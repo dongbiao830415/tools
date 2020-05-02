@@ -10,7 +10,6 @@ import (
 	"golang.org/x/tools/internal/lsp"
 	"golang.org/x/tools/internal/lsp/cache"
 	"golang.org/x/tools/internal/lsp/protocol"
-	"golang.org/x/tools/internal/span"
 	errors "golang.org/x/xerrors"
 )
 
@@ -36,11 +35,11 @@ func TestCapabilities(t *testing.T) {
 	defer c.terminate(ctx)
 
 	params := &protocol.ParamInitialize{}
-	params.RootURI = string(span.FileURI(c.Client.app.wd))
+	params.RootURI = protocol.URIFromPath(c.Client.app.wd)
 	params.Capabilities.Workspace.Configuration = true
 
 	// Send an initialize request to the server.
-	ctx, c.Server = lsp.NewClientServer(ctx, cache.New(app.options), c.Client)
+	c.Server = lsp.NewServer(cache.New(ctx, app.options).NewSession(ctx), c.Client)
 	result, err := c.Server.Initialize(ctx, params)
 	if err != nil {
 		t.Fatal(err)
@@ -55,7 +54,7 @@ func TestCapabilities(t *testing.T) {
 	}
 
 	// Open the file on the server side.
-	uri := protocol.NewURI(span.FileURI(tmpFile))
+	uri := protocol.URIFromPath(tmpFile)
 	if err := c.Server.DidOpen(ctx, &protocol.DidOpenTextDocumentParams{
 		TextDocument: protocol.TextDocumentItem{
 			URI:        uri,
@@ -99,6 +98,49 @@ func TestCapabilities(t *testing.T) {
 		// Validate that an empty command is sent along with import organization responses.
 		if action.Kind == protocol.SourceOrganizeImports && action.Command != nil {
 			t.Errorf("unexpected command for import organization")
+		}
+	}
+
+	if err := c.Server.DidSave(ctx, &protocol.DidSaveTextDocumentParams{
+		TextDocument: protocol.VersionedTextDocumentIdentifier{
+			Version: 2,
+			TextDocumentIdentifier: protocol.TextDocumentIdentifier{
+				URI: uri,
+			},
+		},
+		// LSP specifies that a file can be saved with optional text, so this field must be nil.
+		Text: nil,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Send a completion request to validate expected types.
+	list, err := c.Server.Completion(ctx, &protocol.CompletionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{
+				URI: uri,
+			},
+			Position: protocol.Position{
+				Line:      0,
+				Character: 28,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range list.Items {
+		// All other completion items should have nil commands.
+		// An empty command will be treated as a command with the name '' by VS Code.
+		// This causes VS Code to report errors to users about invalid commands.
+		if item.Command != nil {
+			t.Errorf("unexpected command for completion item")
+		}
+		// The item's TextEdit must be a pointer, as VS Code considers TextEdits
+		// that don't contain the cursor position to be invalid.
+		var textEdit interface{} = item.TextEdit
+		if _, ok := textEdit.(*protocol.TextEdit); !ok {
+			t.Errorf("textEdit is not a *protocol.TextEdit, instead it is %T", textEdit)
 		}
 	}
 }

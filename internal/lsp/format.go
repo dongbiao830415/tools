@@ -7,21 +7,21 @@ package lsp
 import (
 	"context"
 
+	"golang.org/x/tools/internal/lsp/mod"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
-	"golang.org/x/tools/internal/span"
 )
 
 func (s *Server) formatting(ctx context.Context, params *protocol.DocumentFormattingParams) ([]protocol.TextEdit, error) {
-	uri := span.NewURI(params.TextDocument.URI)
-	view, err := s.session.ViewOf(uri)
-	if err != nil {
+	snapshot, fh, ok, err := s.beginFileRequest(params.TextDocument.URI, source.UnknownKind)
+	if !ok {
 		return nil, err
 	}
-	snapshot := view.Snapshot()
-	f, err := view.GetFile(ctx, uri)
-	if err != nil {
-		return nil, err
+	switch fh.Identity().Kind {
+	case source.Mod:
+		return mod.Format(ctx, snapshot, fh)
+	case source.Go:
+		return source.Format(ctx, snapshot, fh)
 	}
-	return source.Format(ctx, snapshot, f)
+	return nil, nil
 }
