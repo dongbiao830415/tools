@@ -66,10 +66,12 @@ type Runner struct {
 }
 
 type runConfig struct {
-	modes    Mode
-	proxyTxt string
-	timeout  time.Duration
-	env      []string
+	modes       Mode
+	proxyTxt    string
+	timeout     time.Duration
+	env         []string
+	skipCleanup bool
+	gopath      bool
 }
 
 func (r *Runner) defaultConfig() *runConfig {
@@ -119,6 +121,22 @@ func WithEnv(env ...string) RunOption {
 	})
 }
 
+// InGOPATH configures the workspace working directory to be GOPATH, rather
+// than a separate working directory for use with modules.
+func InGOPATH() RunOption {
+	return optionSetter(func(opts *runConfig) {
+		opts.gopath = true
+	})
+}
+
+// SkipCleanup is used only for debugging: is skips cleaning up the tests state
+// after completion.
+func SkipCleanup() RunOption {
+	return optionSetter(func(opts *runConfig) {
+		opts.skipCleanup = true
+	})
+}
+
 // Run executes the test function in the default configured gopls execution
 // modes. For each a test run, a new workspace is created containing the
 // un-txtared files specified by filedata.
@@ -150,7 +168,7 @@ func (r *Runner) Run(t *testing.T, filedata string, test func(t *testing.T, e *E
 			defer cancel()
 			ctx = debug.WithInstance(ctx, "", "")
 
-			ws, err := fake.NewWorkspace("regtest", filedata, config.proxyTxt, config.env...)
+			sandbox, err := fake.NewSandbox("regtest", filedata, config.proxyTxt, config.gopath, config.env...)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -160,14 +178,20 @@ func (r *Runner) Run(t *testing.T, filedata string, test func(t *testing.T, e *E
 			// Windows. This may still be flaky however, and in the future we need a
 			// better solution to ensure that all Go processes started by gopls have
 			// exited before we clean up.
-			r.AddCloser(ws)
+			if config.skipCleanup {
+				defer func() {
+					t.Logf("Skipping workspace cleanup: running in %s", sandbox.Workdir.RootURI())
+				}()
+			} else {
+				r.AddCloser(sandbox)
+			}
 			ss := tc.getServer(ctx, t)
 			ls := &loggingServer{delegate: ss}
 			ts := servertest.NewPipeServer(ctx, ls)
 			defer func() {
 				ts.Close()
 			}()
-			env := NewEnv(ctx, t, ws, ts)
+			env := NewEnv(ctx, t, sandbox, ts)
 			defer func() {
 				if t.Failed() && r.PrintGoroutinesOnFailure {
 					pprof.Lookup("goroutine").WriteTo(os.Stderr, 1)
@@ -175,7 +199,7 @@ func (r *Runner) Run(t *testing.T, filedata string, test func(t *testing.T, e *E
 				if t.Failed() || r.AlwaysPrintLogs {
 					ls.printBuffers(t.Name(), os.Stderr)
 				}
-				if err := env.E.Shutdown(ctx); err != nil {
+				if err := env.Editor.Shutdown(ctx); err != nil {
 					panic(err)
 				}
 			}()

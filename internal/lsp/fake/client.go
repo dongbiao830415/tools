@@ -20,6 +20,14 @@ type Client struct {
 	onDiagnostics            func(context.Context, *protocol.PublishDiagnosticsParams) error
 	onWorkDoneProgressCreate func(context.Context, *protocol.WorkDoneProgressCreateParams) error
 	onProgress               func(context.Context, *protocol.ProgressParams) error
+	onShowMessage            func(context.Context, *protocol.ShowMessageParams) error
+}
+
+// OnShowMessage sets the hook to run when the editor receives a showMessage notification
+func (c *Client) OnShowMessage(hook func(context.Context, *protocol.ShowMessageParams) error) {
+	c.mu.Lock()
+	c.onShowMessage = hook
+	c.mu.Unlock()
 }
 
 // OnLogMessage sets the hook to run when the editor receives a log message.
@@ -53,6 +61,9 @@ func (c *Client) ShowMessage(ctx context.Context, params *protocol.ShowMessagePa
 	c.mu.Lock()
 	c.lastMessage = params
 	c.mu.Unlock()
+	if c.onShowMessage != nil {
+		return c.onShowMessage(ctx, params)
+	}
 	return nil
 }
 
@@ -139,7 +150,7 @@ func (c *Client) ApplyEdit(ctx context.Context, params *protocol.ApplyWorkspaceE
 		return &protocol.ApplyWorkspaceEditResponse{FailureReason: "Edit.Changes is unsupported"}, nil
 	}
 	for _, change := range params.Edit.DocumentChanges {
-		path := c.ws.URIToPath(change.TextDocument.URI)
+		path := c.sandbox.Workdir.URIToPath(change.TextDocument.URI)
 		edits := convertEdits(change.Edits)
 		c.EditBuffer(ctx, path, edits)
 	}
