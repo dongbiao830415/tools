@@ -3227,7 +3227,6 @@ func open(s string) *bufio.Reader {
 		if err != nil {
 			errorf("error opening %v: %v", s, err)
 		}
-		defer fi.Close()
 
 		//fmt.Printf("open %v\n", s);
 		return bufio.NewReader(fi)
