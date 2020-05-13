@@ -106,6 +106,16 @@ func (e *Env) GoToDefinition(name string, pos fake.Pos) (string, fake.Pos) {
 	return n, p
 }
 
+// Symbol returns symbols matching query
+func (e *Env) Symbol(query string) []fake.SymbolInformation {
+	e.T.Helper()
+	r, err := e.Editor.Symbol(e.Ctx, query)
+	if err != nil {
+		e.T.Fatal(err)
+	}
+	return r
+}
+
 // FormatBuffer formats the editor buffer, calling t.Fatal on any error.
 func (e *Env) FormatBuffer(name string) {
 	e.T.Helper()
@@ -165,4 +175,15 @@ func (e *Env) CheckForFileChanges() {
 	if err := e.Sandbox.Workdir.CheckForFileChanges(e.Ctx); err != nil {
 		e.T.Fatal(err)
 	}
+}
+
+// CodeLens calls textDocument/codeLens for the given path, calling t.Fatal on
+// any error.
+func (e *Env) CodeLens(path string) []protocol.CodeLens {
+	e.T.Helper()
+	lens, err := e.Editor.CodeLens(e.Ctx, path)
+	if err != nil {
+		e.T.Fatal(err)
+	}
+	return lens
 }
