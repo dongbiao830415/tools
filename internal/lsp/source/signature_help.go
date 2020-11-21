@@ -6,9 +6,7 @@ package source
 
 import (
 	"context"
-	"fmt"
 	"go/ast"
-	"go/doc"
 	"go/token"
 	"go/types"
 
@@ -22,25 +20,21 @@ func SignatureHelp(ctx context.Context, snapshot Snapshot, fh FileHandle, pos pr
 	ctx, done := event.Start(ctx, "source.SignatureHelp")
 	defer done()
 
-	pkg, pgh, err := getParsedFile(ctx, snapshot, fh, NarrowestPackageHandle)
+	pkg, pgf, err := GetParsedFile(ctx, snapshot, fh, NarrowestPackage)
 	if err != nil {
-		return nil, 0, fmt.Errorf("getting file for SignatureHelp: %w", err)
+		return nil, 0, errors.Errorf("getting file for SignatureHelp: %w", err)
 	}
-	file, _, m, _, err := pgh.Cached()
-	if err != nil {
-		return nil, 0, err
-	}
-	spn, err := m.PointSpan(pos)
+	spn, err := pgf.Mapper.PointSpan(pos)
 	if err != nil {
 		return nil, 0, err
 	}
-	rng, err := spn.Range(m.Converter)
+	rng, err := spn.Range(pgf.Mapper.Converter)
 	if err != nil {
 		return nil, 0, err
 	}
 	// Find a call expression surrounding the query position.
 	var callExpr *ast.CallExpr
-	path, _ := astutil.PathEnclosingInterval(file, rng.Start, rng.Start)
+	path, _ := astutil.PathEnclosingInterval(pgf.File, rng.Start, rng.Start)
 	if path == nil {
 		return nil, 0, errors.Errorf("cannot find node enclosing position")
 	}
@@ -63,7 +57,7 @@ FindCall:
 		return nil, 0, errors.Errorf("cannot find an enclosing function")
 	}
 
-	qf := qualifier(file, pkg.GetTypes(), pkg.GetTypesInfo())
+	qf := Qualifier(pgf.File, pkg.GetTypes(), pkg.GetTypesInfo())
 
 	// Get the object representing the function, if available.
 	// There is no object in certain cases such as calling a function returned by
@@ -78,7 +72,7 @@ FindCall:
 
 	// Handle builtin functions separately.
 	if obj, ok := obj.(*types.Builtin); ok {
-		return builtinSignature(ctx, snapshot.View(), callExpr, obj.Name(), rng.Start)
+		return builtinSignature(ctx, snapshot, callExpr, obj.Name(), rng.Start)
 	}
 
 	// Get the type information for the function being called.
@@ -99,11 +93,11 @@ FindCall:
 		comment *ast.CommentGroup
 	)
 	if obj != nil {
-		node, err := objToNode(snapshot.View(), pkg, obj)
+		node, err := objToDecl(ctx, snapshot, pkg, obj)
 		if err != nil {
 			return nil, 0, err
 		}
-		rng, err := objToMappedRange(snapshot.View(), pkg, obj)
+		rng, err := objToMappedRange(snapshot, pkg, obj)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -112,7 +106,7 @@ FindCall:
 			node: node,
 		}
 		decl.MappedRange = append(decl.MappedRange, rng)
-		d, err := hover(ctx, snapshot.View().Session().Cache().FileSet(), pkg, decl)
+		d, err := HoverInfo(ctx, pkg, decl.obj, decl.node)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -121,23 +115,20 @@ FindCall:
 	} else {
 		name = "func"
 	}
-	s, err := newSignature(ctx, snapshot, pkg, file, name, sig, comment, qf)
-	if err != nil {
-		return nil, 0, err
-	}
+	s := NewSignature(ctx, snapshot, pkg, sig, comment, qf)
 	paramInfo := make([]protocol.ParameterInformation, 0, len(s.params))
 	for _, p := range s.params {
 		paramInfo = append(paramInfo, protocol.ParameterInformation{Label: p})
 	}
 	return &protocol.SignatureInformation{
-		Label:         name + s.format(),
-		Documentation: doc.Synopsis(s.doc),
+		Label:         name + s.Format(),
+		Documentation: s.doc,
 		Parameters:    paramInfo,
 	}, activeParam, nil
 }
 
-func builtinSignature(ctx context.Context, view View, callExpr *ast.CallExpr, name string, pos token.Pos) (*protocol.SignatureInformation, int, error) {
-	sig, err := newBuiltinSignature(ctx, view, name)
+func builtinSignature(ctx context.Context, snapshot Snapshot, callExpr *ast.CallExpr, name string, pos token.Pos) (*protocol.SignatureInformation, int, error) {
+	sig, err := NewBuiltinSignature(ctx, snapshot, name)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -147,8 +138,8 @@ func builtinSignature(ctx context.Context, view View, callExpr *ast.CallExpr, na
 	}
 	activeParam := activeParameter(callExpr, len(sig.params), sig.variadic, pos)
 	return &protocol.SignatureInformation{
-		Label:         sig.name + sig.format(),
-		Documentation: doc.Synopsis(sig.doc),
+		Label:         sig.name + sig.Format(),
+		Documentation: sig.doc,
 		Parameters:    paramInfo,
 	}, activeParam, nil
 

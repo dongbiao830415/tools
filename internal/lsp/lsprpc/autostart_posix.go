@@ -7,7 +7,7 @@
 package lsprpc
 
 import (
-	"crypto/sha1"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log"
@@ -17,6 +17,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
+
+	"golang.org/x/xerrors"
 )
 
 func init() {
@@ -31,7 +33,7 @@ func startRemotePosix(goplsPath string, args ...string) error {
 		Setsid: true,
 	}
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("starting remote gopls: %w", err)
+		return xerrors.Errorf("starting remote gopls: %w", err)
 	}
 	return nil
 }
@@ -45,7 +47,7 @@ func autoNetworkAddressPosix(goplsPath, id string) (network string, address stri
 	// socket name. If possible, we also include the buildid in this hash, to
 	// account for long-running processes where the binary has been subsequently
 	// rebuilt.
-	h := sha1.New()
+	h := sha256.New()
 	cmd := exec.Command("go", "tool", "buildid", goplsPath)
 	cmd.Stdout = h
 	var pathHash []byte
@@ -53,7 +55,7 @@ func autoNetworkAddressPosix(goplsPath, id string) (network string, address stri
 		pathHash = h.Sum(nil)
 	} else {
 		log.Printf("error getting current buildid: %v", err)
-		sum := sha1.Sum([]byte(goplsPath))
+		sum := sha256.Sum256([]byte(goplsPath))
 		pathHash = sum[:]
 	}
 	shortHash := fmt.Sprintf("%x", pathHash)[:6]
@@ -78,7 +80,7 @@ func verifyRemoteOwnershipPosix(network, address string) (bool, error) {
 		if os.IsNotExist(err) {
 			return true, nil
 		}
-		return false, fmt.Errorf("checking socket owner: %w", err)
+		return false, xerrors.Errorf("checking socket owner: %w", err)
 	}
 	stat, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
@@ -86,11 +88,11 @@ func verifyRemoteOwnershipPosix(network, address string) (bool, error) {
 	}
 	user, err := user.Current()
 	if err != nil {
-		return false, fmt.Errorf("checking current user: %w", err)
+		return false, xerrors.Errorf("checking current user: %w", err)
 	}
 	uid, err := strconv.ParseUint(user.Uid, 10, 32)
 	if err != nil {
-		return false, fmt.Errorf("parsing current UID: %w", err)
+		return false, xerrors.Errorf("parsing current UID: %w", err)
 	}
 	return stat.Uid == uint32(uid), nil
 }

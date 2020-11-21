@@ -7,11 +7,13 @@ package cache
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/scanner"
 	"go/token"
 	"reflect"
+	"strconv"
 
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/lsp/debug/tag"
@@ -28,50 +30,55 @@ type parseKey struct {
 	mode source.ParseMode
 }
 
+// astCacheKey is similar to parseKey, but is a distinct type because
+// it is used to key a different value within the same map.
+type astCacheKey parseKey
+
 type parseGoHandle struct {
-	handle *memoize.Handle
-	file   source.FileHandle
-	mode   source.ParseMode
+	handle         *memoize.Handle
+	file           source.FileHandle
+	mode           source.ParseMode
+	astCacheHandle *memoize.Handle
 }
 
 type parseGoData struct {
-	memoize.NoCopy
+	parsed *source.ParsedGoFile
 
-	ast    *ast.File
-	mapper *protocol.ColumnMapper
-
-	// Source code used to build the AST. It may be different from the
-	// actual content of the file if we have fixed the AST, in which case,
-	// fixed will be true.
-	src   []byte
+	// If true, we adjusted the AST to make it type check better, and
+	// it may not match the source code.
 	fixed bool
-
-	parseError error // errors associated with parsing the file
-	err        error // any other errors
+	err   error // any other errors
 }
 
-func (c *Cache) ParseGoHandle(fh source.FileHandle, mode source.ParseMode) source.ParseGoHandle {
-	return c.parseGoHandle(fh, mode)
-}
-
-func (c *Cache) parseGoHandle(fh source.FileHandle, mode source.ParseMode) *parseGoHandle {
+func (s *snapshot) parseGoHandle(ctx context.Context, fh source.FileHandle, mode source.ParseMode) *parseGoHandle {
 	key := parseKey{
-		file: fh.Identity(),
+		file: fh.FileIdentity(),
 		mode: mode,
 	}
-	fset := c.fset
-	h := c.store.Bind(key, func(ctx context.Context) interface{} {
-		return parseGo(ctx, fset, fh, mode)
-	})
-	return &parseGoHandle{
-		handle: h,
-		file:   fh,
-		mode:   mode,
+	if pgh := s.getGoFile(key); pgh != nil {
+		return pgh
 	}
+	parseHandle := s.generation.Bind(key, func(ctx context.Context, arg memoize.Arg) interface{} {
+		snapshot := arg.(*snapshot)
+		return parseGo(ctx, snapshot.view.session.cache.fset, fh, mode)
+	}, nil)
+
+	astHandle := s.generation.Bind(astCacheKey(key), func(ctx context.Context, arg memoize.Arg) interface{} {
+		snapshot := arg.(*snapshot)
+		return buildASTCache(ctx, snapshot, parseHandle)
+	}, nil)
+
+	pgh := &parseGoHandle{
+		handle:         parseHandle,
+		file:           fh,
+		mode:           mode,
+		astCacheHandle: astHandle,
+	}
+	return s.addGoFile(key, pgh)
 }
 
 func (pgh *parseGoHandle) String() string {
-	return pgh.File().Identity().URI.Filename()
+	return pgh.File().URI().Filename()
 }
 
 func (pgh *parseGoHandle) File() source.FileHandle {
@@ -82,55 +89,162 @@ func (pgh *parseGoHandle) Mode() source.ParseMode {
 	return pgh.mode
 }
 
-func (pgh *parseGoHandle) Parse(ctx context.Context) (*ast.File, []byte, *protocol.ColumnMapper, error, error) {
-	data, err := pgh.parse(ctx)
+func (s *snapshot) ParseGo(ctx context.Context, fh source.FileHandle, mode source.ParseMode) (*source.ParsedGoFile, error) {
+	pgh := s.parseGoHandle(ctx, fh, mode)
+	pgf, _, err := s.parseGo(ctx, pgh)
+	return pgf, err
+}
+
+func (s *snapshot) parseGo(ctx context.Context, pgh *parseGoHandle) (*source.ParsedGoFile, bool, error) {
+	d, err := pgh.handle.Get(ctx, s.generation, s)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, false, err
 	}
-	return data.ast, data.src, data.mapper, data.parseError, data.err
+	data := d.(*parseGoData)
+	return data.parsed, data.fixed, data.err
 }
 
-func (pgh *parseGoHandle) parse(ctx context.Context) (*parseGoData, error) {
-	v := pgh.handle.Get(ctx)
-	data, ok := v.(*parseGoData)
-	if !ok {
-		return nil, errors.Errorf("no parsed file for %s", pgh.File().Identity().URI)
+func (s *snapshot) PosToDecl(ctx context.Context, pgf *source.ParsedGoFile) (map[token.Pos]ast.Decl, error) {
+	fh, err := s.GetFile(ctx, pgf.URI)
+	if err != nil {
+		return nil, err
 	}
-	return data, nil
+
+	pgh := s.parseGoHandle(ctx, fh, pgf.Mode)
+	d, err := pgh.astCacheHandle.Get(ctx, s.generation, s)
+	if err != nil {
+		return nil, err
+	}
+
+	data := d.(*astCacheData)
+	return data.posToDecl, data.err
 }
 
-func (pgh *parseGoHandle) Cached() (*ast.File, []byte, *protocol.ColumnMapper, error, error) {
-	v := pgh.handle.Cached()
-	if v == nil {
-		return nil, nil, nil, nil, errors.Errorf("no cached AST for %s", pgh.file.Identity().URI)
+func (s *snapshot) PosToField(ctx context.Context, pgf *source.ParsedGoFile) (map[token.Pos]*ast.Field, error) {
+	fh, err := s.GetFile(ctx, pgf.URI)
+	if err != nil {
+		return nil, err
 	}
-	data := v.(*parseGoData)
-	return data.ast, data.src, data.mapper, data.parseError, data.err
+
+	pgh := s.parseGoHandle(ctx, fh, pgf.Mode)
+	d, err := pgh.astCacheHandle.Get(ctx, s.generation, s)
+	if err != nil || d == nil {
+		return nil, err
+	}
+
+	data := d.(*astCacheData)
+	return data.posToField, data.err
 }
 
-func hashParseKey(ph source.ParseGoHandle) string {
-	b := bytes.NewBuffer(nil)
-	b.WriteString(ph.File().Identity().String())
-	b.WriteString(string(rune(ph.Mode())))
-	return hashContents(b.Bytes())
+type astCacheData struct {
+	err error
+
+	posToDecl  map[token.Pos]ast.Decl
+	posToField map[token.Pos]*ast.Field
 }
 
-func hashParseKeys(phs []*parseGoHandle) string {
-	b := bytes.NewBuffer(nil)
-	for _, ph := range phs {
-		b.WriteString(hashParseKey(ph))
+// buildASTCache builds caches to aid in quickly going from the typed
+// world to the syntactic world.
+func buildASTCache(ctx context.Context, snapshot *snapshot, parseHandle *memoize.Handle) *astCacheData {
+	var (
+		// path contains all ancestors, including n.
+		path []ast.Node
+		// decls contains all ancestors that are decls.
+		decls []ast.Decl
+	)
+
+	v, err := parseHandle.Get(ctx, snapshot.generation, snapshot)
+	if err != nil {
+		return &astCacheData{err: err}
 	}
-	return hashContents(b.Bytes())
+	file := v.(*parseGoData).parsed.File
+	if err != nil {
+		return &astCacheData{err: fmt.Errorf("nil file")}
+	}
+
+	data := &astCacheData{
+		posToDecl:  make(map[token.Pos]ast.Decl),
+		posToField: make(map[token.Pos]*ast.Field),
+	}
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		if n == nil {
+			lastP := path[len(path)-1]
+			path = path[:len(path)-1]
+			if len(decls) > 0 && decls[len(decls)-1] == lastP {
+				decls = decls[:len(decls)-1]
+			}
+			return false
+		}
+
+		path = append(path, n)
+
+		switch n := n.(type) {
+		case *ast.Field:
+			addField := func(f ast.Node) {
+				if f.Pos().IsValid() {
+					data.posToField[f.Pos()] = n
+					if len(decls) > 0 {
+						data.posToDecl[f.Pos()] = decls[len(decls)-1]
+					}
+				}
+			}
+
+			// Add mapping for *ast.Field itself. This handles embedded
+			// fields which have no associated *ast.Ident name.
+			addField(n)
+
+			// Add mapping for each field name since you can have
+			// multiple names for the same type expression.
+			for _, name := range n.Names {
+				addField(name)
+			}
+
+			// Also map "X" in "...X" to the containing *ast.Field. This
+			// makes it easy to format variadic signature params
+			// properly.
+			if elips, ok := n.Type.(*ast.Ellipsis); ok && elips.Elt != nil {
+				addField(elips.Elt)
+			}
+		case *ast.FuncDecl:
+			decls = append(decls, n)
+
+			if n.Name != nil && n.Name.Pos().IsValid() {
+				data.posToDecl[n.Name.Pos()] = n
+			}
+		case *ast.GenDecl:
+			decls = append(decls, n)
+
+			for _, spec := range n.Specs {
+				switch spec := spec.(type) {
+				case *ast.TypeSpec:
+					if spec.Name != nil && spec.Name.Pos().IsValid() {
+						data.posToDecl[spec.Name.Pos()] = n
+					}
+				case *ast.ValueSpec:
+					for _, id := range spec.Names {
+						if id != nil && id.Pos().IsValid() {
+							data.posToDecl[id.Pos()] = n
+						}
+					}
+				}
+			}
+		}
+
+		return true
+	})
+
+	return data
 }
 
 func parseGo(ctx context.Context, fset *token.FileSet, fh source.FileHandle, mode source.ParseMode) *parseGoData {
-	ctx, done := event.Start(ctx, "cache.parseGo", tag.File.Of(fh.Identity().URI.Filename()))
+	ctx, done := event.Start(ctx, "cache.parseGo", tag.File.Of(fh.URI().Filename()))
 	defer done()
 
-	if fh.Identity().Kind != source.Go {
-		return &parseGoData{err: errors.Errorf("cannot parse non-Go file %s", fh.Identity().URI)}
+	if fh.Kind() != source.Go {
+		return &parseGoData{err: errors.Errorf("cannot parse non-Go file %s", fh.URI())}
 	}
-	buf, _, err := fh.Read(ctx)
+	buf, err := fh.Read()
 	if err != nil {
 		return &parseGoData{err: err}
 	}
@@ -139,13 +253,29 @@ func parseGo(ctx context.Context, fset *token.FileSet, fh source.FileHandle, mod
 	if mode == source.ParseHeader {
 		parserMode = parser.ImportsOnly | parser.ParseComments
 	}
-	file, parseError := parser.ParseFile(fset, fh.Identity().URI.Filename(), buf, parserMode)
+	file, parseError := parser.ParseFile(fset, fh.URI().Filename(), buf, parserMode)
 	var tok *token.File
 	var fixed bool
 	if file != nil {
 		tok = fset.File(file.Pos())
 		if tok == nil {
-			return &parseGoData{err: errors.Errorf("successfully parsed but no token.File for %s (%v)", fh.Identity().URI, parseError)}
+			tok = fset.AddFile(fh.URI().Filename(), -1, len(buf))
+			tok.SetLinesForContent(buf)
+			return &parseGoData{
+				parsed: &source.ParsedGoFile{
+					URI:  fh.URI(),
+					Mode: mode,
+					Src:  buf,
+					File: file,
+					Tok:  tok,
+					Mapper: &protocol.ColumnMapper{
+						URI:       fh.URI(),
+						Content:   buf,
+						Converter: span.NewTokenConverter(fset, tok),
+					},
+					ParseErr: parseError,
+				},
+			}
 		}
 
 		// Fix any badly parsed parts of the AST.
@@ -154,7 +284,7 @@ func parseGo(ctx context.Context, fset *token.FileSet, fh source.FileHandle, mod
 		// Fix certain syntax errors that render the file unparseable.
 		newSrc := fixSrc(file, tok, buf)
 		if newSrc != nil {
-			newFile, _ := parser.ParseFile(fset, fh.Identity().URI.Filename(), newSrc, parserMode)
+			newFile, _ := parser.ParseFile(fset, fh.URI().Filename(), newSrc, parserMode)
 			if newFile != nil {
 				// Maintain the original parseError so we don't try formatting the doctored file.
 				file = newFile
@@ -169,26 +299,31 @@ func parseGo(ctx context.Context, fset *token.FileSet, fh source.FileHandle, mod
 			trimAST(file)
 		}
 	}
+	// A missing file is always an error; use the parse error or make one up if there isn't one.
 	if file == nil {
-		// If the file is nil only due to parse errors,
-		// the parse errors are the actual errors.
-		err := parseError
-		if err == nil {
-			err = errors.Errorf("no AST for %s", fh.Identity().URI)
+		if parseError == nil {
+			parseError = errors.Errorf("parsing %s failed with no parse error reported", fh.URI())
 		}
-		return &parseGoData{parseError: parseError, err: err}
+		err = parseError
 	}
 	m := &protocol.ColumnMapper{
-		URI:       fh.Identity().URI,
+		URI:       fh.URI(),
 		Converter: span.NewTokenConverter(fset, tok),
 		Content:   buf,
 	}
+
 	return &parseGoData{
-		src:        buf,
-		ast:        file,
-		mapper:     m,
-		parseError: parseError,
-		fixed:      fixed,
+		parsed: &source.ParsedGoFile{
+			URI:      fh.URI(),
+			Mode:     mode,
+			Src:      buf,
+			File:     file,
+			Tok:      tok,
+			Mapper:   m,
+			ParseErr: parseError,
+		},
+		fixed: fixed,
+		err:   err,
 	}
 }
 
@@ -209,24 +344,78 @@ func trimAST(file *ast.File) {
 		case *ast.CommClause:
 			n.Body = nil
 		case *ast.CompositeLit:
-			// Leave elts in place for [...]T
-			// array literals, because they can
-			// affect the expression's type.
-			if !isEllipsisArray(n.Type) {
-				n.Elts = nil
+			// types.Info.Types for long slice/array literals are particularly
+			// expensive. Try to clear them out.
+			at, ok := n.Type.(*ast.ArrayType)
+			if !ok {
+				break
 			}
+			// Removing the elements from an ellipsis array changes its type.
+			// Try to set the length explicitly so we can continue.
+			if _, ok := at.Len.(*ast.Ellipsis); ok {
+				length, ok := arrayLength(n)
+				if !ok {
+					break
+				}
+				at.Len = &ast.BasicLit{
+					Kind:     token.INT,
+					Value:    fmt.Sprint(length),
+					ValuePos: at.Len.Pos(),
+				}
+			}
+			n.Elts = nil
 		}
 		return true
 	})
 }
 
-func isEllipsisArray(n ast.Expr) bool {
-	at, ok := n.(*ast.ArrayType)
-	if !ok {
-		return false
+// arrayLength returns the length of some simple forms of ellipsis array literal.
+// Notably, it handles the tables in golang.org/x/text.
+func arrayLength(array *ast.CompositeLit) (int, bool) {
+	litVal := func(expr ast.Expr) (int, bool) {
+		lit, ok := expr.(*ast.BasicLit)
+		if !ok {
+			return 0, false
+		}
+		val, err := strconv.ParseInt(lit.Value, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return int(val), true
 	}
-	_, ok = at.Len.(*ast.Ellipsis)
-	return ok
+	largestKey := -1
+	for _, elt := range array.Elts {
+		kve, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		switch key := kve.Key.(type) {
+		case *ast.BasicLit:
+			if val, ok := litVal(key); ok && largestKey < val {
+				largestKey = val
+			}
+		case *ast.BinaryExpr:
+			// golang.org/x/text uses subtraction (and only subtraction) in its indices.
+			if key.Op != token.SUB {
+				break
+			}
+			x, ok := litVal(key.X)
+			if !ok {
+				break
+			}
+			y, ok := litVal(key.Y)
+			if !ok {
+				break
+			}
+			if val := x - y; largestKey < val {
+				largestKey = val
+			}
+		}
+	}
+	if largestKey != -1 {
+		return largestKey + 1, true
+	}
+	return len(array.Elts), true
 }
 
 // fixAST inspects the AST and potentially modifies any *ast.BadStmts so that it can be

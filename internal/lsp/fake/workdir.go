@@ -5,8 +5,8 @@
 package fake
 
 import (
+	"bytes"
 	"context"
-	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -16,20 +16,67 @@ import (
 
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/span"
+	errors "golang.org/x/xerrors"
 )
 
 // FileEvent wraps the protocol.FileEvent so that it can be associated with a
 // workdir-relative path.
 type FileEvent struct {
-	Path          string
+	Path, Content string
 	ProtocolEvent protocol.FileEvent
+}
+
+// RelativeTo is a helper for operations relative to a given directory.
+type RelativeTo string
+
+// AbsPath returns an absolute filesystem path for the workdir-relative path.
+func (r RelativeTo) AbsPath(path string) string {
+	fp := filepath.FromSlash(path)
+	if filepath.IsAbs(fp) {
+		return fp
+	}
+	return filepath.Join(string(r), filepath.FromSlash(path))
+}
+
+// RelPath returns a '/'-encoded path relative to the working directory (or an
+// absolute path if the file is outside of workdir)
+func (r RelativeTo) RelPath(fp string) string {
+	root := string(r)
+	if rel, err := filepath.Rel(root, fp); err == nil && !strings.HasPrefix(rel, "..") {
+		return filepath.ToSlash(rel)
+	}
+	return filepath.ToSlash(fp)
+}
+
+func writeTxtar(txt string, rel RelativeTo) error {
+	files := unpackTxt(txt)
+	for name, data := range files {
+		if err := WriteFileData(name, data, rel); err != nil {
+			return errors.Errorf("writing to workdir: %w", err)
+		}
+	}
+	return nil
+}
+
+// WriteFileData writes content to the relative path, replacing the special
+// token $SANDBOX_WORKDIR with the relative root given by rel.
+func WriteFileData(path string, content []byte, rel RelativeTo) error {
+	content = bytes.ReplaceAll(content, []byte("$SANDBOX_WORKDIR"), []byte(rel))
+	fp := rel.AbsPath(path)
+	if err := os.MkdirAll(filepath.Dir(fp), 0755); err != nil {
+		return errors.Errorf("creating nested directory: %w", err)
+	}
+	if err := ioutil.WriteFile(fp, []byte(content), 0644); err != nil {
+		return errors.Errorf("writing %q: %w", path, err)
+	}
+	return nil
 }
 
 // Workdir is a temporary working directory for tests. It exposes file
 // operations in terms of relative paths, and fakes file watching by triggering
 // events on file operations.
 type Workdir struct {
-	workdir string
+	RelativeTo
 
 	watcherMu sync.Mutex
 	watchers  []func(context.Context, []FileEvent)
@@ -40,25 +87,23 @@ type Workdir struct {
 
 // NewWorkdir writes the txtar-encoded file data in txt to dir, and returns a
 // Workir for operating on these files using
-func NewWorkdir(dir, txt string) (*Workdir, error) {
-	w := &Workdir{workdir: dir}
-	files := unpackTxt(txt)
-	for name, data := range files {
-		if err := w.writeFileData(name, string(data)); err != nil {
-			return nil, fmt.Errorf("writing to workdir: %w", err)
-		}
-	}
+func NewWorkdir(dir string) *Workdir {
+	return &Workdir{RelativeTo: RelativeTo(dir)}
+}
+
+func (w *Workdir) writeInitialFiles(txt string) error {
+	writeTxtar(txt, w.RelativeTo)
 	// Poll to capture the current file state.
 	if _, err := w.pollFiles(); err != nil {
-		return nil, fmt.Errorf("polling files: %w", err)
+		return errors.Errorf("polling files: %w", err)
 	}
-	return w, nil
+	return nil
 }
 
 // RootURI returns the root URI for this working directory of this scratch
 // environment.
 func (w *Workdir) RootURI() protocol.DocumentURI {
-	return toURI(w.workdir)
+	return toURI(string(w.RelativeTo))
 }
 
 // AddWatcher registers the given func to be called on any file change.
@@ -68,35 +113,16 @@ func (w *Workdir) AddWatcher(watcher func(context.Context, []FileEvent)) {
 	w.watcherMu.Unlock()
 }
 
-// filePath returns an absolute filesystem path for the workdir-relative path.
-func (w *Workdir) filePath(path string) string {
-	fp := filepath.FromSlash(path)
-	if filepath.IsAbs(fp) {
-		return fp
-	}
-	return filepath.Join(w.workdir, filepath.FromSlash(path))
-}
-
 // URI returns the URI to a the workdir-relative path.
 func (w *Workdir) URI(path string) protocol.DocumentURI {
-	return toURI(w.filePath(path))
+	return toURI(w.AbsPath(path))
 }
 
 // URIToPath converts a uri to a workdir-relative path (or an absolute path,
 // if the uri is outside of the workdir).
 func (w *Workdir) URIToPath(uri protocol.DocumentURI) string {
 	fp := uri.SpanURI().Filename()
-	return w.relPath(fp)
-}
-
-// relPath returns a '/'-encoded path relative to the working directory (or an
-// absolute path if the file is outside of workdir)
-func (w *Workdir) relPath(fp string) string {
-	root := w.RootURI().SpanURI().Filename()
-	if rel, err := filepath.Rel(root, fp); err == nil && !strings.HasPrefix(rel, "..") {
-		return filepath.ToSlash(rel)
-	}
-	return filepath.ToSlash(fp)
+	return w.RelPath(fp)
 }
 
 func toURI(fp string) protocol.DocumentURI {
@@ -105,11 +131,19 @@ func toURI(fp string) protocol.DocumentURI {
 
 // ReadFile reads a text file specified by a workdir-relative path.
 func (w *Workdir) ReadFile(path string) (string, error) {
-	b, err := ioutil.ReadFile(w.filePath(path))
+	b, err := ioutil.ReadFile(w.AbsPath(path))
 	if err != nil {
 		return "", err
 	}
 	return string(b), nil
+}
+
+func (w *Workdir) RegexpRange(path, re string) (Pos, Pos, error) {
+	content, err := w.ReadFile(path)
+	if err != nil {
+		return Pos{}, Pos{}, err
+	}
+	return regexpRange(content, re)
 }
 
 // RegexpSearch searches the file corresponding to path for the first position
@@ -123,11 +157,31 @@ func (w *Workdir) RegexpSearch(path string, re string) (Pos, error) {
 	return start, err
 }
 
+// ChangeFilesOnDisk executes the given on-disk file changes in a batch,
+// simulating the action of changing branches outside of an editor.
+func (w *Workdir) ChangeFilesOnDisk(ctx context.Context, events []FileEvent) error {
+	for _, e := range events {
+		switch e.ProtocolEvent.Type {
+		case protocol.Deleted:
+			fp := w.AbsPath(e.Path)
+			if err := os.Remove(fp); err != nil {
+				return errors.Errorf("removing %q: %w", e.Path, err)
+			}
+		case protocol.Changed, protocol.Created:
+			if _, err := w.writeFile(ctx, e.Path, e.Content); err != nil {
+				return err
+			}
+		}
+	}
+	w.sendEvents(ctx, events)
+	return nil
+}
+
 // RemoveFile removes a workdir-relative file path.
 func (w *Workdir) RemoveFile(ctx context.Context, path string) error {
-	fp := w.filePath(path)
-	if err := os.Remove(fp); err != nil {
-		return fmt.Errorf("removing %q: %w", path, err)
+	fp := w.AbsPath(path)
+	if err := os.RemoveAll(fp); err != nil {
+		return errors.Errorf("removing %q: %w", path, err)
 	}
 	evts := []FileEvent{{
 		Path: path,
@@ -153,12 +207,36 @@ func (w *Workdir) sendEvents(ctx context.Context, evts []FileEvent) {
 	}
 }
 
+// WriteFiles writes the text file content to workdir-relative paths.
+// It batches notifications rather than sending them consecutively.
+func (w *Workdir) WriteFiles(ctx context.Context, files map[string]string) error {
+	var evts []FileEvent
+	for filename, content := range files {
+		evt, err := w.writeFile(ctx, filename, content)
+		if err != nil {
+			return err
+		}
+		evts = append(evts, evt)
+	}
+	w.sendEvents(ctx, evts)
+	return nil
+}
+
 // WriteFile writes text file content to a workdir-relative path.
 func (w *Workdir) WriteFile(ctx context.Context, path, content string) error {
-	fp := w.filePath(path)
+	evt, err := w.writeFile(ctx, path, content)
+	if err != nil {
+		return err
+	}
+	w.sendEvents(ctx, []FileEvent{evt})
+	return nil
+}
+
+func (w *Workdir) writeFile(ctx context.Context, path, content string) (FileEvent, error) {
+	fp := w.AbsPath(path)
 	_, err := os.Stat(fp)
 	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("checking if %q exists: %w", path, err)
+		return FileEvent{}, errors.Errorf("checking if %q exists: %w", path, err)
 	}
 	var changeType protocol.FileChangeType
 	if os.IsNotExist(err) {
@@ -166,36 +244,23 @@ func (w *Workdir) WriteFile(ctx context.Context, path, content string) error {
 	} else {
 		changeType = protocol.Changed
 	}
-	if err := w.writeFileData(path, content); err != nil {
-		return err
+	if err := WriteFileData(path, []byte(content), w.RelativeTo); err != nil {
+		return FileEvent{}, err
 	}
-	evts := []FileEvent{{
+	return FileEvent{
 		Path: path,
 		ProtocolEvent: protocol.FileEvent{
 			URI:  w.URI(path),
 			Type: changeType,
 		},
-	}}
-	w.sendEvents(ctx, evts)
-	return nil
-}
-
-func (w *Workdir) writeFileData(path string, content string) error {
-	fp := w.filePath(path)
-	if err := os.MkdirAll(filepath.Dir(fp), 0755); err != nil {
-		return fmt.Errorf("creating nested directory: %w", err)
-	}
-	if err := ioutil.WriteFile(fp, []byte(content), 0644); err != nil {
-		return fmt.Errorf("writing %q: %w", path, err)
-	}
-	return nil
+	}, nil
 }
 
 // ListFiles lists files in the given directory, returning a map of relative
 // path to modification time.
 func (w *Workdir) ListFiles(dir string) (map[string]time.Time, error) {
 	files := make(map[string]time.Time)
-	absDir := w.filePath(dir)
+	absDir := w.AbsPath(dir)
 	if err := filepath.Walk(absDir, func(fp string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -203,7 +268,7 @@ func (w *Workdir) ListFiles(dir string) (map[string]time.Time, error) {
 		if info.IsDir() {
 			return nil
 		}
-		path := w.relPath(fp)
+		path := w.RelPath(fp)
 		files[path] = info.ModTime()
 		return nil
 	}); err != nil {

@@ -8,22 +8,29 @@ import (
 	"context"
 	"fmt"
 	"go/types"
+	"io/ioutil"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/internal/event"
+	"golang.org/x/tools/internal/gocommand"
 	"golang.org/x/tools/internal/lsp/debug/tag"
 	"golang.org/x/tools/internal/lsp/source"
+	"golang.org/x/tools/internal/memoize"
 	"golang.org/x/tools/internal/packagesinternal"
 	"golang.org/x/tools/internal/span"
 	errors "golang.org/x/xerrors"
 )
 
+// metadata holds package metadata extracted from a call to packages.Load.
 type metadata struct {
 	id              packageID
 	pkgPath         packagePath
-	name            string
+	name            packageName
 	goFiles         []span.URI
 	compiledGoFiles []span.URI
 	forTest         packagePath
@@ -31,12 +38,14 @@ type metadata struct {
 	errors          []packages.Error
 	deps            []packageID
 	missingDeps     map[packagePath]struct{}
-	module          *packagesinternal.Module
+	module          *packages.Module
 
 	// config is the *packages.Config associated with the loaded package.
 	config *packages.Config
 }
 
+// load calls packages.Load for the given scopes, updating package metadata,
+// import graph, and mapped files with the result.
 func (s *snapshot) load(ctx context.Context, scopes ...interface{}) error {
 	var query []string
 	var containsDir bool // for logging
@@ -51,21 +60,19 @@ func (s *snapshot) load(ctx context.Context, scopes ...interface{}) error {
 			// go list and should already be GOPATH-vendorized when appropriate.
 			query = append(query, string(scope))
 		case fileURI:
-			query = append(query, fmt.Sprintf("file=%s", span.URI(scope).Filename()))
-		case directoryURI:
-			filename := span.URI(scope).Filename()
-			q := fmt.Sprintf("%s/...", filename)
-			// Simplify the query if it will be run in the requested directory.
-			// This ensures compatibility with Go 1.12 that doesn't allow
-			// <directory>/... in GOPATH mode.
-			if s.view.folder.Filename() == filename {
-				q = "./..."
+			uri := span.URI(scope)
+			// Don't try to load a file that doesn't exist.
+			fh := s.FindFile(uri)
+			if fh == nil || fh.Kind() != source.Go {
+				continue
 			}
-			query = append(query, q)
+			query = append(query, fmt.Sprintf("file=%s", uri.Filename()))
+		case moduleLoadScope:
+			query = append(query, fmt.Sprintf("%s/...", scope))
 		case viewLoadScope:
 			// If we are outside of GOPATH, a module, or some other known
 			// build system, don't load subdirectories.
-			if !s.view.hasValidBuildConfiguration {
+			if !s.ValidBuildConfiguration() {
 				query = append(query, "./")
 			} else {
 				query = append(query, "./...")
@@ -74,17 +81,34 @@ func (s *snapshot) load(ctx context.Context, scopes ...interface{}) error {
 			panic(fmt.Sprintf("unknown scope type %T", scope))
 		}
 		switch scope.(type) {
-		case directoryURI, viewLoadScope:
+		case viewLoadScope, moduleLoadScope:
 			containsDir = true
 		}
+	}
+	if len(query) == 0 {
+		return nil
 	}
 	sort.Strings(query) // for determinism
 
 	ctx, done := event.Start(ctx, "cache.view.load", tag.Query.Of(query))
 	defer done()
 
-	cfg := s.Config(ctx)
+	_, inv, cleanup, err := s.goCommandInvocation(ctx, source.LoadWorkspace, &gocommand.Invocation{
+		WorkingDir: s.view.rootURI.Filename(),
+	})
+	if err != nil {
+		return err
+	}
+
+	// Set a last resort deadline on packages.Load since it calls the go
+	// command, which may hang indefinitely if it has a bug. golang/go#42132
+	// and golang/go#42255 have more context.
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer cancel()
+
+	cfg := s.config(ctx, inv)
 	pkgs, err := packages.Load(cfg, query...)
+	cleanup()
 
 	// If the context was canceled, return early. Otherwise, we might be
 	// type-checking an incomplete result. Check the context directly,
@@ -98,7 +122,15 @@ func (s *snapshot) load(ctx context.Context, scopes ...interface{}) error {
 		event.Log(ctx, "go/packages.Load", tag.Snapshot.Of(s.ID()), tag.Directory.Of(cfg.Dir), tag.Query.Of(query), tag.PackageCount.Of(len(pkgs)))
 	}
 	if len(pkgs) == 0 {
-		return err
+		if err != nil {
+			// Try to extract the error into a diagnostic.
+			if srcErrs := s.parseLoadError(ctx, err); srcErrs != nil {
+				return srcErrs
+			}
+		} else {
+			err = fmt.Errorf("no packages returned")
+		}
+		return errors.Errorf("%v: %w", err, source.PackagesLoadError)
 	}
 	for _, pkg := range pkgs {
 		if !containsDir || s.view.Options().VerboseOutput {
@@ -111,7 +143,7 @@ func (s *snapshot) load(ctx context.Context, scopes ...interface{}) error {
 		}
 		// Special case for the builtin package, as it has no dependencies.
 		if pkg.PkgPath == "builtin" {
-			if err := s.view.buildBuiltinPackage(ctx, pkg.GoFiles); err != nil {
+			if err := s.buildBuiltinPackage(ctx, pkg.GoFiles); err != nil {
 				return err
 			}
 			continue
@@ -125,7 +157,7 @@ func (s *snapshot) load(ctx context.Context, scopes ...interface{}) error {
 		if err != nil {
 			return err
 		}
-		if _, err := s.buildPackageHandle(ctx, m.id, source.ParseFull); err != nil {
+		if _, err := s.buildPackageHandle(ctx, m.id, s.workspaceParseMode(m.id)); err != nil {
 			return err
 		}
 	}
@@ -135,6 +167,86 @@ func (s *snapshot) load(ctx context.Context, scopes ...interface{}) error {
 	return nil
 }
 
+func (s *snapshot) parseLoadError(ctx context.Context, loadErr error) *source.ErrorList {
+	var srcErrs *source.ErrorList
+	for _, uri := range s.ModFiles() {
+		fh, err := s.GetFile(ctx, uri)
+		if err != nil {
+			continue
+		}
+		srcErr := extractGoCommandError(ctx, s, fh, loadErr)
+		if srcErr == nil {
+			continue
+		}
+		if srcErrs == nil {
+			srcErrs = &source.ErrorList{}
+		}
+		*srcErrs = append(*srcErrs, srcErr)
+	}
+	return srcErrs
+}
+
+type workspaceDirKey string
+
+type workspaceDirData struct {
+	dir string
+	err error
+}
+
+// getWorkspaceDir gets the URI for the workspace directory associated with
+// this snapshot. The workspace directory is a temp directory containing the
+// go.mod file computed from all active modules.
+func (s *snapshot) getWorkspaceDir(ctx context.Context) (span.URI, error) {
+	s.mu.Lock()
+	h := s.workspaceDirHandle
+	s.mu.Unlock()
+	if h != nil {
+		return getWorkspaceDir(ctx, h, s.generation)
+	}
+	file, err := s.workspace.modFile(ctx, s)
+	if err != nil {
+		return "", err
+	}
+	content, err := file.Format()
+	if err != nil {
+		return "", err
+	}
+	key := workspaceDirKey(hashContents(content))
+	s.mu.Lock()
+	s.workspaceDirHandle = s.generation.Bind(key, func(context.Context, memoize.Arg) interface{} {
+		tmpdir, err := ioutil.TempDir("", "gopls-workspace-mod")
+		if err != nil {
+			return &workspaceDirData{err: err}
+		}
+		filename := filepath.Join(tmpdir, "go.mod")
+		if err := ioutil.WriteFile(filename, content, 0644); err != nil {
+			os.RemoveAll(tmpdir)
+			return &workspaceDirData{err: err}
+		}
+		return &workspaceDirData{dir: tmpdir}
+	}, func(v interface{}) {
+		d := v.(*workspaceDirData)
+		if d.dir != "" {
+			if err := os.RemoveAll(d.dir); err != nil {
+				event.Error(context.Background(), "cleaning workspace dir", err)
+			}
+		}
+	})
+	s.mu.Unlock()
+	return getWorkspaceDir(ctx, s.workspaceDirHandle, s.generation)
+}
+
+func getWorkspaceDir(ctx context.Context, h *memoize.Handle, g *memoize.Generation) (span.URI, error) {
+	v, err := h.Get(ctx, g, nil)
+	if err != nil {
+		return "", err
+	}
+	return span.URIFromPath(v.(*workspaceDirData).dir), nil
+}
+
+// setMetadata extracts metadata from pkg and records it in s. It
+// recurses through pkg.Imports to ensure that metadata exists for all
+// dependencies.
 func (s *snapshot) setMetadata(ctx context.Context, pkgPath packagePath, pkg *packages.Package, cfg *packages.Config, seen map[packageID]struct{}) (*metadata, error) {
 	id := packageID(pkg.ID)
 	if _, ok := seen[id]; ok {
@@ -144,12 +256,12 @@ func (s *snapshot) setMetadata(ctx context.Context, pkgPath packagePath, pkg *pa
 	m := &metadata{
 		id:         id,
 		pkgPath:    pkgPath,
-		name:       pkg.Name,
+		name:       packageName(pkg.Name),
 		forTest:    packagePath(packagesinternal.GetForTest(pkg)),
 		typesSizes: pkg.TypesSizes,
 		errors:     pkg.Errors,
 		config:     cfg,
-		module:     packagesinternal.GetModule(pkg),
+		module:     pkg.Module,
 	}
 
 	for _, filename := range pkg.CompiledGoFiles {
@@ -163,6 +275,7 @@ func (s *snapshot) setMetadata(ctx context.Context, pkgPath packagePath, pkg *pa
 		s.addID(uri, m.id)
 	}
 
+	// TODO(rstambler): is this still necessary?
 	copied := map[packageID]struct{}{
 		id: {},
 	}
@@ -204,18 +317,28 @@ func (s *snapshot) setMetadata(ctx context.Context, pkgPath packagePath, pkg *pa
 	}
 
 	// Set the workspace packages. If any of the package's files belong to the
-	// view, then the package is considered to be a workspace package.
+	// view, then the package may be a workspace package.
 	for _, uri := range append(m.compiledGoFiles, m.goFiles...) {
-		// If the package's files are in this view, mark it as a workspace package.
-		if s.view.contains(uri) {
-			// A test variant of a package can only be loaded directly by loading
-			// the non-test variant with -test. Track the import path of the non-test variant.
-			if m.forTest != "" {
-				s.workspacePackages[m.id] = m.forTest
-			} else {
-				s.workspacePackages[m.id] = pkgPath
-			}
-			break
+		if !s.view.contains(uri) {
+			continue
+		}
+
+		// The package's files are in this view. It may be a workspace package.
+		if strings.Contains(string(uri), "/vendor/") {
+			// Vendored packages are not likely to be interesting to the user.
+			continue
+		}
+
+		switch {
+		case m.forTest == "":
+			// A normal package.
+			s.workspacePackages[m.id] = pkgPath
+		case m.forTest == m.pkgPath, m.forTest+"_test" == m.pkgPath:
+			// The test variant of some workspace package or its x_test.
+			// To load it, we need to load the non-test variant with -test.
+			s.workspacePackages[m.id] = m.forTest
+		default:
+			// A test variant of some intermediate package. We don't care about it.
 		}
 	}
 	return m, nil

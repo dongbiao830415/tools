@@ -1,12 +1,9 @@
-// +build go1.11
-
 package imports
 
 import (
 	"archive/zip"
 	"context"
 	"fmt"
-	"go/build"
 	"io/ioutil"
 	"log"
 	"os"
@@ -21,6 +18,7 @@ import (
 	"golang.org/x/mod/module"
 	"golang.org/x/tools/internal/gocommand"
 	"golang.org/x/tools/internal/gopathwalk"
+	"golang.org/x/tools/internal/proxydir"
 	"golang.org/x/tools/internal/testenv"
 	"golang.org/x/tools/txtar"
 )
@@ -241,13 +239,13 @@ import _ "rsc.io/sampler"
 
 	// Clear out the resolver's cache, since we've changed the environment.
 	mt.resolver = newModuleResolver(mt.env)
-	mt.env.GOFLAGS = "-mod=vendor"
+	mt.env.Env["GOFLAGS"] = "-mod=vendor"
 	mt.assertModuleFoundInDir("rsc.io/sampler", "sampler", `/vendor/`)
 }
 
 // Tests that -mod=vendor is auto-enabled only for go1.14 and higher.
 // Vaguely inspired by mod_vendor_auto.txt.
-func testModVendorAuto(t *testing.T, wantEnabled bool) {
+func TestModVendorAuto(t *testing.T) {
 	mt := setup(t, `
 -- go.mod --
 module m
@@ -265,7 +263,7 @@ import _ "rsc.io/sampler"
 	}
 
 	wantDir := `pkg.*mod.*/sampler@.*$`
-	if wantEnabled {
+	if testenv.Go1Point() >= 14 {
 		wantDir = `/vendor/`
 	}
 	mt.assertModuleFoundInDir("rsc.io/sampler", "sampler", wantDir)
@@ -550,6 +548,21 @@ package v
 	mt.assertModuleFoundInDir("example.com/vv", "v", `main/v12$`)
 }
 
+// Tests that we handle GO111MODULE=on with no go.mod file. See #30855.
+func TestNoMainModule(t *testing.T) {
+	testenv.NeedsGo1Point(t, 12)
+	mt := setup(t, `
+-- x.go --
+package x
+`, "")
+	defer mt.cleanup()
+	if _, err := mt.env.invokeGo(context.Background(), "mod", "download", "rsc.io/quote@v1.5.1"); err != nil {
+		t.Fatal(err)
+	}
+
+	mt.assertScanFinds("rsc.io/quote", "quote")
+}
+
 // assertFound asserts that the package at importPath is found to have pkgName,
 // and that scanning for pkgName finds it at importPath.
 func (t *modTest) assertFound(importPath, pkgName string) (string, *pkg) {
@@ -639,6 +652,7 @@ var proxyDir string
 type modTest struct {
 	*testing.T
 	env      *ProcessEnv
+	gopath   string
 	resolver *ModuleResolver
 	cleanup  func()
 }
@@ -647,6 +661,7 @@ type modTest struct {
 // in testdata/mod, along the lines of TestScript in cmd/go.
 func setup(t *testing.T, main, wd string) *modTest {
 	t.Helper()
+	testenv.NeedsGo1Point(t, 11)
 	testenv.NeedsTool(t, "go")
 
 	proxyOnce.Do(func() {
@@ -671,18 +686,19 @@ func setup(t *testing.T, main, wd string) *modTest {
 	}
 
 	env := &ProcessEnv{
-		GOROOT:      build.Default.GOROOT,
-		GOPATH:      filepath.Join(dir, "gopath"),
-		GO111MODULE: "on",
-		GOPROXY:     proxyDirToURL(proxyDir),
-		GOSUMDB:     "off",
+		Env: map[string]string{
+			"GOPATH":      filepath.Join(dir, "gopath"),
+			"GOMODCACHE":  "",
+			"GO111MODULE": "on",
+			"GOSUMDB":     "off",
+			"GOPROXY":     proxydir.ToURL(proxyDir),
+		},
 		WorkingDir:  filepath.Join(mainDir, wd),
 		GocmdRunner: &gocommand.Runner{},
 	}
 	if *testDebug {
 		env.Logf = log.Printf
 	}
-
 	// go mod download gets mad if we don't have a go.mod, so make sure we do.
 	_, err = os.Stat(filepath.Join(mainDir, "go.mod"))
 	if err != nil && !os.IsNotExist(err) {
@@ -694,10 +710,15 @@ func setup(t *testing.T, main, wd string) *modTest {
 		}
 	}
 
+	resolver, err := env.GetResolver()
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &modTest{
 		T:        t,
+		gopath:   env.Env["GOPATH"],
 		env:      env,
-		resolver: newModuleResolver(env),
+		resolver: resolver.(*ModuleResolver),
 		cleanup:  func() { removeDir(dir) },
 	}
 }
@@ -823,7 +844,7 @@ package x
 import _ "rsc.io/quote"
 `, "")
 	defer mt.cleanup()
-	want := filepath.Join(mt.resolver.env.GOPATH, "pkg/mod", "rsc.io/quote@v1.5.2")
+	want := filepath.Join(mt.gopath, "pkg/mod", "rsc.io/quote@v1.5.2")
 
 	found := mt.assertScanFinds("rsc.io/quote", "quote")
 	modDir, _ := mt.resolver.modInfo(found.dir)
@@ -834,6 +855,7 @@ import _ "rsc.io/quote"
 
 // Tests that crud in the module cache is ignored.
 func TestInvalidModCache(t *testing.T) {
+	testenv.NeedsGo1Point(t, 11)
 	dir, err := ioutil.TempDir("", t.Name())
 	if err != nil {
 		t.Fatal(err)
@@ -848,14 +870,18 @@ func TestInvalidModCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := &ProcessEnv{
-		GOROOT:      build.Default.GOROOT,
-		GOPATH:      filepath.Join(dir, "gopath"),
-		GO111MODULE: "on",
-		GOSUMDB:     "off",
+		Env: map[string]string{
+			"GOPATH":      filepath.Join(dir, "gopath"),
+			"GO111MODULE": "on",
+			"GOSUMDB":     "off",
+		},
 		GocmdRunner: &gocommand.Runner{},
 		WorkingDir:  dir,
 	}
-	resolver := newModuleResolver(env)
+	resolver, err := env.GetResolver()
+	if err != nil {
+		t.Fatal(err)
+	}
 	scanToSlice(resolver, nil)
 }
 
@@ -865,10 +891,14 @@ func TestGetCandidatesRanking(t *testing.T) {
 module example.com
 
 require rsc.io/quote v1.5.1
+require rsc.io/quote/v3 v3.0.0
 
 -- rpackage/x.go --
 package rpackage
-import _ "rsc.io/quote"
+import (
+	_ "rsc.io/quote"
+	_ "rsc.io/quote/v3"
+)
 `, "")
 	defer mt.cleanup()
 
@@ -877,7 +907,7 @@ import _ "rsc.io/quote"
 	}
 
 	type res struct {
-		relevance  int
+		relevance  float64
 		name, path string
 	}
 	want := []res{
@@ -886,6 +916,8 @@ import _ "rsc.io/quote"
 		{7, "http", "net/http"},
 		// Main module
 		{6, "rpackage", "example.com/rpackage"},
+		// Direct module deps with v2+ major version
+		{5.003, "quote", "rsc.io/quote/v3"},
 		// Direct module deps
 		{5, "quote", "rsc.io/quote"},
 		// Indirect deps
@@ -904,7 +936,7 @@ import _ "rsc.io/quote"
 			}
 		}
 	}
-	if err := getAllCandidates(context.Background(), add, "", "foo.go", "foo", mt.env); err != nil {
+	if err := GetAllCandidates(context.Background(), add, "", "foo.go", "foo", mt.env); err != nil {
 		t.Fatalf("getAllCandidates() = %v", err)
 	}
 	sort.Slice(got, func(i, j int) bool {
@@ -920,17 +952,20 @@ import _ "rsc.io/quote"
 }
 
 func BenchmarkScanModCache(b *testing.B) {
+	testenv.NeedsGo1Point(b, 11)
 	env := &ProcessEnv{
-		GOPATH:      build.Default.GOPATH,
-		GOROOT:      build.Default.GOROOT,
 		GocmdRunner: &gocommand.Runner{},
 		Logf:        log.Printf,
 	}
 	exclude := []gopathwalk.RootType{gopathwalk.RootGOROOT}
-	scanToSlice(env.GetResolver(), exclude)
+	resolver, err := env.GetResolver()
+	if err != nil {
+		b.Fatal(err)
+	}
+	scanToSlice(resolver, exclude)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		scanToSlice(env.GetResolver(), exclude)
-		env.GetResolver().(*ModuleResolver).ClearForNewScan()
+		scanToSlice(resolver, exclude)
+		resolver.(*ModuleResolver).ClearForNewScan()
 	}
 }

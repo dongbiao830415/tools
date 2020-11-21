@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"golang.org/x/tools/internal/lsp/cache"
+	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/lsp/tests"
 	"golang.org/x/tools/internal/span"
 	"golang.org/x/tools/internal/testenv"
@@ -22,12 +23,15 @@ func TestMain(m *testing.M) {
 }
 
 func TestModfileRemainsUnchanged(t *testing.T) {
+	testenv.NeedsGo1Point(t, 14)
+
 	ctx := tests.Context(t)
 	cache := cache.New(ctx, nil)
 	session := cache.NewSession(ctx)
-	options := tests.DefaultOptions()
+	options := source.DefaultOptions().Clone()
+	tests.DefaultOptions(options)
 	options.TempModfile = true
-	options.Env = append(os.Environ(), "GOPACKAGESDRIVER=off", "GOROOT=")
+	options.Env = map[string]string{"GOPACKAGESDRIVER": "off", "GOROOT": ""}
 
 	// Make sure to copy the test directory to a temporary directory so we do not
 	// modify the test code or add go.sum files when we run the tests.
@@ -41,12 +45,10 @@ func TestModfileRemainsUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, snapshot, err := session.NewView(ctx, "diagnostics_test", span.URIFromPath(folder), options)
+	_, _, release, err := session.NewView(ctx, "diagnostics_test", span.URIFromPath(folder), "", options)
+	release()
 	if err != nil {
 		t.Fatal(err)
-	}
-	if _, t := snapshot.View().ModFiles(); t == "" {
-		return
 	}
 	after, err := ioutil.ReadFile(filepath.Join(folder, "go.mod"))
 	if err != nil {

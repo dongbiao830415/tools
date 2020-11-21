@@ -6,11 +6,13 @@ package fillreturns
 
 import (
 	"errors"
+	"go/ast"
 	ast2 "go/ast"
 	"io"
 	"net/http"
 	. "net/http"
 	"net/url"
+	"strconv"
 )
 
 type T struct{}
@@ -39,9 +41,21 @@ func e() (T, error, *bool) {
 	return T{}, (z(http.ListenAndServe))("", nil), nil // want "wrong number of return values \\(want 3, got 1\\)"
 }
 
+func preserveLeft() (int, int, error) {
+	return 1, 0, errors.New("foo") // want "wrong number of return values \\(want 3, got 2\\)"
+}
+
+func matchValues() (int, error, string) {
+	return 3, errors.New("foo"), "" // want "wrong number of return values \\(want 3, got 2\\)"
+}
+
+func preventDataOverwrite() (int, string) {
+	return 0, "", errors.New("foo") // want "wrong number of return values \\(want 2, got 1\\)"
+}
+
 func closure() (string, error) {
 	_ = func() (int, error) {
-		return 0, errors.New("foo") // want "wrong number of return values \\(want 2, got 1\\)"
+		return 0, nil // want "wrong number of return values \\(want 2, got 0\\)"
 	}
 	return "", nil // want "wrong number of return values \\(want 2, got 0\\)"
 }
@@ -51,7 +65,7 @@ func basic() (uint8, uint16, uint32, uint64, int8, int16, int32, int64, float32,
 }
 
 func complex() (*int, []int, [2]int, map[int]int) {
-	return nil, nil, [2]int{}, nil // want "wrong number of return values \\(want 4, got 0\\)"
+	return nil, nil, nil, nil // want "wrong number of return values \\(want 4, got 0\\)"
 }
 
 func structsAndInterfaces() (T, url.URL, T1, I, I1, io.Reader, Client, ast2.Stmt) {
@@ -62,9 +76,62 @@ func m() (int, error) {
 	if 1 == 2 {
 		return 0, nil // want "wrong number of return values \\(want 2, got 0\\)"
 	} else if 1 == 3 {
-		return 0, nil // want "wrong number of return values \\(want 2, got 0\\)"
+		return 0, errors.New("foo") // want "wrong number of return values \\(want 2, got 1\\)"
 	} else {
-		return 0, nil // want "wrong number of return values \\(want 2, got 0\\)"
+		return 1, nil // want "wrong number of return values \\(want 2, got 1\\)"
 	}
 	return 0, nil // want "wrong number of return values \\(want 2, got 0\\)"
+}
+
+func convertibleTypes() (ast2.Expr, int) {
+	return &ast2.ArrayType{}, 0 // want "wrong number of return values \\(want 2, got 1\\)"
+}
+
+func assignableTypes() (map[string]int, int) {
+	type X map[string]int
+	var x X
+	return x, 0 // want "wrong number of return values \\(want 2, got 1\\)"
+}
+
+func interfaceAndError() (I, int) {
+	return errors.New("foo"), 0 // want "wrong number of return values \\(want 2, got 1\\)"
+}
+
+func funcOneReturn() (string, error) {
+	return strconv.Itoa(1), nil // want "wrong number of return values \\(want 2, got 1\\)"
+}
+
+func funcMultipleReturn() (int, error, string) {
+	return strconv.Atoi("1")
+}
+
+func localFuncMultipleReturn() (string, int, error, string) {
+	return b()
+}
+
+func multipleUnused() (int, string, string, string) {
+	return 3, "", "", "", 4, 5 // want "wrong number of return values \\(want 4, got 3\\)"
+}
+
+func gotTooMany() int {
+	if true {
+		return 0 // want "wrong number of return values \\(want 1, got 2\\)"
+	} else {
+		return 1 // want "wrong number of return values \\(want 1, got 3\\)"
+	}
+	return 5 // want "wrong number of return values \\(want 1, got 3\\)"
+}
+
+func fillVars() (int, string, ast.Node, bool, error) {
+	eint := 0
+	s := "a"
+	var t bool
+	if true {
+		err := errors.New("fail")
+		return eint, s, nil, false, err // want "wrong number of return values \\(want 5, got 0\\)"
+	}
+	n := ast.NewIdent("ident")
+	int := 3
+	var b bool
+	return int, "", n, b, nil // want "wrong number of return values \\(want 5, got 1\\)"
 }

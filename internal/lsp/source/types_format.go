@@ -9,19 +9,19 @@ import (
 	"context"
 	"fmt"
 	"go/ast"
+	"go/doc"
 	"go/printer"
 	"go/token"
 	"go/types"
 	"strings"
 
-	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/lsp/debug/tag"
 	"golang.org/x/tools/internal/lsp/protocol"
 )
 
-// formatType returns the detail and kind for a types.Type.
-func formatType(typ types.Type, qf types.Qualifier) (detail string, kind protocol.CompletionItemKind) {
+// FormatType returns the detail and kind for a types.Type.
+func FormatType(typ types.Type, qf types.Qualifier) (detail string, kind protocol.CompletionItemKind) {
 	if types.IsInterface(typ) {
 		detail = "interface{...}"
 		kind = protocol.InterfaceCompletion
@@ -29,7 +29,7 @@ func formatType(typ types.Type, qf types.Qualifier) (detail string, kind protoco
 		detail = "struct{...}"
 		kind = protocol.StructCompletion
 	} else if typ != typ.Underlying() {
-		detail, kind = formatType(typ.Underlying(), qf)
+		detail, kind = FormatType(typ.Underlying(), qf)
 	} else {
 		detail = types.TypeString(typ, qf)
 		kind = protocol.ClassCompletion
@@ -44,7 +44,7 @@ type signature struct {
 	needResultParens bool
 }
 
-func (s *signature) format() string {
+func (s *signature) Format() string {
 	var b strings.Builder
 	b.WriteByte('(')
 	for i, p := range s.params {
@@ -74,12 +74,22 @@ func (s *signature) format() string {
 	return b.String()
 }
 
-func newBuiltinSignature(ctx context.Context, view View, name string) (*signature, error) {
-	astObj, err := view.LookupBuiltin(ctx, name)
+func (s *signature) Params() []string {
+	return s.params
+}
+
+// NewBuiltinSignature returns signature for the builtin object with a given
+// name, if a builtin object with the name exists.
+func NewBuiltinSignature(ctx context.Context, s Snapshot, name string) (*signature, error) {
+	builtin, err := s.BuiltinPackage(ctx)
 	if err != nil {
 		return nil, err
 	}
-	decl, ok := astObj.Decl.(*ast.FuncDecl)
+	obj := builtin.Package.Scope.Lookup(name)
+	if obj == nil {
+		return nil, fmt.Errorf("no builtin object for %s", name)
+	}
+	decl, ok := obj.Decl.(*ast.FuncDecl)
 	if !ok {
 		return nil, fmt.Errorf("no function declaration for builtin: %s", name)
 	}
@@ -94,10 +104,17 @@ func newBuiltinSignature(ctx context.Context, view View, name string) (*signatur
 			variadic = true
 		}
 	}
-	params, _ := formatFieldList(ctx, view, decl.Type.Params, variadic)
-	results, needResultParens := formatFieldList(ctx, view, decl.Type.Results, false)
+	params, _ := formatFieldList(ctx, s, decl.Type.Params, variadic)
+	results, needResultParens := formatFieldList(ctx, s, decl.Type.Results, false)
+	d := decl.Doc.Text()
+	switch s.View().Options().HoverKind {
+	case SynopsisDocumentation:
+		d = doc.Synopsis(d)
+	case NoDocumentation:
+		d = ""
+	}
 	return &signature{
-		doc:              decl.Doc.Text(),
+		doc:              d,
 		name:             name,
 		needResultParens: needResultParens,
 		params:           params,
@@ -112,7 +129,7 @@ var replacer = strings.NewReplacer(
 	`IntegerType`, `int`,
 )
 
-func formatFieldList(ctx context.Context, view View, list *ast.FieldList, variadic bool) ([]string, bool) {
+func formatFieldList(ctx context.Context, snapshot Snapshot, list *ast.FieldList, variadic bool) ([]string, bool) {
 	if list == nil {
 		return nil, false
 	}
@@ -125,7 +142,7 @@ func formatFieldList(ctx context.Context, view View, list *ast.FieldList, variad
 		p := list.List[i]
 		cfg := printer.Config{Mode: printer.UseSpaces | printer.TabIndent, Tabwidth: 4}
 		b := &bytes.Buffer{}
-		if err := cfg.Fprint(b, view.Session().Cache().FileSet(), p.Type); err != nil {
+		if err := cfg.Fprint(b, snapshot.FileSet(), p.Type); err != nil {
 			event.Error(ctx, "unable to print type", nil, tag.Type.Of(p.Type))
 			continue
 		}
@@ -150,11 +167,12 @@ func formatFieldList(ctx context.Context, view View, list *ast.FieldList, variad
 	return result, writeResultParens
 }
 
-func newSignature(ctx context.Context, s Snapshot, pkg Package, file *ast.File, name string, sig *types.Signature, comment *ast.CommentGroup, qf types.Qualifier) (*signature, error) {
+// NewSignature returns formatted signature for a types.Signature struct.
+func NewSignature(ctx context.Context, s Snapshot, pkg Package, sig *types.Signature, comment *ast.CommentGroup, qf types.Qualifier) *signature {
 	params := make([]string, 0, sig.Params().Len())
 	for i := 0; i < sig.Params().Len(); i++ {
 		el := sig.Params().At(i)
-		typ := formatVarType(ctx, s, pkg, file, el, qf)
+		typ := FormatVarType(ctx, s, pkg, el, qf)
 		p := typ
 		if el.Name() != "" {
 			p = el.Name() + " " + typ
@@ -168,7 +186,7 @@ func newSignature(ctx context.Context, s Snapshot, pkg Package, file *ast.File, 
 			needResultParens = true
 		}
 		el := sig.Results().At(i)
-		typ := formatVarType(ctx, s, pkg, file, el, qf)
+		typ := FormatVarType(ctx, s, pkg, el, qf)
 		if el.Name() == "" {
 			results = append(results, typ)
 		} else {
@@ -178,38 +196,39 @@ func newSignature(ctx context.Context, s Snapshot, pkg Package, file *ast.File, 
 			results = append(results, el.Name()+" "+typ)
 		}
 	}
-	var doc string
+	var d string
 	if comment != nil {
-		doc = comment.Text()
+		d = comment.Text()
+	}
+	switch s.View().Options().HoverKind {
+	case SynopsisDocumentation:
+		d = doc.Synopsis(d)
+	case NoDocumentation:
+		d = ""
 	}
 	return &signature{
-		doc:              doc,
+		doc:              d,
 		params:           params,
 		results:          results,
 		variadic:         sig.Variadic(),
 		needResultParens: needResultParens,
-	}, nil
+	}
 }
 
-// formatVarType formats a *types.Var, accounting for type aliases.
+// FormatVarType formats a *types.Var, accounting for type aliases.
 // To do this, it looks in the AST of the file in which the object is declared.
 // On any errors, it always fallbacks back to types.TypeString.
-func formatVarType(ctx context.Context, s Snapshot, srcpkg Package, srcfile *ast.File, obj *types.Var, qf types.Qualifier) string {
-	file, pkg, err := findPosInPackage(s.View(), srcpkg, obj.Pos())
+func FormatVarType(ctx context.Context, snapshot Snapshot, srcpkg Package, obj *types.Var, qf types.Qualifier) string {
+	pgf, pkg, err := FindPosInPackage(snapshot, srcpkg, obj.Pos())
 	if err != nil {
 		return types.TypeString(obj.Type(), qf)
 	}
-	// Named and unnamed variables must be handled differently.
-	// Unnamed variables appear in the result values of a function signature.
-	var expr ast.Expr
-	if obj.Name() != "" {
-		expr, err = namedVarType(ctx, s, pkg, file, obj)
-	} else {
-		expr, err = unnamedVarType(file, obj)
-	}
+
+	expr, err := varType(ctx, snapshot, pgf, obj)
 	if err != nil {
 		return types.TypeString(obj.Type(), qf)
 	}
+
 	// The type names in the AST may not be correctly qualified.
 	// Determine the package name to use based on the package that originated
 	// the query and the package in which the type is declared.
@@ -219,54 +238,30 @@ func formatVarType(ctx context.Context, s Snapshot, srcpkg Package, srcfile *ast
 
 	// If the request came from a different package than the one in which the
 	// types are defined, we may need to modify the qualifiers.
-	qualified = qualifyExpr(s.View().Session().Cache().FileSet(), qualified, srcpkg, pkg, srcfile, clonedInfo)
-	fmted := formatNode(s.View().Session().Cache().FileSet(), qualified)
+	qualified = qualifyExpr(qualified, srcpkg, pkg, clonedInfo, qf)
+	fmted := FormatNode(snapshot.FileSet(), qualified)
 	return fmted
 }
 
-// unnamedVarType finds the type for an unnamed variable.
-func unnamedVarType(file *ast.File, obj *types.Var) (ast.Expr, error) {
-	path, _ := astutil.PathEnclosingInterval(file, obj.Pos(), obj.Pos())
-	var expr ast.Expr
-	for _, p := range path {
-		e, ok := p.(ast.Expr)
-		if !ok {
-			break
-		}
-		expr = e
-	}
-	typ, ok := expr.(ast.Expr)
-	if !ok {
-		return nil, fmt.Errorf("unexpected type for node (%T)", path[0])
-	}
-	return typ, nil
-}
-
-// namedVarType returns the type for a named variable.
-func namedVarType(ctx context.Context, s Snapshot, pkg Package, file *ast.File, obj *types.Var) (ast.Expr, error) {
-	ident, err := findIdentifier(ctx, s, pkg, file, obj.Pos())
+// varType returns the type expression for a *types.Var.
+func varType(ctx context.Context, snapshot Snapshot, pgf *ParsedGoFile, obj *types.Var) (ast.Expr, error) {
+	posToField, err := snapshot.PosToField(ctx, pgf)
 	if err != nil {
 		return nil, err
 	}
-	if ident.Declaration.obj != obj {
-		return nil, fmt.Errorf("expected the ident's declaration %v to be equal to obj %v", ident.Declaration.obj, obj)
-	}
-	if i := ident.ident; i == nil || i.Obj == nil || i.Obj.Decl == nil {
+	field := posToField[obj.Pos()]
+	if field == nil {
 		return nil, fmt.Errorf("no declaration for object %s", obj.Name())
 	}
-	f, ok := ident.ident.Obj.Decl.(*ast.Field)
+	typ, ok := field.Type.(ast.Expr)
 	if !ok {
-		return nil, fmt.Errorf("declaration of object %v is %T, not *ast.Field", obj.Name(), ident.ident.Obj.Decl)
-	}
-	typ, ok := f.Type.(ast.Expr)
-	if !ok {
-		return nil, fmt.Errorf("unexpected type for node (%T)", f.Type)
+		return nil, fmt.Errorf("unexpected type for node (%T)", field.Type)
 	}
 	return typ, nil
 }
 
 // qualifyExpr applies the "pkgName." prefix to any *ast.Ident in the expr.
-func qualifyExpr(fset *token.FileSet, expr ast.Expr, srcpkg, pkg Package, file *ast.File, clonedInfo map[token.Pos]*types.PkgName) ast.Expr {
+func qualifyExpr(expr ast.Expr, srcpkg, pkg Package, clonedInfo map[token.Pos]*types.PkgName, qf types.Qualifier) ast.Expr {
 	ast.Inspect(expr, func(n ast.Node) bool {
 		switch n := n.(type) {
 		case *ast.ArrayType, *ast.ChanType, *ast.Ellipsis,
@@ -287,7 +282,7 @@ func qualifyExpr(fset *token.FileSet, expr ast.Expr, srcpkg, pkg Package, file *
 			if !ok {
 				return false
 			}
-			pkgName := importedPkgName(fset, srcpkg.GetTypes(), obj.Imported(), file)
+			pkgName := qf(obj.Imported())
 			if pkgName != "" {
 				x.Name = pkgName
 			}
@@ -298,31 +293,13 @@ func qualifyExpr(fset *token.FileSet, expr ast.Expr, srcpkg, pkg Package, file *
 			}
 			// Only add the qualifier if the identifier is exported.
 			if ast.IsExported(n.Name) {
-				pkgName := importedPkgName(fset, srcpkg.GetTypes(), pkg.GetTypes(), file)
+				pkgName := qf(pkg.GetTypes())
 				n.Name = pkgName + "." + n.Name
 			}
 		}
 		return false
 	})
 	return expr
-}
-
-// importedPkgName returns the package name used for pkg in srcpkg.
-func importedPkgName(fset *token.FileSet, srcpkg, pkg *types.Package, file *ast.File) string {
-	if srcpkg == pkg {
-		return ""
-	}
-	// If the file already imports the package under another name, use that.
-	for _, group := range astutil.Imports(fset, file) {
-		for _, cand := range group {
-			if strings.Trim(cand.Path.Value, `"`) == pkg.Path() {
-				if cand.Name != nil && cand.Name.Name != "" {
-					return cand.Name.Name
-				}
-			}
-		}
-	}
-	return pkg.Name()
 }
 
 // cloneExpr only clones expressions that appear in the parameters or return

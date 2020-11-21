@@ -8,16 +8,20 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"strings"
 	"time"
 
+	"golang.org/x/tools/internal/fakenet"
 	"golang.org/x/tools/internal/jsonrpc2"
 	"golang.org/x/tools/internal/lsp/cache"
 	"golang.org/x/tools/internal/lsp/debug"
 	"golang.org/x/tools/internal/lsp/lsprpc"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/tool"
+	errors "golang.org/x/xerrors"
 )
 
 // Serve is a struct that exposes the configurable parts of the LSP server as
@@ -31,9 +35,9 @@ type Serve struct {
 	Trace       bool          `flag:"rpc.trace" help:"print the full rpc trace in lsp inspector format"`
 	Debug       string        `flag:"debug" help:"serve debug information on the supplied address"`
 
-	RemoteListenTimeout time.Duration `flag:"remote.listen.timeout" help:"when used with -remote=auto, the listen.timeout used when auto-starting the remote"`
-	RemoteDebug         string        `flag:"remote.debug" help:"when used with -remote=auto, the debug address used when auto-starting the remote"`
-	RemoteLogfile       string        `flag:"remote.logfile" help:"when used with -remote=auto, the filename for the remote daemon to log to"`
+	RemoteListenTimeout time.Duration `flag:"remote.listen.timeout" help:"when used with -remote=auto, the -listen.timeout value used to start the daemon"`
+	RemoteDebug         string        `flag:"remote.debug" help:"when used with -remote=auto, the -debug value used to start the daemon"`
+	RemoteLogfile       string        `flag:"remote.logfile" help:"when used with -remote=auto, the -logfile value used to start the daemon"`
 
 	app *Application
 }
@@ -61,8 +65,9 @@ func (s *Serve) Run(ctx context.Context, args ...string) error {
 	}
 
 	di := debug.GetInstance(ctx)
+	isDaemon := s.Address != "" || s.Port != 0
 	if di != nil {
-		closeLog, err := di.SetLogFile(s.Logfile)
+		closeLog, err := di.SetLogFile(s.Logfile, isDaemon)
 		if err != nil {
 			return err
 		}
@@ -81,22 +86,32 @@ func (s *Serve) Run(ctx context.Context, args ...string) error {
 			lsprpc.RemoteLogfile(s.RemoteLogfile),
 		)
 	} else {
-		ss = lsprpc.NewStreamServer(cache.New(ctx, s.app.options))
+		ss = lsprpc.NewStreamServer(cache.New(ctx, s.app.options), isDaemon)
 	}
 
+	var network, addr string
 	if s.Address != "" {
-		network, addr := parseAddr(s.Address)
-		return jsonrpc2.ListenAndServe(ctx, network, addr, ss, s.IdleTimeout)
+		network, addr = parseAddr(s.Address)
 	}
 	if s.Port != 0 {
-		addr := fmt.Sprintf(":%v", s.Port)
-		return jsonrpc2.ListenAndServe(ctx, "tcp", addr, ss, s.IdleTimeout)
+		network = "tcp"
+		addr = fmt.Sprintf(":%v", s.Port)
 	}
-	stream := jsonrpc2.NewHeaderStream(os.Stdin, os.Stdout)
+	if addr != "" {
+		log.Printf("Gopls daemon: listening on %s network, address %s...", network, addr)
+		defer log.Printf("Gopls daemon: exiting")
+		return jsonrpc2.ListenAndServe(ctx, network, addr, ss, s.IdleTimeout)
+	}
+	stream := jsonrpc2.NewHeaderStream(fakenet.NewConn("stdio", os.Stdin, os.Stdout))
 	if s.Trace && di != nil {
 		stream = protocol.LoggingStream(stream, di.LogWriter)
 	}
-	return ss.ServeStream(ctx, stream)
+	conn := jsonrpc2.NewConn(stream)
+	err := ss.ServeStream(ctx, conn)
+	if errors.Is(err, io.EOF) {
+		return nil
+	}
+	return err
 }
 
 // parseAddr parses the -listen flag in to a network, and address.

@@ -11,16 +11,18 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"sort"
 
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/lsp/protocol"
+	"golang.org/x/xerrors"
 )
 
-func Implementation(ctx context.Context, s Snapshot, f FileHandle, pp protocol.Position) ([]protocol.Location, error) {
+func Implementation(ctx context.Context, snapshot Snapshot, f FileHandle, pp protocol.Position) ([]protocol.Location, error) {
 	ctx, done := event.Start(ctx, "source.Implementation")
 	defer done()
 
-	impls, err := implementations(ctx, s, f, pp)
+	impls, err := implementations(ctx, snapshot, f, pp)
 	if err != nil {
 		return nil, err
 	}
@@ -29,7 +31,7 @@ func Implementation(ctx context.Context, s Snapshot, f FileHandle, pp protocol.P
 		if impl.pkg == nil || len(impl.pkg.CompiledGoFiles()) == 0 {
 			continue
 		}
-		rng, err := objToMappedRange(s.View(), impl.pkg, impl.obj)
+		rng, err := objToMappedRange(snapshot, impl.pkg, impl.obj)
 		if err != nil {
 			return nil, err
 		}
@@ -42,6 +44,13 @@ func Implementation(ctx context.Context, s Snapshot, f FileHandle, pp protocol.P
 			Range: pr,
 		})
 	}
+	sort.Slice(locations, func(i, j int) bool {
+		li, lj := locations[i], locations[j]
+		if li.URI == lj.URI {
+			return protocol.CompareRange(li.Range, lj.Range) < 0
+		}
+		return li.URI < lj.URI
+	})
 	return locations, nil
 }
 
@@ -53,7 +62,7 @@ func implementations(ctx context.Context, s Snapshot, f FileHandle, pp protocol.
 	var (
 		impls []qualifiedObject
 		seen  = make(map[token.Position]bool)
-		fset  = s.View().Session().Cache().FileSet()
+		fset  = s.FileSet()
 	)
 
 	qos, err := qualifiedObjsAtProtocolPos(ctx, s, f, pp)
@@ -94,11 +103,7 @@ func implementations(ctx context.Context, s Snapshot, f FileHandle, pp protocol.
 		if err != nil {
 			return nil, err
 		}
-		for _, ph := range knownPkgs {
-			pkg, err := ph.Check(ctx)
-			if err != nil {
-				return nil, err
-			}
+		for _, pkg := range knownPkgs {
 			pkgs[pkg.GetTypes()] = pkg
 			info := pkg.GetTypesInfo()
 			for _, obj := range info.Defs {
@@ -160,7 +165,7 @@ func implementations(ctx context.Context, s Snapshot, f FileHandle, pp protocol.
 // concreteImplementsIntf returns true if a is an interface type implemented by
 // concrete type b, or vice versa.
 func concreteImplementsIntf(a, b types.Type) bool {
-	aIsIntf, bIsIntf := isInterface(a), isInterface(b)
+	aIsIntf, bIsIntf := IsInterface(a), IsInterface(b)
 
 	// Make sure exactly one is an interface type.
 	if aIsIntf == bIsIntf {
@@ -179,7 +184,7 @@ func concreteImplementsIntf(a, b types.Type) bool {
 // type. This is useful to make sure you consider a named type's full method
 // set.
 func ensurePointer(T types.Type) types.Type {
-	if _, ok := T.(*types.Named); ok && !isInterface(T) {
+	if _, ok := T.(*types.Named); ok && !IsInterface(T) {
 		return types.NewPointer(T)
 	}
 
@@ -199,30 +204,30 @@ type qualifiedObject struct {
 	sourcePkg Package
 }
 
-var errBuiltin = errors.New("builtin object")
+var (
+	errBuiltin       = errors.New("builtin object")
+	errNoObjectFound = errors.New("no object found")
+)
 
 // qualifiedObjsAtProtocolPos returns info for all the type.Objects
 // referenced at the given position. An object will be returned for
-// every package that the file belongs to.
+// every package that the file belongs to, in every typechecking mode
+// applicable.
 func qualifiedObjsAtProtocolPos(ctx context.Context, s Snapshot, fh FileHandle, pp protocol.Position) ([]qualifiedObject, error) {
-	phs, err := s.PackageHandles(ctx, fh)
+	pkgs, err := s.PackagesForFile(ctx, fh.URI(), TypecheckAll)
 	if err != nil {
 		return nil, err
 	}
 	// Check all the packages that the file belongs to.
 	var qualifiedObjs []qualifiedObject
-	for _, ph := range phs {
-		searchpkg, err := ph.Check(ctx)
-		if err != nil {
-			return nil, err
-		}
+	for _, searchpkg := range pkgs {
 		astFile, pos, err := getASTFile(searchpkg, fh, pp)
 		if err != nil {
 			return nil, err
 		}
 		path := pathEnclosingObjNode(astFile, pos)
 		if path == nil {
-			return nil, ErrNoIdentFound
+			continue
 		}
 		var objs []types.Object
 		switch leaf := path[0].(type) {
@@ -230,12 +235,12 @@ func qualifiedObjsAtProtocolPos(ctx context.Context, s Snapshot, fh FileHandle, 
 			// If leaf represents an implicit type switch object or the type
 			// switch "assign" variable, expand to all of the type switch's
 			// implicit objects.
-			if implicits := typeSwitchImplicits(searchpkg, path); len(implicits) > 0 {
+			if implicits, _ := typeSwitchImplicits(searchpkg, path); len(implicits) > 0 {
 				objs = append(objs, implicits...)
 			} else {
 				obj := searchpkg.GetTypesInfo().ObjectOf(leaf)
 				if obj == nil {
-					return nil, fmt.Errorf("no object for %q", leaf.Name)
+					return nil, xerrors.Errorf("%w for %q", errNoObjectFound, leaf.Name)
 				}
 				objs = append(objs, obj)
 			}
@@ -243,7 +248,7 @@ func qualifiedObjsAtProtocolPos(ctx context.Context, s Snapshot, fh FileHandle, 
 			// Look up the implicit *types.PkgName.
 			obj := searchpkg.GetTypesInfo().Implicits[leaf]
 			if obj == nil {
-				return nil, fmt.Errorf("no object for import %q", importPath(leaf))
+				return nil, xerrors.Errorf("%w for import %q", errNoObjectFound, ImportPath(leaf))
 			}
 			objs = append(objs, obj)
 		}
@@ -261,7 +266,7 @@ func qualifiedObjsAtProtocolPos(ctx context.Context, s Snapshot, fh FileHandle, 
 		addPkg(searchpkg)
 		for _, obj := range objs {
 			if obj.Parent() == types.Universe {
-				return nil, fmt.Errorf("%w %q", errBuiltin, obj.Name())
+				return nil, xerrors.Errorf("%q: %w", obj.Name(), errBuiltin)
 			}
 			pkg, ok := pkgs[obj.Pkg()]
 			if !ok {
@@ -279,29 +284,25 @@ func qualifiedObjsAtProtocolPos(ctx context.Context, s Snapshot, fh FileHandle, 
 	// Return an error if no objects were found since callers will assume that
 	// the slice has at least 1 element.
 	if len(qualifiedObjs) == 0 {
-		return nil, fmt.Errorf("no object found")
+		return nil, errNoObjectFound
 	}
 	return qualifiedObjs, nil
 }
 
 func getASTFile(pkg Package, f FileHandle, pos protocol.Position) (*ast.File, token.Pos, error) {
-	pgh, err := pkg.File(f.Identity().URI)
+	pgf, err := pkg.File(f.URI())
 	if err != nil {
 		return nil, 0, err
 	}
-	file, _, m, _, err := pgh.Cached()
+	spn, err := pgf.Mapper.PointSpan(pos)
 	if err != nil {
 		return nil, 0, err
 	}
-	spn, err := m.PointSpan(pos)
+	rng, err := spn.Range(pgf.Mapper.Converter)
 	if err != nil {
 		return nil, 0, err
 	}
-	rng, err := spn.Range(m.Converter)
-	if err != nil {
-		return nil, 0, err
-	}
-	return file, rng.Start, nil
+	return pgf.File, rng.Start, nil
 }
 
 // pathEnclosingObjNode returns the AST path to the object-defining

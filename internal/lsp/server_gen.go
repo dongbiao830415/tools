@@ -36,8 +36,8 @@ func (s *Server) DidChange(ctx context.Context, params *protocol.DidChangeTextDo
 	return s.didChange(ctx, params)
 }
 
-func (s *Server) DidChangeConfiguration(ctx context.Context, changed *protocol.DidChangeConfigurationParams) error {
-	return s.didChangeConfiguration(ctx, changed)
+func (s *Server) DidChangeConfiguration(ctx context.Context, _ *protocol.DidChangeConfigurationParams) error {
+	return s.didChangeConfiguration(ctx, nil)
 }
 
 func (s *Server) DidChangeWatchedFiles(ctx context.Context, params *protocol.DidChangeWatchedFilesParams) error {
@@ -100,8 +100,8 @@ func (s *Server) Implementation(ctx context.Context, params *protocol.Implementa
 	return s.implementation(ctx, params)
 }
 
-func (s *Server) IncomingCalls(context.Context, *protocol.CallHierarchyIncomingCallsParams) ([]protocol.CallHierarchyIncomingCall, error) {
-	return nil, notImplemented("IncomingCalls")
+func (s *Server) IncomingCalls(ctx context.Context, params *protocol.CallHierarchyIncomingCallsParams) ([]protocol.CallHierarchyIncomingCall, error) {
+	return s.incomingCalls(ctx, params)
 }
 
 func (s *Server) Initialize(ctx context.Context, params *protocol.ParamInitialize) (*protocol.InitializeResult, error) {
@@ -112,8 +112,12 @@ func (s *Server) Initialized(ctx context.Context, params *protocol.InitializedPa
 	return s.initialized(ctx, params)
 }
 
-func (s *Server) LogTraceNotification(context.Context, *protocol.LogTraceParams) error {
-	return notImplemented("LogTraceNotification")
+func (s *Server) LogTrace(context.Context, *protocol.LogTraceParams) error {
+	return notImplemented("LogTrace")
+}
+
+func (s *Server) Moniker(context.Context, *protocol.MonikerParams) ([]protocol.Moniker, error) {
+	return nil, notImplemented("Moniker")
 }
 
 func (s *Server) NonstandardRequest(ctx context.Context, method string, params interface{}) (interface{}, error) {
@@ -124,12 +128,12 @@ func (s *Server) OnTypeFormatting(context.Context, *protocol.DocumentOnTypeForma
 	return nil, notImplemented("OnTypeFormatting")
 }
 
-func (s *Server) OutgoingCalls(context.Context, *protocol.CallHierarchyOutgoingCallsParams) ([]protocol.CallHierarchyOutgoingCall, error) {
-	return nil, notImplemented("OutgoingCalls")
+func (s *Server) OutgoingCalls(ctx context.Context, params *protocol.CallHierarchyOutgoingCallsParams) ([]protocol.CallHierarchyOutgoingCall, error) {
+	return s.outgoingCalls(ctx, params)
 }
 
-func (s *Server) PrepareCallHierarchy(context.Context, *protocol.CallHierarchyPrepareParams) ([]protocol.CallHierarchyItem, error) {
-	return nil, notImplemented("PrepareCallHierarchy")
+func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.CallHierarchyPrepareParams) ([]protocol.CallHierarchyItem, error) {
+	return s.prepareCallHierarchy(ctx, params)
 }
 
 func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRenameParams) (*protocol.Range, error) {
@@ -152,6 +156,10 @@ func (s *Server) Resolve(context.Context, *protocol.CompletionItem) (*protocol.C
 	return nil, notImplemented("Resolve")
 }
 
+func (s *Server) ResolveCodeAction(context.Context, *protocol.CodeAction) (*protocol.CodeAction, error) {
+	return nil, notImplemented("ResolveCodeAction")
+}
+
 func (s *Server) ResolveCodeLens(context.Context, *protocol.CodeLens) (*protocol.CodeLens, error) {
 	return nil, notImplemented("ResolveCodeLens")
 }
@@ -164,20 +172,24 @@ func (s *Server) SelectionRange(context.Context, *protocol.SelectionRangeParams)
 	return nil, notImplemented("SelectionRange")
 }
 
-func (s *Server) SemanticTokens(context.Context, *protocol.SemanticTokensParams) (*protocol.SemanticTokens, error) {
-	return nil, notImplemented("SemanticTokens")
+func (s *Server) SemanticTokensFull(ctx context.Context, p *protocol.SemanticTokensParams) (*protocol.SemanticTokens, error) {
+	return s.semanticTokensFull(ctx, p)
 }
 
-func (s *Server) SemanticTokensEdits(context.Context, *protocol.SemanticTokensEditsParams) (interface{}, error) {
-	return nil, notImplemented("SemanticTokensEdits")
+func (s *Server) SemanticTokensFullDelta(ctx context.Context, p *protocol.SemanticTokensDeltaParams) (interface{}, error) {
+	return s.semanticTokensFullDelta(ctx, p)
 }
 
-func (s *Server) SemanticTokensRange(context.Context, *protocol.SemanticTokensRangeParams) (*protocol.SemanticTokens, error) {
-	return nil, notImplemented("SemanticTokensRange")
+func (s *Server) SemanticTokensRange(ctx context.Context, p *protocol.SemanticTokensRangeParams) (*protocol.SemanticTokens, error) {
+	return s.semanticTokensRange(ctx, p)
 }
 
-func (s *Server) SetTraceNotification(context.Context, *protocol.SetTraceParams) error {
-	return notImplemented("SetTraceNotification")
+func (s *Server) SemanticTokensRefresh(ctx context.Context) error {
+	return s.semanticTokensRefresh(ctx)
+}
+
+func (s *Server) SetTrace(context.Context, *protocol.SetTraceParams) error {
+	return notImplemented("SetTrace")
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {

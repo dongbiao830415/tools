@@ -18,6 +18,7 @@ import (
 	"golang.org/x/tools/internal/lsp/diff/myers"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
+	"golang.org/x/tools/internal/lsp/source/completion"
 	"golang.org/x/tools/internal/span"
 )
 
@@ -227,11 +228,11 @@ func DiffCodeLens(uri span.URI, want, got []protocol.CodeLens) string {
 	}
 	for i, w := range want {
 		g := got[i]
+		if w.Command.Command != g.Command.Command {
+			return summarizeCodeLens(i, uri, want, got, "incorrect Command Name got %v want %v", g.Command.Command, w.Command.Command)
+		}
 		if w.Command.Title != g.Command.Title {
 			return summarizeCodeLens(i, uri, want, got, "incorrect Command Title got %v want %v", g.Command.Title, w.Command.Title)
-		}
-		if w.Command.Command != g.Command.Command {
-			return summarizeCodeLens(i, uri, want, got, "incorrect Command Title got %v want %v", g.Command.Command, w.Command.Command)
 		}
 		if protocol.ComparePosition(w.Range.Start, g.Range.Start) != 0 {
 			return summarizeCodeLens(i, uri, want, got, "incorrect Start got %v want %v", g.Range.Start, w.Range.Start)
@@ -252,11 +253,11 @@ func sortCodeLens(c []protocol.CodeLens) {
 		}
 		if c[i].Command.Command < c[j].Command.Command {
 			return true
+		} else if c[i].Command.Command == c[j].Command.Command {
+			return c[i].Command.Title < c[j].Command.Title
+		} else {
+			return false
 		}
-		if c[i].Command.Command == c[j].Command.Command {
-			return true
-		}
-		return c[i].Command.Title <= c[j].Command.Title
 	})
 }
 
@@ -310,7 +311,29 @@ func DiffSignatures(spn span.Span, want, got *protocol.SignatureHelp) string {
 	return ""
 }
 
-func ToProtocolCompletionItems(items []source.CompletionItem) []protocol.CompletionItem {
+// DiffCallHierarchyItems returns the diff between expected and actual call locations for incoming/outgoing call hierarchies
+func DiffCallHierarchyItems(gotCalls []protocol.CallHierarchyItem, expectedCalls []protocol.CallHierarchyItem) string {
+	expected := make(map[protocol.Location]bool)
+	for _, call := range expectedCalls {
+		expected[protocol.Location{URI: call.URI, Range: call.Range}] = true
+	}
+
+	got := make(map[protocol.Location]bool)
+	for _, call := range gotCalls {
+		got[protocol.Location{URI: call.URI, Range: call.Range}] = true
+	}
+	if len(got) != len(expected) {
+		return fmt.Sprintf("expected %d calls but got %d", len(expected), len(got))
+	}
+	for spn := range got {
+		if !expected[spn] {
+			return fmt.Sprintf("incorrect calls, expected locations %v but got locations %v", expected, got)
+		}
+	}
+	return ""
+}
+
+func ToProtocolCompletionItems(items []completion.CompletionItem) []protocol.CompletionItem {
 	var result []protocol.CompletionItem
 	for _, item := range items {
 		result = append(result, ToProtocolCompletionItem(item))
@@ -318,7 +341,7 @@ func ToProtocolCompletionItems(items []source.CompletionItem) []protocol.Complet
 	return result
 }
 
-func ToProtocolCompletionItem(item source.CompletionItem) protocol.CompletionItem {
+func ToProtocolCompletionItem(item completion.CompletionItem) protocol.CompletionItem {
 	pItem := protocol.CompletionItem{
 		Label:         item.Label,
 		Kind:          item.Kind,
@@ -441,7 +464,7 @@ func DiffSnippets(want string, got *protocol.CompletionItem) string {
 	return ""
 }
 
-func FindItem(list []protocol.CompletionItem, want source.CompletionItem) *protocol.CompletionItem {
+func FindItem(list []protocol.CompletionItem, want completion.CompletionItem) *protocol.CompletionItem {
 	for _, item := range list {
 		if item.Label == want.Label {
 			return &item
@@ -495,25 +518,28 @@ func summarizeCompletionItems(i int, want, got []protocol.CompletionItem, reason
 	return msg.String()
 }
 
-func FormatFolderName(folder string) string {
-	if index := strings.Index(folder, "testdata"); index != -1 {
-		return folder[index:]
-	}
-	return folder
-}
-
-func EnableAllAnalyzers(snapshot source.Snapshot, opts *source.Options) {
-	if opts.UserEnabledAnalyses == nil {
-		opts.UserEnabledAnalyses = make(map[string]bool)
+func EnableAllAnalyzers(view source.View, opts *source.Options) {
+	if opts.Analyses == nil {
+		opts.Analyses = make(map[string]bool)
 	}
 	for _, a := range opts.DefaultAnalyzers {
-		if !a.Enabled(snapshot) {
-			opts.UserEnabledAnalyses[a.Analyzer.Name] = true
+		if !a.IsEnabled(view) {
+			opts.Analyses[a.Analyzer.Name] = true
 		}
 	}
 	for _, a := range opts.TypeErrorAnalyzers {
-		if !a.Enabled(snapshot) {
-			opts.UserEnabledAnalyses[a.Analyzer.Name] = true
+		if !a.IsEnabled(view) {
+			opts.Analyses[a.Analyzer.Name] = true
+		}
+	}
+	for _, a := range opts.ConvenienceAnalyzers {
+		if !a.IsEnabled(view) {
+			opts.Analyses[a.Analyzer.Name] = true
+		}
+	}
+	for _, a := range opts.StaticcheckAnalyzers {
+		if !a.IsEnabled(view) {
+			opts.Analyses[a.Analyzer.Name] = true
 		}
 	}
 }

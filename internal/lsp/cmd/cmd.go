@@ -14,7 +14,6 @@ import (
 	"go/token"
 	"io/ioutil"
 	"log"
-	"net"
 	"os"
 	"strings"
 	"sync"
@@ -24,6 +23,7 @@ import (
 	"golang.org/x/tools/internal/lsp"
 	"golang.org/x/tools/internal/lsp/cache"
 	"golang.org/x/tools/internal/lsp/debug"
+	"golang.org/x/tools/internal/lsp/lsprpc"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
@@ -57,18 +57,25 @@ type Application struct {
 	// The environment variables to use.
 	env []string
 
-	// Support for remote lsp server
+	// Support for remote LSP server.
 	Remote string `flag:"remote" help:"forward all commands to a remote lsp specified by this flag. With no special prefix, this is assumed to be a TCP address. If prefixed by 'unix;', the subsequent address is assumed to be a unix domain socket. If 'auto', or prefixed by 'auto;', the remote address is automatically resolved based on the executing environment."`
 
-	// Enable verbose logging
+	// Verbose enables verbose logging.
 	Verbose bool `flag:"v" help:"verbose output"`
 
+	// VeryVerbose enables a higher level of verbosity in logging output.
+	VeryVerbose bool `flag:"vv" help:"very verbose output"`
+
 	// Control ocagent export of telemetry
-	OCAgent string `flag:"ocagent" help:"the address of the ocagent, or off"`
+	OCAgent string `flag:"ocagent" help:"the address of the ocagent (e.g. http://localhost:55678), or off"`
 
 	// PrepareOptions is called to update the options when a new view is built.
 	// It is primarily to allow the behavior of gopls to be modified by hooks.
 	PrepareOptions func(*source.Options)
+}
+
+func (app *Application) verbose() bool {
+	return app.Verbose || app.VeryVerbose
 }
 
 // New returns a new Application ready to run.
@@ -85,7 +92,6 @@ func New(name, wd string, env []string, options func(*source.Options)) *Applicat
 
 		Serve: Serve{
 			RemoteListenTimeout: 1 * time.Minute,
-			RemoteLogfile:       "auto",
 		},
 	}
 	return app
@@ -164,11 +170,13 @@ func (app *Application) mainCommands() []tool.Application {
 		&app.Serve,
 		&version{app: app},
 		&bug{},
+		&apiJSON{},
 	}
 }
 
 func (app *Application) featureCommands() []tool.Application {
 	return []tool.Application{
+		&callHierarchy{app: app},
 		&check{app: app},
 		&definition{app: app},
 		&foldingRanges{app: app},
@@ -181,9 +189,11 @@ func (app *Application) featureCommands() []tool.Application {
 		&prepareRename{app: app},
 		&references{app: app},
 		&rename{app: app},
+		&semtok{app: app},
 		&signature{app: app},
-		&suggestedfix{app: app},
+		&suggestedFix{app: app},
 		&symbols{app: app},
+		&workspace{app: app},
 		&workspaceSymbol{app: app},
 	}
 }
@@ -203,9 +213,9 @@ func (app *Application) connect(ctx context.Context) (*connection, error) {
 	case strings.HasPrefix(app.Remote, "internal@"):
 		internalMu.Lock()
 		defer internalMu.Unlock()
-		opts := source.DefaultOptions()
+		opts := source.DefaultOptions().Clone()
 		if app.options != nil {
-			app.options(&opts)
+			app.options(opts)
 		}
 		key := fmt.Sprintf("%s %v", app.wd, opts)
 		if c := internalConnections[key]; c != nil {
@@ -224,17 +234,27 @@ func (app *Application) connect(ctx context.Context) (*connection, error) {
 	}
 }
 
+// CloseTestConnections terminates shared connections used in command tests. It
+// should only be called from tests.
+func CloseTestConnections(ctx context.Context) {
+	for _, c := range internalConnections {
+		c.Shutdown(ctx)
+		c.Exit(ctx)
+	}
+}
+
 func (app *Application) connectRemote(ctx context.Context, remote string) (*connection, error) {
 	connection := newConnection(app)
-	conn, err := net.Dial("tcp", remote)
+	network, addr := parseAddr(remote)
+	conn, err := lsprpc.ConnectToRemote(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}
-	stream := jsonrpc2.NewHeaderStream(conn, conn)
+	stream := jsonrpc2.NewHeaderStream(conn)
 	cc := jsonrpc2.NewConn(stream)
 	connection.Server = protocol.ServerDispatcher(cc)
 	ctx = protocol.WithClient(ctx, connection.Client)
-	go cc.Run(ctx,
+	cc.Go(ctx,
 		protocol.Handlers(
 			protocol.ClientHandler(connection.Client,
 				jsonrpc2.MethodNotFound)))
@@ -244,7 +264,7 @@ func (app *Application) connectRemote(ctx context.Context, remote string) (*conn
 var matcherString = map[source.SymbolMatcher]string{
 	source.SymbolFuzzy:           "fuzzy",
 	source.SymbolCaseSensitive:   "caseSensitive",
-	source.SymbolCaseInsensitive: "default",
+	source.SymbolCaseInsensitive: "caseInsensitive",
 }
 
 func (c *connection) initialize(ctx context.Context, options func(*source.Options)) error {
@@ -253,14 +273,20 @@ func (c *connection) initialize(ctx context.Context, options func(*source.Option
 	params.Capabilities.Workspace.Configuration = true
 
 	// Make sure to respect configured options when sending initialize request.
-	opts := source.DefaultOptions()
+	opts := source.DefaultOptions().Clone()
 	if options != nil {
-		options(&opts)
+		options(opts)
 	}
 	params.Capabilities.TextDocument.Hover = protocol.HoverClientCapabilities{
 		ContentFormat: []protocol.MarkupKind{opts.PreferredContentFormat},
 	}
 	params.Capabilities.TextDocument.DocumentSymbol.HierarchicalDocumentSymbolSupport = opts.HierarchicalDocumentSymbolSupport
+	params.Capabilities.TextDocument.SemanticTokens = protocol.SemanticTokensClientCapabilities{}
+	params.Capabilities.TextDocument.SemanticTokens.Formats = []string{"relative"}
+	params.Capabilities.TextDocument.SemanticTokens.Requests.Range = true
+	params.Capabilities.TextDocument.SemanticTokens.Requests.Full = true
+	params.Capabilities.TextDocument.SemanticTokens.TokenTypes = lsp.SemanticTypes()
+	params.Capabilities.TextDocument.SemanticTokens.TokenModifiers = lsp.SemanticModifiers()
 	params.InitializationOptions = map[string]interface{}{
 		"symbolMatcher": matcherString[opts.SymbolMatcher],
 	}
@@ -330,15 +356,15 @@ func (c *cmdClient) LogMessage(ctx context.Context, p *protocol.LogMessageParams
 	case protocol.Warning:
 		log.Print("Warning:", p.Message)
 	case protocol.Info:
-		if c.app.Verbose {
+		if c.app.verbose() {
 			log.Print("Info:", p.Message)
 		}
 	case protocol.Log:
-		if c.app.Verbose {
+		if c.app.verbose() {
 			log.Print("Log:", p.Message)
 		}
 	default:
-		if c.app.Verbose {
+		if c.app.verbose() {
 			log.Print(p.Message)
 		}
 	}
@@ -373,7 +399,7 @@ func (c *cmdClient) Configuration(ctx context.Context, p *protocol.ParamConfigur
 			}
 			env[l[0]] = l[1]
 		}
-		results[i] = map[string]interface{}{
+		m := map[string]interface{}{
 			"env": env,
 			"analyses": map[string]bool{
 				"fillreturns":    true,
@@ -382,6 +408,10 @@ func (c *cmdClient) Configuration(ctx context.Context, p *protocol.ParamConfigur
 				"undeclaredname": true,
 			},
 		}
+		if c.app.VeryVerbose {
+			m["verboseOutput"] = true
+		}
+		results[i] = m
 	}
 	return results, nil
 }
@@ -472,6 +502,19 @@ func (c *connection) AddFile(ctx context.Context, uri span.URI) *cmdFile {
 	return file
 }
 
+func (c *connection) semanticTokens(ctx context.Context, file span.URI) (*protocol.SemanticTokens, error) {
+	p := &protocol.SemanticTokensParams{
+		TextDocument: protocol.TextDocumentIdentifier{
+			URI: protocol.URIFromSpanURI(file),
+		},
+	}
+	resp, err := c.Server.SemanticTokensFull(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
 func (c *connection) diagnoseFiles(ctx context.Context, files []span.URI) error {
 	var untypedFiles []interface{}
 	for _, file := range files {
@@ -495,4 +538,9 @@ func (c *connection) terminate(ctx context.Context) {
 	c.Shutdown(ctx)
 	//TODO: right now calling exit terminates the process, we should rethink that
 	//server.Exit(ctx)
+}
+
+// Implement io.Closer.
+func (c *cmdClient) Close() error {
+	return nil
 }

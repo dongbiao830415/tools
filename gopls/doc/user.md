@@ -28,13 +28,24 @@ go get golang.org/x/tools/gopls@latest
 
 **Do not** use the `-u` flag, as it will update your dependencies to incompatible versions.
 
+To get a specific version of `gopls` (for example, to test a prerelease
+version), run:
+
+```sh
+go get golang.org/x/tools/gopls@vX.Y.Z
+```
+
+Where `vX.Y.Z` is the desired version.
+
 If you see this error:
 
 ```sh
 $ go get golang.org/x/tools/gopls@latest
 go: cannot use path@version syntax in GOPATH mode
 ```
+
 then run
+
 ```sh
 GO111MODULE=on go get golang.org/x/tools/gopls@latest
 ```
@@ -47,11 +58,19 @@ with `@master` could fail.  To actually update your `gopls` to the
 latest **unstable** version, use:
 
 ```sh
-$ go get golang.org/x/tools/gopls@master golang.org/x/tools@master
+go get golang.org/x/tools/gopls@master golang.org/x/tools@master
 ```
 
 In general, you should use `@latest` instead, to prevent frequent
 breakages.
+
+### Supported Go versions
+
+`gopls` follows the
+[Go Release Policy](https://golang.org/doc/devel/release.html#policy),
+meaning that it officially supports the last 2 major Go releases. We run CI to
+verify that the `gopls` tests pass for the last 4 major Go releases, but do not
+prioritize issues only affecting legacy Go release (3 or 4 releases ago).
 
 ## Configurations
 
@@ -95,6 +114,36 @@ See [Settings](settings.md) for more information about the available configurati
 #### Workspace folder configuration
 
 This contains exactly the same set of values that are in the global configuration, but it is fetched for every workspace folder separately. The editor can choose to respond with different values per-folder.
+
+## Special Features
+
+### Symbol Queries
+
+Gopls supports some extended syntax for `workspace/symbol` requests, when using
+the `fuzzy` symbol matcher (the default). Inspired by the popular fuzzy matcher
+[FZF](https://github.com/junegunn/fzf), the following special characters are
+supported within symbol queries:
+
+| Character | Usage     | Match        |
+| --------- | --------- | ------------ |
+| `'`       | `'abc`    | exact        |
+| `^`       | `^printf` | exact prefix |
+| `$`       | `printf$` | exact suffix |
+
+### Working on the Go source distribution
+
+If you are working on the [Go project](https://go.googlesource.com/go) itself, your `go` command will have to correspond to the version of the source you are working on. That is, if you have downloaded the code to `$HOME/go`, your `go` command should be the `$HOME/go/bin/go` executable that you built with `make.bash` or equivalent.
+
+You can achieve this by adding the right version of `go` to your `PATH` (`export PATH=$HOME/go/bin:$PATH` on Unix systems) or by configuring your editor. In VS Code, you can use the `go.alternateTools` setting to point to the correct version of `go`:
+
+```json5
+{
+
+    "go.alternateTools": {
+        "go": "$HOME/bin/go"
+    }
+}
+```
 
 ## Command line support
 

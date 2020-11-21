@@ -11,7 +11,6 @@ import (
 	"sync"
 
 	"golang.org/x/tools/internal/jsonrpc2"
-	"golang.org/x/tools/internal/lsp/mod"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
@@ -24,10 +23,15 @@ const concurrentAnalyses = 1
 // messages on on the supplied stream.
 func NewServer(session source.Session, client protocol.Client) *Server {
 	return &Server{
-		delivered:       make(map[span.URI]sentDiagnostics),
-		session:         session,
-		client:          client,
-		diagnosticsSema: make(chan struct{}, concurrentAnalyses),
+		delivered:             make(map[span.URI]sentDiagnostics),
+		gcOptimizationDetails: make(map[span.URI]struct{}),
+		watchedDirectories:    make(map[span.URI]struct{}),
+		changedFiles:          make(map[span.URI]struct{}),
+		session:               session,
+		client:                client,
+		diagnosticsSema:       make(chan struct{}, concurrentAnalyses),
+		progress:              newProgressTracker(client),
+		debouncer:             newDebouncer(),
 	}
 }
 
@@ -61,68 +65,80 @@ type Server struct {
 	stateMu sync.Mutex
 	state   serverState
 
-	session source.Session
+	session   source.Session
+	clientPID int
+
+	// notifications generated before serverInitialized
+	notifications []*protocol.ShowMessageParams
 
 	// changedFiles tracks files for which there has been a textDocument/didChange.
-	changedFiles map[span.URI]struct{}
+	changedFilesMu sync.Mutex
+	changedFiles   map[span.URI]struct{}
 
 	// folders is only valid between initialize and initialized, and holds the
 	// set of folders to build views for when we are ready
 	pendingFolders []protocol.WorkspaceFolder
 
+	// watchedDirectories is the set of directories that we have requested that
+	// the client watch on disk. It will be updated as the set of directories
+	// that the server should watch changes.
+	watchedDirectoriesMu   sync.Mutex
+	watchedDirectories     map[span.URI]struct{}
+	watchRegistrationCount uint64
+
 	// delivered is a cache of the diagnostics that the server has sent.
 	deliveredMu sync.Mutex
 	delivered   map[span.URI]sentDiagnostics
 
-	// diagnosticsSema limits the concurrency of diagnostics runs, which can be expensive.
+	// gcOptimizationDetails describes the packages for which we want
+	// optimization details to be included in the diagnostics. The key is the
+	// directory of the package.
+	gcOptimizationDetailsMu sync.Mutex
+	gcOptimizationDetails   map[span.URI]struct{}
+
+	// diagnosticsSema limits the concurrency of diagnostics runs, which can be
+	// expensive.
 	diagnosticsSema chan struct{}
 
-	// supportsWorkDoneProgress is set in the initializeRequest
-	// to determine if the client can support progress notifications
-	supportsWorkDoneProgress bool
-	inProgressMu             sync.Mutex
-	inProgress               map[string]*WorkDone
+	progress *progressTracker
+
+	// debouncer is used for debouncing diagnostics.
+	debouncer *debouncer
+
+	// When the workspace fails to load, we show its status through a progress
+	// report with an error message.
+	criticalErrorStatusMu sync.Mutex
+	criticalErrorStatus   *workDone
 }
 
 // sentDiagnostics is used to cache diagnostics that have been sent for a given file.
 type sentDiagnostics struct {
-	version      float64
-	identifier   string
-	sorted       []*source.Diagnostic
-	withAnalysis bool
-	snapshotID   uint64
+	id              source.VersionedFileIdentity
+	sorted          []*source.Diagnostic
+	includeAnalysis bool
+	snapshotID      uint64
 }
 
-func (s *Server) codeLens(ctx context.Context, params *protocol.CodeLensParams) ([]protocol.CodeLens, error) {
-	snapshot, fh, ok, err := s.beginFileRequest(params.TextDocument.URI, source.UnknownKind)
-	if !ok {
-		return nil, err
-	}
-	switch fh.Identity().Kind {
-	case source.Mod:
-		return mod.CodeLens(ctx, snapshot, fh.Identity().URI)
-	case source.Go:
-		return source.CodeLens(ctx, snapshot, fh)
-	}
-	// Unsupported file kind for a code action.
-	return nil, nil
+func (s *Server) workDoneProgressCancel(ctx context.Context, params *protocol.WorkDoneProgressCancelParams) error {
+	return s.progress.cancel(ctx, params.Token)
 }
 
 func (s *Server) nonstandardRequest(ctx context.Context, method string, params interface{}) (interface{}, error) {
 	paramMap := params.(map[string]interface{})
 	if method == "gopls/diagnoseFiles" {
 		for _, file := range paramMap["files"].([]interface{}) {
-			snapshot, fh, ok, err := s.beginFileRequest(protocol.DocumentURI(file.(string)), source.UnknownKind)
+			snapshot, fh, ok, release, err := s.beginFileRequest(ctx, protocol.DocumentURI(file.(string)), source.UnknownKind)
+			defer release()
 			if !ok {
 				return nil, err
 			}
 
-			fileID, diagnostics, err := source.FileDiagnostics(ctx, snapshot, fh.Identity().URI)
+			fileID, diagnostics, err := source.FileDiagnostics(ctx, snapshot, fh.URI())
 			if err != nil {
 				return nil, err
 			}
 			if err := s.client.PublishDiagnostics(ctx, &protocol.PublishDiagnosticsParams{
-				URI:         protocol.URIFromSpanURI(fh.Identity().URI),
+				URI:         protocol.URIFromSpanURI(fh.URI()),
 				Diagnostics: toProtocolDiagnostics(diagnostics),
 				Version:     fileID.Version,
 			}); err != nil {
@@ -139,38 +155,8 @@ func (s *Server) nonstandardRequest(ctx context.Context, method string, params i
 	return nil, notImplemented(method)
 }
 
-func (s *Server) workDoneProgressCancel(ctx context.Context, params *protocol.WorkDoneProgressCancelParams) error {
-	token, ok := params.Token.(string)
-	if !ok {
-		return errors.Errorf("expected params.Token to be string but got %T", params.Token)
-	}
-	s.inProgressMu.Lock()
-	defer s.inProgressMu.Unlock()
-	wd, ok := s.inProgress[token]
-	if !ok {
-		return errors.Errorf("token %q not found in progress", token)
-	}
-	if wd.cancel == nil {
-		return errors.Errorf("work %q is not cancellable", token)
-	}
-	wd.cancel()
-	return nil
-}
-
-func (s *Server) addInProgress(wd *WorkDone) {
-	s.inProgressMu.Lock()
-	s.inProgress[wd.token] = wd
-	s.inProgressMu.Unlock()
-}
-
-func (s *Server) removeInProgress(token string) {
-	s.inProgressMu.Lock()
-	delete(s.inProgress, token)
-	s.inProgressMu.Unlock()
-}
-
 func notImplemented(method string) error {
-	return fmt.Errorf("%w: %q not yet implemented", jsonrpc2.ErrMethodNotFound, method)
+	return errors.Errorf("%w: %q not yet implemented", jsonrpc2.ErrMethodNotFound, method)
 }
 
 //go:generate helper/helper -d protocol/tsserver.go -o server_gen.go -u .

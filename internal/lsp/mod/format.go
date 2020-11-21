@@ -12,15 +12,15 @@ func Format(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle)
 	ctx, done := event.Start(ctx, "mod.Format")
 	defer done()
 
-	file, m, err := snapshot.ModHandle(ctx, fh).Parse(ctx)
+	pm, err := snapshot.ParseMod(ctx, fh)
 	if err != nil {
 		return nil, err
 	}
-	formatted, err := file.Format()
+	formatted, err := pm.File.Format()
 	if err != nil {
 		return nil, err
 	}
 	// Calculate the edits to be made due to the change.
-	diff := snapshot.View().Options().ComputeEdits(fh.Identity().URI, string(m.Content), string(formatted))
-	return source.ToProtocolEdits(m, diff)
+	diff := snapshot.View().Options().ComputeEdits(fh.URI(), string(pm.Mapper.Content), string(formatted))
+	return source.ToProtocolEdits(pm.Mapper, diff)
 }

@@ -6,8 +6,9 @@ package jsonrpc2
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
+
+	errors "golang.org/x/xerrors"
 )
 
 // Message is the interface to all jsonrpc2 message types.
@@ -146,7 +147,10 @@ func (msg *Response) Err() error              { return msg.err }
 func (msg *Response) isJSONRPC2Message()      {}
 
 func (r *Response) MarshalJSON() ([]byte, error) {
-	msg := &wireResponse{Result: &r.result, Error: toWireError(r.err), ID: &r.id}
+	msg := &wireResponse{Error: toWireError(r.err), ID: &r.id}
+	if msg.Error == nil {
+		msg.Result = &r.result
+	}
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return data, fmt.Errorf("marshaling notification: %w", err)
@@ -224,4 +228,12 @@ func DecodeMessage(data []byte) (Message, error) {
 		call.params = *msg.Params
 	}
 	return call, nil
+}
+
+func marshalToRaw(obj interface{}) (json.RawMessage, error) {
+	data, err := json.Marshal(obj)
+	if err != nil {
+		return json.RawMessage{}, err
+	}
+	return json.RawMessage(data), nil
 }

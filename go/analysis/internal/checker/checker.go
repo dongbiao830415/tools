@@ -639,6 +639,7 @@ func (act *action) execOnce() {
 		Fset:              act.pkg.Fset,
 		Files:             act.pkg.Syntax,
 		OtherFiles:        act.pkg.OtherFiles,
+		IgnoredFiles:      act.pkg.IgnoredFiles,
 		Pkg:               act.pkg.Types,
 		TypesInfo:         act.pkg.TypesInfo,
 		TypesSizes:        act.pkg.TypesSizes,
@@ -800,8 +801,13 @@ func exportedFrom(obj types.Object, pkg *types.Package) bool {
 		return obj.Exported() && obj.Pkg() == pkg ||
 			obj.Type().(*types.Signature).Recv() != nil
 	case *types.Var:
-		return obj.Exported() && obj.Pkg() == pkg ||
-			obj.IsField()
+		if obj.IsField() {
+			return true
+		}
+		// we can't filter more aggressively than this because we need
+		// to consider function parameters exported, but have no way
+		// of telling apart function parameters from local variables.
+		return obj.Pkg() == pkg
 	case *types.TypeName, *types.Const:
 		return true
 	}

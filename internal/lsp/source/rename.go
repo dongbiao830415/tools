@@ -12,6 +12,7 @@ import (
 	"go/token"
 	"go/types"
 	"regexp"
+	"strings"
 
 	"golang.org/x/tools/go/types/typeutil"
 	"golang.org/x/tools/internal/event"
@@ -41,16 +42,16 @@ type PrepareItem struct {
 	Text  string
 }
 
-func PrepareRename(ctx context.Context, s Snapshot, f FileHandle, pp protocol.Position) (*PrepareItem, error) {
+func PrepareRename(ctx context.Context, snapshot Snapshot, f FileHandle, pp protocol.Position) (*PrepareItem, error) {
 	ctx, done := event.Start(ctx, "source.PrepareRename")
 	defer done()
 
-	qos, err := qualifiedObjsAtProtocolPos(ctx, s, f, pp)
+	qos, err := qualifiedObjsAtProtocolPos(ctx, snapshot, f, pp)
 	if err != nil {
 		return nil, err
 	}
 	node, obj, pkg := qos[0].node, qos[0].obj, qos[0].sourcePkg
-	mr, err := posToMappedRange(s.View(), pkg, node.Pos(), node.End())
+	mr, err := posToMappedRange(snapshot, pkg, node.Pos(), node.End())
 	if err != nil {
 		return nil, err
 	}
@@ -88,20 +89,33 @@ func Rename(ctx context.Context, s Snapshot, f FileHandle, pp protocol.Position,
 		return nil, errors.Errorf("invalid identifier to rename: %q", newName)
 	}
 	if pkg == nil || pkg.IsIllTyped() {
-		return nil, errors.Errorf("package for %s is ill typed", f.Identity().URI)
+		return nil, errors.Errorf("package for %s is ill typed", f.URI())
 	}
-	refs, err := references(ctx, s, qos, true)
+	refs, err := references(ctx, s, qos, true, false)
 	if err != nil {
 		return nil, err
 	}
 	r := renamer{
 		ctx:          ctx,
-		fset:         s.View().Session().Cache().FileSet(),
+		fset:         s.FileSet(),
 		refs:         refs,
 		objsToUpdate: make(map[types.Object]bool),
 		from:         obj.Name(),
 		to:           newName,
 		packages:     make(map[*types.Package]Package),
+	}
+
+	// A renaming initiated at an interface method indicates the
+	// intention to rename abstract and concrete methods as needed
+	// to preserve assignability.
+	for _, ref := range refs {
+		if obj, ok := ref.obj.(*types.Func); ok {
+			recv := obj.Type().(*types.Signature).Recv()
+			if recv != nil && IsInterface(recv.Type().Underlying()) {
+				r.changeMethods = true
+				break
+			}
+		}
 	}
 	for _, from := range refs {
 		r.packages[from.pkg.GetTypes()] = from.pkg
@@ -126,11 +140,11 @@ func Rename(ctx context.Context, s Snapshot, f FileHandle, pp protocol.Position,
 	for uri, edits := range changes {
 		// These edits should really be associated with FileHandles for maximal correctness.
 		// For now, this is good enough.
-		fh, err := s.GetFile(uri)
+		fh, err := s.GetFile(ctx, uri)
 		if err != nil {
 			return nil, err
 		}
-		data, _, err := fh.Read(ctx)
+		data, err := fh.Read()
 		if err != nil {
 			return nil, err
 		}
@@ -199,17 +213,31 @@ func (r *renamer) update() (map[span.URI][]diff.TextEdit, error) {
 		}
 
 		// Perform the rename in doc comments declared in the original package.
+		// go/parser strips out \r\n returns from the comment text, so go
+		// line-by-line through the comment text to get the correct positions.
 		for _, comment := range doc.List {
-			for _, locs := range docRegexp.FindAllStringIndex(comment.Text, -1) {
-				rng := span.NewRange(r.fset, comment.Pos()+token.Pos(locs[0]), comment.Pos()+token.Pos(locs[1]))
-				spn, err := rng.Span()
-				if err != nil {
-					return nil, err
+			if isDirective(comment.Text) {
+				continue
+			}
+			lines := strings.Split(comment.Text, "\n")
+			tok := r.fset.File(comment.Pos())
+			commentLine := tok.Position(comment.Pos()).Line
+			for i, line := range lines {
+				lineStart := comment.Pos()
+				if i > 0 {
+					lineStart = tok.LineStart(commentLine + i)
 				}
-				result[spn.URI()] = append(result[spn.URI()], diff.TextEdit{
-					Span:    spn,
-					NewText: r.to,
-				})
+				for _, locs := range docRegexp.FindAllIndex([]byte(line), -1) {
+					rng := span.NewRange(r.fset, lineStart+token.Pos(locs[0]), lineStart+token.Pos(locs[1]))
+					spn, err := rng.Span()
+					if err != nil {
+						return nil, err
+					}
+					result[spn.URI()] = append(result[spn.URI()], diff.TextEdit{
+						Span:    spn,
+						NewText: r.to,
+					})
+				}
 			}
 		}
 	}
