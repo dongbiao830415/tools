@@ -131,14 +131,14 @@ func (s *snapshot) FileSet() *token.FileSet {
 
 func (s *snapshot) ModFiles() []span.URI {
 	var uris []span.URI
-	for modURI := range s.workspace.activeModFiles() {
+	for modURI := range s.workspace.getActiveModFiles() {
 		uris = append(uris, modURI)
 	}
 	return uris
 }
 
 func (s *snapshot) ValidBuildConfiguration() bool {
-	return validBuildConfiguration(s.view.rootURI, &s.view.workspaceInformation, s.workspace.activeModFiles())
+	return validBuildConfiguration(s.view.rootURI, &s.view.workspaceInformation, s.workspace.getActiveModFiles())
 }
 
 // workspaceMode describes the way in which the snapshot's workspace should
@@ -155,7 +155,7 @@ func (s *snapshot) workspaceMode() workspaceMode {
 	// If the view is not in a module and contains no modules, but still has a
 	// valid workspace configuration, do not create the workspace module.
 	// It could be using GOPATH or a different build system entirely.
-	if len(s.workspace.activeModFiles()) == 0 && validBuildConfiguration {
+	if len(s.workspace.getActiveModFiles()) == 0 && validBuildConfiguration {
 		return mode
 	}
 	mode |= moduleMode
@@ -191,7 +191,7 @@ func (s *snapshot) config(ctx context.Context, inv *gocommand.Invocation) *packa
 	s.view.optionsMu.Unlock()
 
 	// Forcibly disable GOPACKAGESDRIVER. It's incompatible with the
-	// packagesinternal APIs we use, and we really only support the go commmand
+	// packagesinternal APIs we use, and we really only support the go command
 	// anyway.
 	env := append(append([]string{}, inv.Env...), "GOPACKAGESDRIVER=off")
 	cfg := &packages.Config{
@@ -228,7 +228,7 @@ func (s *snapshot) config(ctx context.Context, inv *gocommand.Invocation) *packa
 	return cfg
 }
 
-func (s *snapshot) RunGoCommandDirect(ctx context.Context, mode source.InvocationMode, inv *gocommand.Invocation) (*bytes.Buffer, error) {
+func (s *snapshot) RunGoCommandDirect(ctx context.Context, mode source.InvocationFlags, inv *gocommand.Invocation) (*bytes.Buffer, error) {
 	_, inv, cleanup, err := s.goCommandInvocation(ctx, mode, inv)
 	if err != nil {
 		return nil, err
@@ -238,7 +238,7 @@ func (s *snapshot) RunGoCommandDirect(ctx context.Context, mode source.Invocatio
 	return s.view.session.gocmdRunner.Run(ctx, *inv)
 }
 
-func (s *snapshot) RunGoCommandPiped(ctx context.Context, mode source.InvocationMode, inv *gocommand.Invocation, stdout, stderr io.Writer) error {
+func (s *snapshot) RunGoCommandPiped(ctx context.Context, mode source.InvocationFlags, inv *gocommand.Invocation, stdout, stderr io.Writer) error {
 	_, inv, cleanup, err := s.goCommandInvocation(ctx, mode, inv)
 	if err != nil {
 		return err
@@ -247,37 +247,84 @@ func (s *snapshot) RunGoCommandPiped(ctx context.Context, mode source.Invocation
 	return s.view.session.gocmdRunner.RunPiped(ctx, *inv, stdout, stderr)
 }
 
-func (s *snapshot) goCommandInvocation(ctx context.Context, mode source.InvocationMode, inv *gocommand.Invocation) (tmpURI span.URI, updatedInv *gocommand.Invocation, cleanup func(), err error) {
+func (s *snapshot) goCommandInvocation(ctx context.Context, flags source.InvocationFlags, inv *gocommand.Invocation) (tmpURI span.URI, updatedInv *gocommand.Invocation, cleanup func(), err error) {
 	s.view.optionsMu.Lock()
-	inv.Env = append(append(append(os.Environ(), s.view.options.EnvSlice()...), inv.Env...), "GO111MODULE="+s.view.go111module)
+	allowModfileModificationOption := s.view.options.AllowModfileModifications
+	allowNetworkOption := s.view.options.AllowImplicitNetworkAccess
+	inv.Env = append(append(append(os.Environ(), s.view.options.EnvSlice()...), inv.Env...), "GO111MODULE="+s.view.effectiveGo111Module)
 	inv.BuildFlags = append([]string{}, s.view.options.BuildFlags...)
 	s.view.optionsMu.Unlock()
 	cleanup = func() {} // fallback
 
+	// All logic below is for module mode.
+	if s.workspaceMode()&moduleMode == 0 {
+		return "", inv, cleanup, nil
+	}
+
+	mode, allowNetwork := flags.Mode(), flags.AllowNetwork()
+	if !allowNetwork && !allowNetworkOption {
+		inv.Env = append(inv.Env, "GOPROXY=off")
+	}
+
 	var modURI span.URI
-	if s.workspaceMode()&moduleMode != 0 {
-		// Select the module context to use.
-		// If we're type checking, we need to use the workspace context, meaning
-		// the main (workspace) module. Otherwise, we should use the module for
-		// the passed-in working dir.
-		if mode == source.LoadWorkspace {
-			if s.workspaceMode()&usesWorkspaceModule == 0 {
-				for m := range s.workspace.activeModFiles() { // range to access the only element
-					modURI = m
-				}
-			} else {
-				var tmpDir span.URI
-				var err error
-				tmpDir, err = s.getWorkspaceDir(ctx)
-				if err != nil {
-					return "", nil, cleanup, err
-				}
-				inv.WorkingDir = tmpDir.Filename()
-				modURI = span.URIFromPath(filepath.Join(tmpDir.Filename(), "go.mod"))
+	// Select the module context to use.
+	// If we're type checking, we need to use the workspace context, meaning
+	// the main (workspace) module. Otherwise, we should use the module for
+	// the passed-in working dir.
+	if mode == source.LoadWorkspace {
+		if s.workspaceMode()&usesWorkspaceModule == 0 {
+			for m := range s.workspace.getActiveModFiles() { // range to access the only element
+				modURI = m
 			}
 		} else {
-			modURI = s.GoModForFile(ctx, span.URIFromPath(inv.WorkingDir))
+			var tmpDir span.URI
+			var err error
+			tmpDir, err = s.getWorkspaceDir(ctx)
+			if err != nil {
+				return "", nil, cleanup, err
+			}
+			inv.WorkingDir = tmpDir.Filename()
+			modURI = span.URIFromPath(filepath.Join(tmpDir.Filename(), "go.mod"))
 		}
+	} else {
+		modURI = s.GoModForFile(ctx, span.URIFromPath(inv.WorkingDir))
+	}
+
+	var modContent []byte
+	if modURI != "" {
+		modFH, err := s.GetFile(ctx, modURI)
+		if err != nil {
+			return "", nil, cleanup, err
+		}
+		modContent, err = modFH.Read()
+		if err != nil {
+			return "", nil, cleanup, err
+		}
+	}
+
+	vendorEnabled, err := s.vendorEnabled(ctx, modURI, modContent)
+	if err != nil {
+		return "", nil, cleanup, err
+	}
+
+	mutableModFlag := ""
+	if s.view.goversion >= 16 {
+		mutableModFlag = "mod"
+	}
+
+	switch mode {
+	case source.LoadWorkspace, source.Normal:
+		if vendorEnabled {
+			inv.ModFlag = "vendor"
+		} else if s.workspaceMode()&usesWorkspaceModule == 0 && !allowModfileModificationOption {
+			inv.ModFlag = "readonly"
+		} else {
+			// Temporarily allow updates for multi-module workspace mode:
+			// it doesn't create a go.sum at all. golang/go#42509.
+			inv.ModFlag = mutableModFlag
+		}
+	case source.UpdateUserModFile, source.WriteTemporaryModFile:
+		inv.ModFlag = mutableModFlag
 	}
 
 	wantTempMod := mode != source.UpdateUserModFile
@@ -302,25 +349,6 @@ func (s *snapshot) goCommandInvocation(ctx context.Context, mode source.Invocati
 			return "", nil, cleanup, err
 		}
 		inv.ModFile = tmpURI.Filename()
-	}
-
-	var modContent []byte
-	if modURI != "" {
-		modFH, err := s.GetFile(ctx, modURI)
-		if err != nil {
-			return "", nil, cleanup, err
-		}
-		modContent, err = modFH.Read()
-		if err != nil {
-			return "", nil, nil, err
-		}
-	}
-	modMod, err := s.needsModEqualsMod(ctx, modURI, modContent)
-	if err != nil {
-		return "", nil, cleanup, err
-	}
-	if modMod {
-		inv.ModFlag = "mod"
 	}
 
 	return tmpURI, inv, cleanup, nil
@@ -432,7 +460,7 @@ func (s *snapshot) packageHandlesForFile(ctx context.Context, uri span.URI, mode
 		// calls to packages.Load. Determine what we should do instead.
 	}
 	if reload {
-		if err := s.load(ctx, fileURI(uri)); err != nil {
+		if err := s.load(ctx, false, fileURI(uri)); err != nil {
 			return nil, err
 		}
 	}
@@ -604,19 +632,46 @@ func (s *snapshot) workspacePackageIDs() (ids []packageID) {
 	return ids
 }
 
-func (s *snapshot) WorkspaceDirectories(ctx context.Context) []span.URI {
-	return s.workspace.dirs(ctx, s)
+func (s *snapshot) fileWatchingGlobPatterns(ctx context.Context) map[string]struct{} {
+	// Work-around microsoft/vscode#100870 by making sure that we are,
+	// at least, watching the user's entire workspace. This will still be
+	// applied to every folder in the workspace.
+	patterns := map[string]struct{}{
+		"**/*.{go,mod,sum}": {},
+	}
+	dirs := s.workspace.dirs(ctx, s)
+	for _, dir := range dirs {
+		dirName := dir.Filename()
+
+		// If the directory is within the view's folder, we're already watching
+		// it with the pattern above.
+		if source.InDir(s.view.folder.Filename(), dirName) {
+			continue
+		}
+		// TODO(rstambler): If microsoft/vscode#3025 is resolved before
+		// microsoft/vscode#101042, we will need a work-around for Windows
+		// drive letter casing.
+		patterns[fmt.Sprintf("%s/**/*.{go,mod,sum}", dirName)] = struct{}{}
+	}
+
+	// Some clients do not send notifications for changes to directories that
+	// contain Go code (golang/go#42348). To handle this, explicitly watch all
+	// of the directories in the workspace. We find them by adding the
+	// directories of every file in the snapshot's workspace directories.
+	var dirNames []string
+	for uri := range s.allKnownSubdirs(ctx) {
+		dirNames = append(dirNames, uri.Filename())
+	}
+	sort.Strings(dirNames)
+	if len(dirNames) > 0 {
+		patterns[fmt.Sprintf("{%s}", strings.Join(dirNames, ","))] = struct{}{}
+	}
+	return patterns
 }
 
 // allKnownSubdirs returns all of the subdirectories within the snapshot's
 // workspace directories. None of the workspace directories are included.
 func (s *snapshot) allKnownSubdirs(ctx context.Context) map[span.URI]struct{} {
-	// Don't return results until the snapshot is loaded, otherwise it may not
-	// yet "know" its files.
-	if err := s.awaitLoaded(ctx); err != nil {
-		return nil
-	}
-
 	dirs := s.workspace.dirs(ctx, s)
 
 	s.mu.Lock()
@@ -626,9 +681,7 @@ func (s *snapshot) allKnownSubdirs(ctx context.Context) map[span.URI]struct{} {
 		dir := filepath.Dir(uri.Filename())
 		var matched span.URI
 		for _, wsDir := range dirs {
-			// Note: InDir handles symlinks, but InDirLex does not--it's too
-			// expensive to call InDir on every file in the snapshot.
-			if source.InDirLex(wsDir.Filename(), dir) {
+			if source.InDir(wsDir.Filename(), dir) {
 				matched = wsDir
 				break
 			}
@@ -657,7 +710,7 @@ func (s *snapshot) allKnownSubdirs(ctx context.Context) map[span.URI]struct{} {
 func (s *snapshot) knownFilesInDir(ctx context.Context, dir span.URI) []span.URI {
 	var files []span.URI
 	for uri := range s.files {
-		if source.InDirLex(dir.Filename(), uri.Filename()) {
+		if source.InDir(dir.Filename(), uri.Filename()) {
 			files = append(files, uri)
 		}
 	}
@@ -737,7 +790,7 @@ func (s *snapshot) CachedImportPaths(ctx context.Context) (map[string]source.Pac
 
 func (s *snapshot) GoModForFile(ctx context.Context, uri span.URI) span.URI {
 	var match span.URI
-	for modURI := range s.workspace.activeModFiles() {
+	for modURI := range s.workspace.getActiveModFiles() {
 		if !source.InDir(dirURI(modURI).Filename(), uri.Filename()) {
 			continue
 		}
@@ -898,7 +951,11 @@ func (s *snapshot) getFileLocked(ctx context.Context, f *fileBase) (source.Versi
 func (s *snapshot) IsOpen(uri span.URI) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.isOpenLocked(uri)
 
+}
+
+func (s *snapshot) isOpenLocked(uri span.URI) bool {
 	_, open := s.files[uri].(*overlay)
 	return open
 }
@@ -937,34 +994,39 @@ func (s *snapshot) AwaitInitialized(ctx context.Context) {
 
 // reloadWorkspace reloads the metadata for all invalidated workspace packages.
 func (s *snapshot) reloadWorkspace(ctx context.Context) error {
-	// If the view's build configuration is invalid, we cannot reload by
-	// package path. Just reload the directory instead.
-	if !s.ValidBuildConfiguration() {
-		return s.load(ctx, viewLoadScope("LOAD_INVALID_VIEW"))
-	}
-
 	// See which of the workspace packages are missing metadata.
 	s.mu.Lock()
+	missingMetadata := len(s.workspacePackages) == 0 || len(s.metadata) == 0
 	pkgPathSet := map[packagePath]struct{}{}
 	for id, pkgPath := range s.workspacePackages {
+		if s.metadata[id] != nil {
+			continue
+		}
+		missingMetadata = true
+
 		// Don't try to reload "command-line-arguments" directly.
 		if pkgPath == "command-line-arguments" {
 			continue
 		}
-		if s.metadata[id] == nil {
-			pkgPathSet[pkgPath] = struct{}{}
-		}
+		pkgPathSet[pkgPath] = struct{}{}
 	}
 	s.mu.Unlock()
+
+	// If the view's build configuration is invalid, we cannot reload by
+	// package path. Just reload the directory instead.
+	if missingMetadata && !s.ValidBuildConfiguration() {
+		return s.load(ctx, false, viewLoadScope("LOAD_INVALID_VIEW"))
+	}
 
 	if len(pkgPathSet) == 0 {
 		return nil
 	}
+
 	var pkgPaths []interface{}
 	for pkgPath := range pkgPathSet {
 		pkgPaths = append(pkgPaths, pkgPath)
 	}
-	return s.load(ctx, pkgPaths...)
+	return s.load(ctx, false, pkgPaths...)
 }
 
 func (s *snapshot) reloadOrphanedFiles(ctx context.Context) error {
@@ -977,7 +1039,7 @@ func (s *snapshot) reloadOrphanedFiles(ctx context.Context) error {
 		return nil
 	}
 
-	err := s.load(ctx, scopes...)
+	err := s.load(ctx, false, scopes...)
 
 	// If we failed to load some files, i.e. they have no metadata,
 	// mark the failures so we don't bother retrying until the file's
@@ -1209,7 +1271,7 @@ func (s *snapshot) clone(ctx context.Context, changes map[span.URI]*fileChange, 
 			// If the view's go.mod file's contents have changed, invalidate
 			// the metadata for every known package in the snapshot.
 			delete(result.parseModHandles, uri)
-			if _, ok := result.workspace.activeModFiles()[uri]; ok {
+			if _, ok := result.workspace.getActiveModFiles()[uri]; ok {
 				modulesChanged = true
 			}
 		}
@@ -1283,7 +1345,7 @@ copyIDs:
 		}
 		result.ids[k] = ids
 	}
-	// Copy the set of initally loaded packages.
+	// Copy the set of initially loaded packages.
 	for id, pkgPath := range s.workspacePackages {
 		// Packages with the id "command-line-arguments" are generated by the
 		// go command when the user is outside of GOPATH and outside of a
@@ -1561,7 +1623,7 @@ func (s *snapshot) buildBuiltinPackage(ctx context.Context, goFiles []string) er
 // BuildGoplsMod generates a go.mod file for all modules in the workspace. It
 // bypasses any existing gopls.mod.
 func BuildGoplsMod(ctx context.Context, root span.URI, fs source.FileSource) (*modfile.File, error) {
-	allModules, err := findAllModules(ctx, root)
+	allModules, err := findModules(ctx, root, 0)
 	if err != nil {
 		return nil, err
 	}

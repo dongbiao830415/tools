@@ -183,6 +183,7 @@ const test38878 = `
 -- go.mod --
 module foo
 
+go 1.12
 -- a.go --
 package x
 
@@ -352,6 +353,8 @@ func TestPackageChange_Issue38328(t *testing.T) {
 	const packageChange = `
 -- go.mod --
 module fake
+
+go 1.12
 -- a.go --
 package foo
 func main() {}
@@ -379,9 +382,10 @@ module mod.com
 
 go 1.12
 
-require (
-	foo.test v1.2.3
-)
+require foo.test v1.2.3
+-- go.sum --
+foo.test v1.2.3 h1:TMA+lyd1ck0TqjSFpNe4T6cf/K6TYkoHwOOcMBMjaEw=
+foo.test v1.2.3/go.mod h1:Ij3kyLIe5lzjycjh13NL8I2gX0quZuTdW0MnmlwGBL4=
 -- print.go --
 package lib
 
@@ -465,6 +469,7 @@ func TestEqualInEnv_Issue38669(t *testing.T) {
 -- go.mod --
 module mod.com
 
+go 1.12
 -- main.go --
 package main
 
@@ -488,6 +493,7 @@ func TestNoSuggestedFixesForGeneratedFiles_Issue38467(t *testing.T) {
 -- go.mod --
 module mod.com
 
+go 1.12
 -- main.go --
 package main
 
@@ -728,7 +734,7 @@ func main() {
 		var d protocol.PublishDiagnosticsParams
 		env.Await(
 			OnceMet(
-				env.DiagnosticAtRegexp("main.go", `"github.com/ardanlabs/conf"`),
+				env.DiagnosticAtRegexpWithMessage("main.go", `"github.com/ardanlabs/conf"`, "your go.mod file"),
 				ReadDiagnostics("main.go", &d),
 			),
 		)
@@ -855,6 +861,8 @@ func TestCreateOnlyXTest(t *testing.T) {
 	const mod = `
 -- go.mod --
 module mod.com
+
+go 1.12
 -- foo/foo.go --
 package foo
 -- foo/bar_test.go --
@@ -885,6 +893,8 @@ func TestChangePackageName(t *testing.T) {
 	const mod = `
 -- go.mod --
 module mod.com
+
+go 1.12
 -- foo/foo.go --
 package foo
 -- foo/bar_test.go --
@@ -930,7 +940,7 @@ func TestIgnoredFiles(t *testing.T) {
 -- go.mod --
 module mod.com
 
-go 1.15
+go 1.12
 -- _foo/x.go --
 package x
 
@@ -1212,6 +1222,8 @@ func TestInvalidPackageName(t *testing.T) {
 	const pkgDefault = `
 -- go.mod --
 module mod.com
+
+go 1.12
 -- main.go --
 package default
 
@@ -1230,6 +1242,8 @@ func TestLimitWorkspaceScope(t *testing.T) {
 	const mod = `
 -- go.mod --
 module mod.com
+
+go 1.12
 -- a/main.go --
 package main
 
@@ -1259,6 +1273,8 @@ func TestStaticcheckDiagnostic(t *testing.T) {
 	const files = `
 -- go.mod --
 module mod.com
+
+go 1.12
 -- main.go --
 package main
 
@@ -1288,6 +1304,8 @@ func TestSecondaryDiagnostics(t *testing.T) {
 	const dir = `
 -- go.mod --
 module mod.com
+
+go 1.12
 -- main.go --
 package main
 func main() {
@@ -1365,6 +1383,7 @@ func TestEnableAllExperiments(t *testing.T) {
 -- go.mod --
 module mod.com
 
+go 1.12
 -- main.go --
 package main
 
@@ -1390,6 +1409,8 @@ func TestSwig(t *testing.T) {
 	const mod = `
 -- go.mod --
 module mod.com
+
+go 1.12
 -- pkg/simple/export_swig.go --
 package simple
 
@@ -1434,11 +1455,13 @@ func main() {
 // have no more complaints about it.
 // https://github.com/golang/go/issues/41061
 func TestRenamePackage(t *testing.T) {
-	t.Skip("Waiting for the fix that makes this pass: https://github.com/golang/go/issues/41061")
+	testenv.NeedsGo1Point(t, 16)
 
 	const contents = `
 -- go.mod --
 module mod.com
+
+go 1.12
 -- foo.go --
 package foo
 -- foo_test.go --
@@ -1512,6 +1535,137 @@ func main() {
 		env.Await(
 			env.DiagnosticAtRegexp("main.go", `"mod.com/bob"`),
 			EmptyDiagnostics("bob/bob.go"),
+		)
+	})
+}
+
+// Confirms that circular imports are tested and reported.
+func TestCircularImports(t *testing.T) {
+	const mod = `
+-- go.mod --
+module mod.com
+
+go 1.12
+-- self/self.go --
+package self
+
+import _ "mod.com/self"
+func Hello() {}
+-- double/a/a.go --
+package a
+
+import _ "mod.com/double/b"
+-- double/b/b.go --
+package b
+
+import _ "mod.com/double/a"
+-- triple/a/a.go --
+package a
+
+import _ "mod.com/triple/b"
+-- triple/b/b.go --
+package b
+
+import _ "mod.com/triple/c"
+-- triple/c/c.go --
+package c
+
+import _ "mod.com/triple/a"
+`
+	run(t, mod, func(t *testing.T, env *Env) {
+		env.Await(
+			env.DiagnosticAtRegexpWithMessage("self/self.go", `_ "mod.com/self"`, "import cycle not allowed"),
+			env.DiagnosticAtRegexpWithMessage("double/a/a.go", `_ "mod.com/double/b"`, "import cycle not allowed"),
+			env.DiagnosticAtRegexpWithMessage("triple/a/a.go", `_ "mod.com/triple/b"`, "import cycle not allowed"),
+		)
+	})
+}
+
+func TestBadImport(t *testing.T) {
+	testenv.NeedsGo1Point(t, 14)
+
+	const mod = `
+-- go.mod --
+module mod.com
+
+go 1.12
+-- main.go --
+package main
+
+import (
+	_ "nosuchpkg"
+)
+`
+	t.Run("module", func(t *testing.T) {
+		run(t, mod, func(t *testing.T, env *Env) {
+			env.Await(
+				env.DiagnosticAtRegexpWithMessage("main.go", `"nosuchpkg"`, `could not import nosuchpkg (no required module provides package "nosuchpkg"`),
+			)
+		})
+	})
+	t.Run("GOPATH", func(t *testing.T) {
+		withOptions(
+			InGOPATH(),
+			EditorConfig{
+				Env: map[string]string{"GO111MODULE": "off"},
+			},
+			WithModes(WithoutExperiments),
+		).run(t, mod, func(t *testing.T, env *Env) {
+			env.Await(
+				env.DiagnosticAtRegexpWithMessage("main.go", `"nosuchpkg"`, `cannot find package "nosuchpkg" in any of`),
+			)
+		})
+	})
+}
+
+func TestMultipleModules_GO111MODULE_on(t *testing.T) {
+	const modules = `
+-- a/go.mod --
+module a.com
+
+go 1.12
+-- a/a.go --
+package a
+-- b/go.mod --
+module b.com
+
+go 1.12
+-- b/b.go --
+package b
+`
+	withOptions(
+		WithModes(WithoutExperiments),
+		EditorConfig{
+			Env: map[string]string{
+				"GO111MODULE": "on",
+			},
+		},
+	).run(t, modules, func(t *testing.T, env *Env) {
+		env.OpenFile("a/a.go")
+		env.OpenFile("b/go.mod")
+		env.Await(
+			env.DiagnosticAtRegexp("a/a.go", "package a"),
+			env.DiagnosticAtRegexp("b/go.mod", "module b.com"),
+			OutstandingWork("Error loading workspace", "gopls requires a module at the root of your workspace."),
+		)
+	})
+}
+
+func TestAdHocPackagesReloading(t *testing.T) {
+	const nomod = `
+-- main.go --
+package main
+
+func main() {}
+`
+	run(t, nomod, func(t *testing.T, env *Env) {
+		env.OpenFile("main.go")
+		env.RegexpReplace("main.go", "{}", "{ var x int; }") // simulate typing
+		env.Await(
+			OnceMet(
+				CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidChange), 1),
+				NoLogMatching(protocol.Info, "packages=1"),
+			),
 		)
 	})
 }

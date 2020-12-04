@@ -38,7 +38,7 @@ func runModfileTest(t *testing.T, files, proxy string, f TestFunc) {
 		withOptions(WithProxyFiles(proxy)).run(t, files, f)
 	})
 	t.Run("nested", func(t *testing.T) {
-		withOptions(WithProxyFiles(proxy), NestWorkdir(), WithModes(Experimental)).run(t, files, f)
+		withOptions(WithProxyFiles(proxy), NestWorkdir(), WithModes(Singleton|Experimental)).run(t, files, f)
 	})
 }
 
@@ -110,6 +110,54 @@ func main() {
 	})
 }
 
+func TestGoGetFix(t *testing.T) {
+	testenv.NeedsGo1Point(t, 14)
+	const mod = `
+-- go.mod --
+module mod.com
+
+go 1.12
+
+-- main.go --
+package main
+
+import "example.com/blah"
+
+var _ = blah.Name
+`
+
+	const want = `module mod.com
+
+go 1.12
+
+require example.com v1.2.3
+`
+
+	runModfileTest(t, mod, proxy, func(t *testing.T, env *Env) {
+		if strings.Contains(t.Name(), "workspace_module") {
+			t.Skip("workspace module mode doesn't set -mod=readonly")
+		}
+		env.OpenFile("main.go")
+		var d protocol.PublishDiagnosticsParams
+		env.Await(
+			OnceMet(
+				env.DiagnosticAtRegexp("main.go", `"example.com/blah"`),
+				ReadDiagnostics("main.go", &d),
+			),
+		)
+		var goGetDiag protocol.Diagnostic
+		for _, diag := range d.Diagnostics {
+			if strings.Contains(diag.Message, "could not import") {
+				goGetDiag = diag
+			}
+		}
+		env.ApplyQuickFixes("main.go", []protocol.Diagnostic{goGetDiag})
+		if got := env.ReadWorkspaceFile("go.mod"); got != want {
+			t.Fatalf("unexpected go.mod content:\n%s", tests.Diff(want, got))
+		}
+	})
+}
+
 // Tests that multiple missing dependencies gives good single fixes.
 func TestMissingDependencyFixes(t *testing.T) {
 	testenv.NeedsGo1Point(t, 14)
@@ -167,6 +215,9 @@ module mod.com
 go 1.12
 
 require example.com v1.2.3 // indirect
+-- go.sum --
+example.com v1.2.3 h1:ihBTGWGjTU3V4ZJ9OmHITkU9WQ4lGdQkMjgyLFk0FaY=
+example.com v1.2.3/go.mod h1:Y2Rc5rVWjWur0h3pd9aEvK5Pof8YKDANh9gHA2Maujo=
 -- main.go --
 package main
 
@@ -210,7 +261,9 @@ const X = 1
 module mod.com
 go 1.14
 require example.com v1.0.0
-
+-- go.sum --
+example.com v1.0.0 h1:38O7j5rEBajXk+Q5wzLbRN7KqMkSgEiN9NqcM1O2bBM=
+example.com v1.0.0/go.mod h1:vUsPMGpx9ZXXzECCOsOmYCW7npJTwuA16yl89n3Mgls=
 -- main.go --
 package main
 func main() {}
@@ -265,6 +318,11 @@ module mod.com
 go 1.14
 
 require google.golang.org/protobuf v1.20.0
+-- go.sum --
+github.com/esimov/caire v1.2.5 h1:OcqDII/BYxcBYj3DuwDKjd+ANhRxRqLa2n69EGje7qw=
+github.com/esimov/caire v1.2.5/go.mod h1:mXnjRjg3+WUtuhfSC1rKRmdZU9vJZyS1ZWU0qSvJhK8=
+google.golang.org/protobuf v1.20.0 h1:y9T1vAtFKQg0faFNMOxJU7WuEqPWolVkjIkU6aI8qCY=
+google.golang.org/protobuf v1.20.0/go.mod h1:FcqsytGClbtLv1ot8NvsJHjBi0h22StKVP+K/j2liKA=
 -- main.go --
 package main
 
@@ -313,6 +371,9 @@ module mod.com
 go 1.12
 
 require example.com v1.2.3
+-- go.sum --
+example.com v1.2.3 h1:ihBTGWGjTU3V4ZJ9OmHITkU9WQ4lGdQkMjgyLFk0FaY=
+example.com v1.2.3/go.mod h1:Y2Rc5rVWjWur0h3pd9aEvK5Pof8YKDANh9gHA2Maujo=
 -- main.go --
 package main
 
@@ -361,6 +422,11 @@ module mod.com
 go 1.12
 
 require example.com/blah/v2 v2.0.0
+-- go.sum --
+example.com/blah v1.0.0 h1:kGPlWJbMsn1P31H9xp/q2mYI32cxLnCvauHN0AVaHnc=
+example.com/blah v1.0.0/go.mod h1:PZUQaGFeVjyDmAE8ywmLbmDn3fj4Ws8epg4oLuDzW3M=
+example.com/blah/v2 v2.0.0 h1:w5baE9JuuU11s3de3yWx2sU05AhNkgLYdZ4qukv+V0k=
+example.com/blah/v2 v2.0.0/go.mod h1:UZiKbTwobERo/hrqFLvIQlJwQZQGxWMVY4xere8mj7w=
 -- main.go --
 package main
 
@@ -424,8 +490,19 @@ func main() {
 				env.DiagnosticAtRegexp("go.mod", "example.com v1.2.2"),
 			)
 			env.RegexpReplace("go.mod", "v1.2.2", "v1.2.3")
-			env.Editor.SaveBufferWithoutActions(env.Ctx, "go.mod") // go.mod changes must be on disk
+			env.Editor.SaveBuffer(env.Ctx, "go.mod") // go.mod changes must be on disk
+
+			d := protocol.PublishDiagnosticsParams{}
 			env.Await(
+				OnceMet(
+					env.DiagnosticAtRegexpWithMessage("go.mod", "example.com v1.2.3", "example.com@v1.2.3"),
+					ReadDiagnostics("go.mod", &d),
+				),
+			)
+			env.ApplyQuickFixes("go.mod", d.Diagnostics)
+
+			env.Await(
+				EmptyDiagnostics("go.mod"),
 				env.DiagnosticAtRegexp("main.go", "x = "),
 			)
 		})
@@ -438,6 +515,9 @@ module mod.com
 require (
 	example.com v1.2.3
 )
+-- go.sum --
+example.com v1.2.3 h1:ihBTGWGjTU3V4ZJ9OmHITkU9WQ4lGdQkMjgyLFk0FaY=
+example.com v1.2.3/go.mod h1:Y2Rc5rVWjWur0h3pd9aEvK5Pof8YKDANh9gHA2Maujo=
 -- main.go --
 package main
 
@@ -456,12 +536,12 @@ func main() {
 				env.DiagnosticAtRegexp("main.go", "x = "),
 			)
 			env.RegexpReplace("go.mod", "v1.2.3", "v1.2.2")
-			env.Editor.SaveBufferWithoutActions(env.Ctx, "go.mod") // go.mod changes must be on disk
+			env.Editor.SaveBuffer(env.Ctx, "go.mod") // go.mod changes must be on disk
 			env.Await(
 				env.DiagnosticAtRegexp("go.mod", "example.com v1.2.2"),
 			)
 			env.RegexpReplace("go.mod", "v1.2.2", "v1.2.3")
-			env.Editor.SaveBufferWithoutActions(env.Ctx, "go.mod") // go.mod changes must be on disk
+			env.Editor.SaveBuffer(env.Ctx, "go.mod") // go.mod changes must be on disk
 			env.Await(
 				env.DiagnosticAtRegexp("main.go", "x = "),
 			)
@@ -627,6 +707,26 @@ func main() {
 	).run(t, mod, func(t *testing.T, env *Env) {
 		env.Await(
 			env.DiagnosticAtRegexp("main.go", `"example.com/blah"`),
+		)
+	})
+}
+
+func TestModTypoDiagnostic(t *testing.T) {
+	const mod = `
+-- go.mod --
+module mod.com
+
+go 1.12
+-- main.go --
+package main
+
+func main() {}
+`
+	run(t, mod, func(t *testing.T, env *Env) {
+		env.OpenFile("go.mod")
+		env.RegexpReplace("go.mod", "module", "modul")
+		env.Await(
+			env.DiagnosticAtRegexp("go.mod", "modul"),
 		)
 	})
 }

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"golang.org/x/tools/internal/lsp"
+	"golang.org/x/tools/internal/lsp/fake"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/lsp/tests"
@@ -20,6 +21,8 @@ func TestDisablingCodeLens(t *testing.T) {
 	const workspace = `
 -- go.mod --
 module codelens.test
+
+go 1.12
 -- lib.go --
 package lib
 
@@ -52,7 +55,7 @@ const (
 		t.Run(test.label, func(t *testing.T) {
 			withOptions(
 				EditorConfig{
-					CodeLens: test.enabled,
+					CodeLenses: test.enabled,
 				},
 			).run(t, workspace, func(t *testing.T, env *Env) {
 				env.OpenFile("lib.go")
@@ -154,6 +157,11 @@ go 1.14
 
 require golang.org/x/hello v1.0.0
 require golang.org/x/unused v1.0.0
+-- go.sum --
+golang.org/x/hello v1.0.0 h1:qbzE1/qT0/zojAMd/JcPsO2Vb9K4Bkeyq0vB2JGMmsw=
+golang.org/x/hello v1.0.0/go.mod h1:WW7ER2MRNXWA6c8/4bDIek4Hc/+DofTrMaQQitGXcco=
+golang.org/x/unused v1.0.0 h1:LecSbCn5P3vTcxubungSt1Pn4D/WocCaiWOPDC0y0rw=
+golang.org/x/unused v1.0.0/go.mod h1:ihoW8SgWzugwwj0N2SfLfPZCxTB1QOVfhMfB5PWTQ8U=
 -- main.go --
 package main
 
@@ -187,6 +195,8 @@ func TestRegenerateCgo(t *testing.T) {
 	const workspace = `
 -- go.mod --
 module example.com
+
+go 1.12
 -- cgo.go --
 package x
 
@@ -238,7 +248,7 @@ func main() {
 `
 	withOptions(
 		EditorConfig{
-			CodeLens: map[string]bool{
+			CodeLenses: map[string]bool{
 				"gc_details": true,
 			}},
 	).run(t, mod, func(t *testing.T, env *Env) {
@@ -264,6 +274,17 @@ func main() {
 		if !found {
 			t.Fatalf(`expected to find diagnostic with message "escape(x escapes to heap)", found none`)
 		}
+
+		// Editing a buffer should cause gc_details diagnostics to disappear, since
+		// they only apply to saved buffers.
+		env.EditBuffer("main.go", fake.NewEdit(0, 0, 0, 0, "\n\n"))
+		env.Await(EmptyDiagnostics("main.go"))
+
+		// Saving a buffer should re-format back to the original state, and
+		// re-enable the gc_details diagnostics.
+		env.SaveBuffer("main.go")
+		env.Await(DiagnosticAt("main.go", 6, 12))
+
 		// Toggle the GC details code lens again so now it should be off.
 		env.ExecuteCodeLensCommand("main.go", source.CommandToggleDetails)
 		env.Await(

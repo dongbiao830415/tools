@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"golang.org/x/tools/internal/lsp/cache"
@@ -38,6 +39,7 @@ type runner struct {
 	data        *tests.Data
 	diagnostics map[span.URI][]*source.Diagnostic
 	ctx         context.Context
+	normalizers []tests.Normalizer
 }
 
 func testLSP(t *testing.T, datum *tests.Data) {
@@ -83,9 +85,10 @@ func testLSP(t *testing.T, datum *tests.Data) {
 		t.Fatal(err)
 	}
 	r := &runner{
-		server: NewServer(session, testClient{}),
-		data:   datum,
-		ctx:    ctx,
+		server:      NewServer(session, testClient{}),
+		data:        datum,
+		ctx:         ctx,
+		normalizers: tests.CollectNormalizers(datum.Exported),
 	}
 	tests.Run(t, r, datum)
 }
@@ -455,7 +458,7 @@ func (r *runner) Import(t *testing.T, spn span.Span) {
 	}
 }
 
-func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string) {
+func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string, expectedActions int) {
 	uri := spn.URI()
 	view, err := r.server.session.ViewOf(uri)
 	if err != nil {
@@ -506,10 +509,13 @@ func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string)
 	if err != nil {
 		t.Fatalf("CodeAction %s failed: %v", spn, err)
 	}
-	if len(actions) != 1 {
+	if len(actions) != expectedActions {
 		// Hack: We assume that we only get one code action per range.
-		// TODO(rstambler): Support multiple code actions per test.
-		t.Fatalf("unexpected number of code actions, want 1, got %v", len(actions))
+		var cmds []string
+		for _, a := range actions {
+			cmds = append(cmds, fmt.Sprintf("%s (%s)", a.Command.Command, a.Title))
+		}
+		t.Fatalf("unexpected number of code actions, want %d, got %d: %v", expectedActions, len(actions), cmds)
 	}
 	action := actions[0]
 	var match bool
@@ -526,7 +532,7 @@ func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string)
 	if cmd := action.Command; cmd != nil {
 		edits, err := commandToEdits(r.ctx, snapshot, fh, rng, action.Command.Command)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("error converting command %q to edits: %v", action.Command.Command, err)
 		}
 		res, err = applyTextDocumentEdits(r, edits)
 		if err != nil {
@@ -562,7 +568,11 @@ func commandToEdits(ctx context.Context, snapshot source.Snapshot, fh source.Ver
 	if !command.Applies(ctx, snapshot, fh, rng) {
 		return nil, fmt.Errorf("cannot apply %v", command.ID())
 	}
-	return command.SuggestedFix(ctx, snapshot, fh, rng)
+	edits, err := command.SuggestedFix(ctx, snapshot, fh, rng)
+	if err != nil {
+		return nil, fmt.Errorf("error calling command.SuggestedFix: %v", err)
+	}
+	return edits, nil
 }
 
 func (r *runner) FunctionExtraction(t *testing.T, start span.Span, end span.Span) {
@@ -1012,20 +1022,14 @@ func (r *runner) Symbols(t *testing.T, uri span.URI, expectedSymbols []protocol.
 	}
 }
 
-func (r *runner) WorkspaceSymbols(t *testing.T, query string, expectedSymbols []protocol.SymbolInformation, dirs map[string]struct{}) {
-	r.callWorkspaceSymbols(t, query, source.SymbolCaseInsensitive, dirs, expectedSymbols)
+func (r *runner) WorkspaceSymbols(t *testing.T, uri span.URI, query string, typ tests.WorkspaceSymbolsTestType) {
+	r.callWorkspaceSymbols(t, uri, query, typ)
 }
 
-func (r *runner) FuzzyWorkspaceSymbols(t *testing.T, query string, expectedSymbols []protocol.SymbolInformation, dirs map[string]struct{}) {
-	r.callWorkspaceSymbols(t, query, source.SymbolFuzzy, dirs, expectedSymbols)
-}
-
-func (r *runner) CaseSensitiveWorkspaceSymbols(t *testing.T, query string, expectedSymbols []protocol.SymbolInformation, dirs map[string]struct{}) {
-	r.callWorkspaceSymbols(t, query, source.SymbolCaseSensitive, dirs, expectedSymbols)
-}
-
-func (r *runner) callWorkspaceSymbols(t *testing.T, query string, matcher source.SymbolMatcher, dirs map[string]struct{}, expectedSymbols []protocol.SymbolInformation) {
+func (r *runner) callWorkspaceSymbols(t *testing.T, uri span.URI, query string, typ tests.WorkspaceSymbolsTestType) {
 	t.Helper()
+
+	matcher := tests.WorkspaceSymbolsTestTypeToMatcher(typ)
 
 	original := r.server.session.Options()
 	modified := original
@@ -1036,12 +1040,19 @@ func (r *runner) callWorkspaceSymbols(t *testing.T, query string, matcher source
 	params := &protocol.WorkspaceSymbolParams{
 		Query: query,
 	}
-	got, err := r.server.Symbol(r.ctx, params)
+	gotSymbols, err := r.server.Symbol(r.ctx, params)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got = tests.FilterWorkspaceSymbols(got, dirs)
-	if diff := tests.DiffWorkspaceSymbols(expectedSymbols, got); diff != "" {
+	got, err := tests.WorkspaceSymbolsString(r.ctx, r.data, uri, gotSymbols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = filepath.ToSlash(tests.Normalize(got, r.normalizers))
+	want := string(r.data.Golden(fmt.Sprintf("workspace_symbol-%s-%s", strings.ToLower(string(matcher)), query), uri.Filename(), func() ([]byte, error) {
+		return []byte(got), nil
+	}))
+	if diff := tests.Diff(want, got); diff != "" {
 		t.Error(diff)
 	}
 }
@@ -1158,20 +1169,21 @@ func (r *runner) collectDiagnostics(view source.View) {
 	defer release()
 
 	// Always run diagnostics with analysis.
-	reports, _ := r.server.diagnose(r.ctx, snapshot, true)
-	r.server.publishReports(r.ctx, snapshot, reports, false)
-	for uri, sent := range r.server.delivered {
+	r.server.diagnose(r.ctx, snapshot, true)
+	for uri, reports := range r.server.diagnostics {
 		var diagnostics []*source.Diagnostic
-		for _, d := range sent.sorted {
-			diagnostics = append(diagnostics, &source.Diagnostic{
-				Range:    d.Range,
-				Message:  d.Message,
-				Related:  d.Related,
-				Severity: d.Severity,
-				Source:   d.Source,
-				Tags:     d.Tags,
-			})
+		for _, report := range reports.reports {
+			for _, d := range report.diags {
+				diagnostics = append(diagnostics, &source.Diagnostic{
+					Range:    d.Range,
+					Message:  d.Message,
+					Related:  d.Related,
+					Severity: d.Severity,
+					Source:   d.Source,
+					Tags:     d.Tags,
+				})
+			}
+			r.diagnostics[uri] = diagnostics
 		}
-		r.diagnostics[uri] = diagnostics
 	}
 }

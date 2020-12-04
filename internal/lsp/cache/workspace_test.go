@@ -174,7 +174,7 @@ replace gopls.test => ../../gopls.test2`,
 			root := span.URIFromPath(dir)
 
 			fs := osFileSource{}
-			wm, err := newWorkspace(ctx, root, fs, !test.legacyMode)
+			wm, err := newWorkspace(ctx, root, fs, false, !test.legacyMode)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -221,7 +221,7 @@ func checkWorkspaceModule(t *testing.T, rel fake.RelativeTo, got *workspace, wan
 		t.Errorf("module source = %v, want %v", got.moduleSource, wantSource)
 	}
 	modules := make(map[span.URI]struct{})
-	for k := range got.activeModFiles() {
+	for k := range got.getActiveModFiles() {
 		modules[k] = struct{}{}
 	}
 	for _, modPath := range want {
