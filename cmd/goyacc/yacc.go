@@ -161,6 +161,7 @@ var vflag string  // -v [y.output]	- y.output file
 var lflag bool    // -l			- disable line directives
 var prefix string // name prefix for identifiers, default yy
 var eflag bool
+var azDefine Define
 
 func init() {
 	flag.StringVar(&oflag, "o", "y.go", "parser output")
@@ -3214,7 +3215,7 @@ func ungetrune(f *bufio.Reader, c rune) {
 }
 
 func open(s string) *bufio.Reader {
-	if len(azDefine) <= 0 {
+	if azDefine.Size() <= 0 {
 		fi, err := os.Open(s)
 		if err != nil {
 			errorf("error opening %v: %v", s, err)
@@ -3228,7 +3229,9 @@ func open(s string) *bufio.Reader {
 		if err != nil {
 			errorf("error read file %s: %s", s, err.Error())
 		}
-		preprocess_input(b)
+		if err := azDefine.preprocess_input(b); err != nil {
+			errorf("preprocess input: %s", err.Error())
+		}
 
 		if eflag {
 			var efile string
