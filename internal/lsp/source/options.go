@@ -120,8 +120,9 @@ func DefaultOptions() *Options {
 				CompletionBudget: 100 * time.Millisecond,
 			},
 			ExperimentalOptions: ExperimentalOptions{
-				ExpandWorkspaceToModule:     true,
-				ExperimentalPackageCacheKey: true,
+				ExpandWorkspaceToModule:      true,
+				ExperimentalPackageCacheKey:  true,
+				ExperimentalDiagnosticsDelay: 250 * time.Millisecond,
 			},
 			InternalOptions: InternalOptions{
 				LiteralCompletions:      true,
@@ -625,11 +626,10 @@ func (o *Options) AddStaticcheckAnalyzer(a *analysis.Analyzer) {
 }
 
 // enableAllExperiments turns on all of the experimental "off-by-default"
-// features offered by gopls.
-// Any experimental features specified in maps should be enabled in
-// enableAllExperimentMaps.
+// features offered by gopls. Any experimental features specified in maps
+// should be enabled in enableAllExperimentMaps.
 func (o *Options) enableAllExperiments() {
-	o.ExperimentalDiagnosticsDelay = 200 * time.Millisecond
+	// There are currently no experimental features in development.
 }
 
 func (o *Options) enableAllExperimentMaps() {
@@ -791,6 +791,12 @@ func (o *Options) set(name string, value interface{}) OptionResult {
 
 	case "experimentalPackageCacheKey":
 		result.setBool(&o.ExperimentalPackageCacheKey)
+
+	case "allowModfileModifications":
+		result.setBool(&o.AllowModfileModifications)
+
+	case "allowImplicitNetworkAccess":
+		result.setBool(&o.AllowImplicitNetworkAccess)
 
 	case "allExperiments":
 		// This setting should be handled before all of the other options are

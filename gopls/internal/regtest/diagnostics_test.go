@@ -284,7 +284,7 @@ func Hello() {
 
 	t.Run("without workspace module", func(t *testing.T) {
 		withOptions(
-			WithModes(WithoutExperiments),
+			WithModes(Singleton),
 		).run(t, noMod, func(t *testing.T, env *Env) {
 			env.Await(
 				env.DiagnosticAtRegexp("main.go", `"mod.com/bob"`),
@@ -858,6 +858,8 @@ func TestHello(t *testing.T) {
 
 // Reproduce golang/go#40690.
 func TestCreateOnlyXTest(t *testing.T) {
+	testenv.NeedsGo1Point(t, 13)
+
 	const mod = `
 -- go.mod --
 module mod.com
@@ -1609,7 +1611,7 @@ import (
 			EditorConfig{
 				Env: map[string]string{"GO111MODULE": "off"},
 			},
-			WithModes(WithoutExperiments),
+			WithModes(Singleton),
 		).run(t, mod, func(t *testing.T, env *Env) {
 			env.Await(
 				env.DiagnosticAtRegexpWithMessage("main.go", `"nosuchpkg"`, `cannot find package "nosuchpkg" in any of`),
@@ -1634,7 +1636,7 @@ go 1.12
 package b
 `
 	withOptions(
-		WithModes(WithoutExperiments),
+		WithModes(Singleton),
 		EditorConfig{
 			Env: map[string]string{
 				"GO111MODULE": "on",
