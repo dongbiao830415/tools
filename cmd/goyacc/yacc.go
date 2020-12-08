@@ -162,6 +162,7 @@ var lflag bool    // -l			- disable line directives
 var prefix string // name prefix for identifiers, default yy
 var eflag bool
 var azDefine Define
+var lexType string
 
 func init() {
 	flag.StringVar(&oflag, "o", "y.go", "parser output")
@@ -170,6 +171,7 @@ func init() {
 	flag.BoolVar(&lflag, "l", false, "disable line directives")
 	flag.BoolVar(&eflag, "E", false, "Print input file after preprocessing.")
 	flag.Var(&azDefine, "D", "Define an %ifdef macro.")
+	flag.StringVar(&lexType, "t", "", "lex type")
 }
 
 var initialstacksize = 16
@@ -382,6 +384,9 @@ func setup() {
 	flag.Parse()
 	if flag.NArg() != 1 {
 		usage()
+	}
+	if lexType == "" {
+		lexType = prefix + "Lexer"
 	}
 	if initialstacksize < 1 {
 		// never set so cannot happen
@@ -2972,6 +2977,8 @@ func others() {
 		fmt.Fprintf(ftable, "\n//line yaccpar:1\n")
 	}
 
+	yaccpar = strings.Replace(yaccpar, prefix+"lexType", lexType, -1)
+
 	parts := strings.SplitN(yaccpar, prefix+"run()", 2)
 	fmt.Fprintf(ftable, "%v", parts[0])
 	ftable.Write(fcode.Bytes())
@@ -3481,6 +3488,10 @@ func ($$rcvr *$$ParserImpl) Parse($$lex $$Lexer) int {
 		$$token = -1
 	}()
 	$$p := -1
+
+	lx := $$lex.($$lexType)
+	_ = lx
+
 	goto $$stack
 
 ret0:
