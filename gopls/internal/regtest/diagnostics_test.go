@@ -10,7 +10,6 @@ import (
 	"log"
 	"os"
 	"testing"
-	"time"
 
 	"golang.org/x/tools/internal/lsp"
 	"golang.org/x/tools/internal/lsp/fake"
@@ -187,6 +186,8 @@ go 1.12
 -- a.go --
 package x
 
+// import "fmt"
+
 func f() {}
 
 -- a_test.go --
@@ -199,28 +200,33 @@ func TestA(t *testing.T) {
 }
 `
 
-func TestRmTest38878Close(t *testing.T) {
+// Tests golang/go#38878: deleting a test file should clear its errors, and
+// not break the workspace.
+func TestDeleteTestVariant(t *testing.T) {
 	runner.Run(t, test38878, func(t *testing.T, env *Env) {
-		env.OpenFile("a_test.go")
-		env.Await(DiagnosticAt("a_test.go", 5, 3))
-		env.CloseBuffer("a_test.go")
+		env.Await(env.DiagnosticAtRegexp("a_test.go", `f\((3)\)`))
 		env.RemoveWorkspaceFile("a_test.go")
-		// diagnostics go away
 		env.Await(EmptyDiagnostics("a_test.go"))
+
+		// Make sure the test variant has been removed from the workspace by
+		// triggering a metadata load.
+		env.OpenFile("a.go")
+		env.RegexpReplace("a.go", `// import`, "import")
+		env.Await(env.DiagnosticAtRegexp("a.go", `"fmt"`))
 	})
 }
 
-func TestRmTest38878(t *testing.T) {
+// Tests golang/go#38878: deleting a test file on disk while it's still open
+// should not clear its errors.
+func TestDeleteTestVariant_DiskOnly(t *testing.T) {
 	log.SetFlags(log.Lshortfile)
 	runner.Run(t, test38878, func(t *testing.T, env *Env) {
 		env.OpenFile("a_test.go")
 		env.Await(DiagnosticAt("a_test.go", 5, 3))
 		env.Sandbox.Workdir.RemoveFile(context.Background(), "a_test.go")
-		// diagnostics remain after giving gopls a chance to do something
-		// (there is not yet a better way to decide gopls isn't going
-		// to do anything)
-		time.Sleep(time.Second)
-		env.Await(DiagnosticAt("a_test.go", 5, 3))
+		env.Await(OnceMet(
+			CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidChangeWatchedFiles), 1),
+			DiagnosticAt("a_test.go", 5, 3)))
 	})
 }
 
@@ -454,8 +460,13 @@ func _() {
 	fmt.Println("Hello World")
 }
 `
-	editorConfig := EditorConfig{Env: map[string]string{"GOPATH": ""}}
-	withOptions(editorConfig).run(t, files, func(t *testing.T, env *Env) {
+	withOptions(
+		EditorConfig{
+			Env: map[string]string{
+				"GOPATH":      "",
+				"GO111MODULE": "off",
+			},
+		}).run(t, files, func(t *testing.T, env *Env) {
 		env.OpenFile("main.go")
 		env.Await(env.DiagnosticAtRegexp("main.go", "fmt"))
 		env.SaveBuffer("main.go")
@@ -1464,17 +1475,37 @@ func TestRenamePackage(t *testing.T) {
 module mod.com
 
 go 1.12
--- foo.go --
-package foo
--- foo_test.go --
-package foo_`
+-- main.go --
+package main
 
-	runner.Run(t, contents, func(t *testing.T, env *Env) {
-		env.OpenFile("foo_test.go")
-		env.RegexpReplace("foo_test.go", "foo_", "foo_test")
-		env.SaveBuffer("foo_test.go")
+import "example.com/blah"
+
+func main() {
+	blah.Hello()
+}
+-- bob.go --
+package main
+-- foo/foo.go --
+package foo
+-- foo/foo_test.go --
+package foo_
+`
+
+	withOptions(
+		WithProxyFiles(proxy),
+		InGOPATH(),
+	).run(t, contents, func(t *testing.T, env *Env) {
+		// Simulate typing character by character.
+		env.OpenFile("foo/foo_test.go")
+		env.Await(CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidOpen), 1))
+		env.RegexpReplace("foo/foo_test.go", "_", "_t")
+		env.Await(CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidChange), 1))
+		env.RegexpReplace("foo/foo_test.go", "_t", "_test")
+		env.Await(CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidChange), 2))
+
 		env.Await(
-			EmptyDiagnostics("foo_test.go"),
+			EmptyDiagnostics("foo/foo_test.go"),
+			NoOutstandingWork(),
 		)
 	})
 }
@@ -1620,7 +1651,7 @@ import (
 	})
 }
 
-func TestMultipleModules_GO111MODULE_on(t *testing.T) {
+func TestMultipleModules_Warning(t *testing.T) {
 	const modules = `
 -- a/go.mod --
 module a.com
@@ -1635,21 +1666,47 @@ go 1.12
 -- b/b.go --
 package b
 `
-	withOptions(
-		WithModes(Singleton),
-		EditorConfig{
-			Env: map[string]string{
-				"GO111MODULE": "on",
+	for _, go111module := range []string{"on", "auto"} {
+		t.Run("GO111MODULE="+go111module, func(t *testing.T) {
+			withOptions(
+				WithModes(Singleton),
+				EditorConfig{
+					Env: map[string]string{
+						"GO111MODULE": go111module,
+					},
+				},
+			).run(t, modules, func(t *testing.T, env *Env) {
+				env.OpenFile("a/a.go")
+				env.OpenFile("b/go.mod")
+				env.Await(
+					env.DiagnosticAtRegexp("a/a.go", "package a"),
+					env.DiagnosticAtRegexp("b/go.mod", "module b.com"),
+					OutstandingWork("Error loading workspace", "gopls requires a module at the root of your workspace."),
+				)
+			})
+		})
+	}
+
+	// Expect no warning if GO111MODULE=auto in a directory in GOPATH.
+	t.Run("GOPATH_GO111MODULE_auto", func(t *testing.T) {
+		withOptions(
+			WithModes(Singleton),
+			EditorConfig{
+				Env: map[string]string{
+					"GO111MODULE": "auto",
+				},
 			},
-		},
-	).run(t, modules, func(t *testing.T, env *Env) {
-		env.OpenFile("a/a.go")
-		env.OpenFile("b/go.mod")
-		env.Await(
-			env.DiagnosticAtRegexp("a/a.go", "package a"),
-			env.DiagnosticAtRegexp("b/go.mod", "module b.com"),
-			OutstandingWork("Error loading workspace", "gopls requires a module at the root of your workspace."),
-		)
+			InGOPATH(),
+		).run(t, modules, func(t *testing.T, env *Env) {
+			env.OpenFile("a/a.go")
+			env.Await(
+				OnceMet(
+					CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidOpen), 1),
+					NoDiagnostics("a/a.go"),
+				),
+				NoOutstandingWork(),
+			)
+		})
 	})
 }
 

@@ -6,6 +6,7 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"go/types"
 	"io/ioutil"
@@ -174,10 +175,8 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...interf
 }
 
 func (s *snapshot) parseLoadError(ctx context.Context, loadErr error) *source.CriticalError {
-	// The error may be a result of the user's workspace layout. Check for
-	// a valid workspace configuration first.
-	if criticalErr := s.workspaceLayoutErrors(ctx, loadErr); criticalErr != nil {
-		return criticalErr
+	if strings.Contains(loadErr.Error(), "cannot find main module") {
+		return s.WorkspaceLayoutError(ctx)
 	}
 	criticalErr := &source.CriticalError{
 		MainError: loadErr,
@@ -199,7 +198,7 @@ func (s *snapshot) parseLoadError(ctx context.Context, loadErr error) *source.Cr
 
 // workspaceLayoutErrors returns a diagnostic for every open file, as well as
 // an error message if there are no open files.
-func (s *snapshot) workspaceLayoutErrors(ctx context.Context, err error) *source.CriticalError {
+func (s *snapshot) WorkspaceLayoutError(ctx context.Context) *source.CriticalError {
 	// Assume the workspace is misconfigured only if we've detected an invalid
 	// build configuration. Currently, a valid build configuration is either a
 	// module at the root of the view or a GOPATH workspace.
@@ -209,8 +208,7 @@ func (s *snapshot) workspaceLayoutErrors(ctx context.Context, err error) *source
 	if len(s.workspace.getKnownModFiles()) == 0 {
 		return nil
 	}
-	// TODO(rstambler): Handle GO111MODULE=auto.
-	if s.view.userGo111Module != on {
+	if s.view.userGo111Module == off {
 		return nil
 	}
 	if s.workspace.moduleSource != legacyWorkspace {
@@ -291,22 +289,36 @@ func (s *snapshot) getWorkspaceDir(ctx context.Context) (span.URI, error) {
 	if err != nil {
 		return "", err
 	}
-	content, err := file.Format()
+	hash := sha256.New()
+	modContent, err := file.Format()
 	if err != nil {
 		return "", err
 	}
-	key := workspaceDirKey(hashContents(content))
+	sumContent, err := s.workspace.sumFile(ctx, s)
+	if err != nil {
+		return "", err
+	}
+	hash.Write(modContent)
+	hash.Write(sumContent)
+	key := workspaceDirKey(hash.Sum(nil))
 	s.mu.Lock()
 	h = s.generation.Bind(key, func(context.Context, memoize.Arg) interface{} {
 		tmpdir, err := ioutil.TempDir("", "gopls-workspace-mod")
 		if err != nil {
 			return &workspaceDirData{err: err}
 		}
-		filename := filepath.Join(tmpdir, "go.mod")
-		if err := ioutil.WriteFile(filename, content, 0644); err != nil {
-			os.RemoveAll(tmpdir)
-			return &workspaceDirData{err: err}
+
+		for name, content := range map[string][]byte{
+			"go.mod": modContent,
+			"go.sum": sumContent,
+		} {
+			filename := filepath.Join(tmpdir, name)
+			if err := ioutil.WriteFile(filename, content, 0644); err != nil {
+				os.RemoveAll(tmpdir)
+				return &workspaceDirData{err: err}
+			}
 		}
+
 		return &workspaceDirData{dir: tmpdir}
 	}, func(v interface{}) {
 		d := v.(*workspaceDirData)

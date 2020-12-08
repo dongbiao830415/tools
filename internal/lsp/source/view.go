@@ -146,6 +146,11 @@ type Snapshot interface {
 
 	// WorkspacePackages returns the snapshot's top-level packages.
 	WorkspacePackages(ctx context.Context) ([]Package, error)
+
+	// WorkspaceLayoutError reports whether there might be any problems with
+	// the user's workspace configuration, which would cause bad or incorrect
+	// diagnostics.
+	WorkspaceLayoutError(ctx context.Context) *CriticalError
 }
 
 // PackageFilter sets how a package is filtered out from a set of packages
@@ -579,7 +584,11 @@ type Error struct {
 	Kind     ErrorKind
 	Message  string
 	Category string // only used by analysis errors so far
-	Related  []RelatedInformation
+
+	Related []RelatedInformation
+
+	Code     string
+	CodeHref string
 
 	// SuggestedFixes is used to generate quick fixes for a CodeAction request.
 	// It isn't part of the Diagnostic type.
