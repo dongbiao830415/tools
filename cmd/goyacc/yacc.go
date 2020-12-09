@@ -3429,10 +3429,8 @@ func $$ErrorMessage(state, lookAhead int) string {
 	return res
 }
 
-func $$lex1(lex $$Lexer, lval *$$SymType) (char, token int) {
+func $$lex2(char int) (token int) {
 	token = 0
-	//char 就是token的数字的值
-	char = lex.Lex(lval)
 	if char <= 0 {
 		token = $$Tok1[0]
 		goto out
@@ -3459,6 +3457,14 @@ out:
 	if token == 0 {
 		token = $$Tok2[1] /* unknown char */
 	}
+
+	return token
+}
+
+func $$lex1(lex $$Lexer, lval *$$SymType) (char, token int) {
+	//char 就是token的数字的值
+	char = lex.Lex(lval)
+	token =  $$lex2(char)
 	if $$Debug >= 3 {
 		__yyfmt__.Printf("lex %s(%d)\n", $$Tokname(token), uint(char))
 	}
