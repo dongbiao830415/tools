@@ -3222,39 +3222,28 @@ func ungetrune(f *bufio.Reader, c rune) {
 }
 
 func open(s string) *bufio.Reader {
-	if azDefine.Size() <= 0 {
-		fi, err := os.Open(s)
-		if err != nil {
-			errorf("error opening %v: %v", s, err)
-		}
-
-		//fmt.Printf("open %v\n", s);
-		return bufio.NewReader(fi)
-
-	} else {
-		b, err := ioutil.ReadFile(s)
-		if err != nil {
-			errorf("error read file %s: %s", s, err.Error())
-		}
-		if err := azDefine.preprocess_input(b); err != nil {
-			errorf("preprocess input: %s", err.Error())
-		}
-
-		if eflag {
-			var efile string
-			if oflag == "" {
-				efile = "y.e"
-
-			} else {
-				efile = strings.TrimSuffix(oflag, ".go") + ".e"
-			}
-
-			ioutil.WriteFile(efile, b, 0644)
-		}
-
-		fi := bytes.NewReader(b)
-		return bufio.NewReader(fi)
+	b, err := ioutil.ReadFile(s)
+	if err != nil {
+		errorf("error read file %s: %s", s, err.Error())
 	}
+	if err := azDefine.preprocess_input(b); err != nil {
+		errorf("preprocess input: %s", err.Error())
+	}
+
+	if eflag {
+		var efile string
+		if oflag == "" {
+			efile = "y.e"
+
+		} else {
+			efile = strings.TrimSuffix(oflag, ".go") + ".e"
+		}
+
+		ioutil.WriteFile(efile, b, 0644)
+	}
+
+	fi := bytes.NewReader(b)
+	return bufio.NewReader(fi)
 }
 
 func create(s string) *bufio.Writer {
