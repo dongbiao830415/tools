@@ -6,6 +6,9 @@ package vta
 
 import (
 	"go/types"
+
+	"golang.org/x/tools/go/callgraph"
+	"golang.org/x/tools/go/ssa"
 )
 
 func canAlias(n1, n2 node) bool {
@@ -83,4 +86,82 @@ func interfaceUnderPtr(t types.Type) types.Type {
 	}
 
 	return interfaceUnderPtr(p.Elem())
+}
+
+// sliceArrayElem returns the element type of type `t` that is
+// expected to be a (pointer to) array or slice, consistent with
+// the ssa.Index and ssa.IndexAddr instructions. Panics otherwise.
+func sliceArrayElem(t types.Type) types.Type {
+	u := t.Underlying()
+
+	if p, ok := u.(*types.Pointer); ok {
+		u = p.Elem().Underlying()
+	}
+
+	if a, ok := u.(*types.Array); ok {
+		return a.Elem()
+	}
+	return u.(*types.Slice).Elem()
+}
+
+// siteCallees computes a set of callees for call site `c` given program `callgraph`.
+func siteCallees(c ssa.CallInstruction, callgraph *callgraph.Graph) []*ssa.Function {
+	var matches []*ssa.Function
+
+	node := callgraph.Nodes[c.Parent()]
+	if node == nil {
+		return nil
+	}
+
+	for _, edge := range node.Out {
+		callee := edge.Callee.Func
+		// Skip synthetic functions wrapped around source functions.
+		if edge.Site == c && callee.Synthetic == "" {
+			matches = append(matches, callee)
+		}
+	}
+	return matches
+}
+
+func canHaveMethods(t types.Type) bool {
+	if _, ok := t.(*types.Named); ok {
+		return true
+	}
+
+	u := t.Underlying()
+	switch u.(type) {
+	case *types.Interface, *types.Signature, *types.Struct:
+		return true
+	default:
+		return false
+	}
+}
+
+// calls returns the set of call instructions in `f`.
+func calls(f *ssa.Function) []ssa.CallInstruction {
+	var calls []ssa.CallInstruction
+	for _, bl := range f.Blocks {
+		for _, instr := range bl.Instrs {
+			if c, ok := instr.(ssa.CallInstruction); ok {
+				calls = append(calls, c)
+			}
+		}
+	}
+	return calls
+}
+
+// intersect produces an intersection of functions in `fs1` and `fs2`.
+func intersect(fs1, fs2 []*ssa.Function) []*ssa.Function {
+	m := make(map[*ssa.Function]bool)
+	for _, f := range fs1 {
+		m[f] = true
+	}
+
+	var res []*ssa.Function
+	for _, f := range fs2 {
+		if m[f] {
+			res = append(res, f)
+		}
+	}
+	return res
 }

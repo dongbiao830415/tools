@@ -262,6 +262,9 @@ type builder struct {
 }
 
 func (b *builder) visit(funcs map[*ssa.Function]bool) {
+	// Add the fixed edge Panic -> Recover
+	b.graph.addEdge(panicArg{}, recoverReturn{})
+
 	for f, in := range funcs {
 		if in {
 			b.fun(f)
@@ -283,6 +286,8 @@ func (b *builder) instr(instr ssa.Instruction) {
 		b.addInFlowAliasEdges(b.nodeFromVal(i.Addr), b.nodeFromVal(i.Val))
 	case *ssa.MakeInterface:
 		b.addInFlowEdge(b.nodeFromVal(i.X), b.nodeFromVal(i))
+	case *ssa.MakeClosure:
+		b.closure(i)
 	case *ssa.UnOp:
 		b.unop(i)
 	case *ssa.Phi:
@@ -319,14 +324,33 @@ func (b *builder) instr(instr ssa.Instruction) {
 		b.field(i)
 	case *ssa.FieldAddr:
 		b.fieldAddr(i)
+	case *ssa.Send:
+		b.send(i)
+	case *ssa.Select:
+		b.selekt(i)
+	case *ssa.Index:
+		b.index(i)
+	case *ssa.IndexAddr:
+		b.indexAddr(i)
+	case *ssa.Lookup:
+		b.lookup(i)
+	case *ssa.MapUpdate:
+		b.mapUpdate(i)
+	case *ssa.Next:
+		b.next(i)
+	case ssa.CallInstruction:
+		b.call(i)
+	case *ssa.Panic:
+		b.panic(i)
+	case *ssa.Return:
+		b.rtrn(i)
 	case *ssa.MakeChan, *ssa.MakeMap, *ssa.MakeSlice, *ssa.BinOp,
 		*ssa.Alloc, *ssa.DebugRef, *ssa.Convert, *ssa.Jump, *ssa.If,
 		*ssa.Slice, *ssa.Range, *ssa.RunDefers:
 		// No interesting flow here.
 		return
 	default:
-		// TODO(zpavlinovic): make into a panic once all instructions are supported.
-		fmt.Printf("unsupported instruction %v\n", instr)
+		panic(fmt.Sprintf("unsupported instruction %v\n", instr))
 	}
 }
 
@@ -336,7 +360,8 @@ func (b *builder) unop(u *ssa.UnOp) {
 		// Multiplication operator * is used here as a dereference operator.
 		b.addInFlowAliasEdges(b.nodeFromVal(u), b.nodeFromVal(u.X))
 	case token.ARROW:
-		// TODO(zpavlinovic): add support for channels.
+		t := u.X.Type().Underlying().(*types.Chan).Elem()
+		b.addInFlowAliasEdges(b.nodeFromVal(u), channelElem{typ: t})
 	default:
 		// There is no interesting type flow otherwise.
 	}
@@ -388,6 +413,91 @@ func (b *builder) fieldAddr(f *ssa.FieldAddr) {
 	b.addInFlowEdge(b.nodeFromVal(f), fnode)
 }
 
+func (b *builder) send(s *ssa.Send) {
+	t := s.Chan.Type().Underlying().(*types.Chan).Elem()
+	b.addInFlowAliasEdges(channelElem{typ: t}, b.nodeFromVal(s.X))
+}
+
+// selekt generates flows for select statement
+//   a = select blocking/nonblocking [c_1 <- t_1, c_2 <- t_2, ..., <- o_1, <- o_2, ...]
+// between receiving channel registers c_i and corresponding input register t_i. Further,
+// flows are generated between o_i and a[2 + i]. Note that a is a tuple register of type
+// <int, bool, r_1, r_2, ...> where the type of r_i is the element type of channel o_i.
+func (b *builder) selekt(s *ssa.Select) {
+	recvIndex := 0
+	for _, state := range s.States {
+		t := state.Chan.Type().Underlying().(*types.Chan).Elem()
+
+		if state.Dir == types.SendOnly {
+			b.addInFlowAliasEdges(channelElem{typ: t}, b.nodeFromVal(state.Send))
+		} else {
+			// state.Dir == RecvOnly by definition of select instructions.
+			tupEntry := indexedLocal{val: s, typ: t, index: 2 + recvIndex}
+			b.addInFlowAliasEdges(tupEntry, channelElem{typ: t})
+			recvIndex++
+		}
+	}
+}
+
+// index instruction a := b[c] on slices creates flows between a and
+// SliceElem(t) flow where t is an interface type of c. Arrays and
+// slice elements are both modeled as SliceElem.
+func (b *builder) index(i *ssa.Index) {
+	et := sliceArrayElem(i.X.Type())
+	b.addInFlowAliasEdges(b.nodeFromVal(i), sliceElem{typ: et})
+}
+
+// indexAddr instruction a := &b[c] fetches address of a index
+// into the field so we create bidirectional flow a <-> SliceElem(t)
+// where t is an interface type of c. Arrays and slice elements are
+// both modeled as SliceElem.
+func (b *builder) indexAddr(i *ssa.IndexAddr) {
+	et := sliceArrayElem(i.X.Type())
+	b.addInFlowEdge(sliceElem{typ: et}, b.nodeFromVal(i))
+	b.addInFlowEdge(b.nodeFromVal(i), sliceElem{typ: et})
+}
+
+// lookup handles map query commands a := m[b] where m is of type
+// map[...]V and V is an interface. It creates flows between `a`
+// and MapValue(V).
+func (b *builder) lookup(l *ssa.Lookup) {
+	t, ok := l.X.Type().Underlying().(*types.Map)
+	if !ok {
+		// No interesting flows for string lookups.
+		return
+	}
+	b.addInFlowAliasEdges(b.nodeFromVal(l), mapValue{typ: t.Elem()})
+}
+
+// mapUpdate handles map update commands m[b] = a where m is of type
+// map[K]V and K and V are interfaces. It creates flows between `a`
+// and MapValue(V) as well as between MapKey(K) and `b`.
+func (b *builder) mapUpdate(u *ssa.MapUpdate) {
+	t, ok := u.Map.Type().Underlying().(*types.Map)
+	if !ok {
+		// No interesting flows for string updates.
+		return
+	}
+
+	b.addInFlowAliasEdges(mapKey{typ: t.Key()}, b.nodeFromVal(u.Key))
+	b.addInFlowAliasEdges(mapValue{typ: t.Elem()}, b.nodeFromVal(u.Value))
+}
+
+// next instruction <ok, key, value> := next r, where r
+// is a range over map or string generates flow between
+// key and MapKey as well value and MapValue nodes.
+func (b *builder) next(n *ssa.Next) {
+	if n.IsString {
+		return
+	}
+	tup := n.Type().Underlying().(*types.Tuple)
+	kt := tup.At(1).Type()
+	vt := tup.At(2).Type()
+
+	b.addInFlowAliasEdges(indexedLocal{val: n, typ: kt, index: 1}, mapKey{typ: kt})
+	b.addInFlowAliasEdges(indexedLocal{val: n, typ: vt, index: 2}, mapValue{typ: vt})
+}
+
 // addInFlowAliasEdges adds an edge r -> l to b.graph if l is a node that can
 // have an inflow, i.e., a node that represents an interface or an unresolved
 // function value. Similarly for the edge l -> r with an additional condition
@@ -397,6 +507,97 @@ func (b *builder) addInFlowAliasEdges(l, r node) {
 
 	if canAlias(l, r) {
 		b.addInFlowEdge(l, r)
+	}
+}
+
+func (b *builder) closure(c *ssa.MakeClosure) {
+	f := c.Fn.(*ssa.Function)
+	b.addInFlowEdge(function{f: f}, b.nodeFromVal(c))
+
+	for i, fv := range f.FreeVars {
+		b.addInFlowAliasEdges(b.nodeFromVal(fv), b.nodeFromVal(c.Bindings[i]))
+	}
+}
+
+// panic creates a flow from arguments to panic instructions to return
+// registers of all recover statements in the program. Introduces a
+// global panic node Panic and
+//  1) for every panic statement p: add p -> Panic
+//  2) for every recover statement r: add Panic -> r (handled in call)
+// TODO(zpavlinovic): improve precision by explicitly modeling how panic
+// values flow from callees to callers and into deferred recover instructions.
+func (b *builder) panic(p *ssa.Panic) {
+	// Panics often have, for instance, strings as arguments which do
+	// not create interesting flows.
+	if !canHaveMethods(p.X.Type()) {
+		return
+	}
+
+	b.addInFlowEdge(b.nodeFromVal(p.X), panicArg{})
+}
+
+// call adds flows between arguments/parameters and return values/registers
+// for both static and dynamic calls, as well as go and defer calls.
+func (b *builder) call(c ssa.CallInstruction) {
+	// When c is r := recover() call register instruction, we add Recover -> r.
+	if bf, ok := c.Common().Value.(*ssa.Builtin); ok && bf.Name() == "recover" {
+		b.addInFlowEdge(recoverReturn{}, b.nodeFromVal(c.(*ssa.Call)))
+		return
+	}
+
+	for _, f := range siteCallees(c, b.callGraph) {
+		addArgumentFlows(b, c, f)
+	}
+}
+
+func addArgumentFlows(b *builder, c ssa.CallInstruction, f *ssa.Function) {
+	cc := c.Common()
+	// When c is an unresolved method call (cc.Method != nil), cc.Value contains
+	// the receiver object rather than cc.Args[0].
+	if cc.Method != nil {
+		b.addInFlowAliasEdges(b.nodeFromVal(f.Params[0]), b.nodeFromVal(cc.Value))
+	}
+
+	offset := 0
+	if cc.Method != nil {
+		offset = 1
+	}
+	for i, v := range cc.Args {
+		b.addInFlowAliasEdges(b.nodeFromVal(f.Params[i+offset]), b.nodeFromVal(v))
+	}
+}
+
+// rtrn produces flows between values of r and c where
+// c is a call instruction that resolves to the enclosing
+// function of r based on b.callGraph.
+func (b *builder) rtrn(r *ssa.Return) {
+	n := b.callGraph.Nodes[r.Parent()]
+	// n != nil when b.callgraph is sound, but the client can
+	// pass any callgraph, including an underapproximate one.
+	if n == nil {
+		return
+	}
+
+	for _, e := range n.In {
+		if cv, ok := e.Site.(ssa.Value); ok {
+			addReturnFlows(b, r, cv)
+		}
+	}
+}
+
+func addReturnFlows(b *builder, r *ssa.Return, site ssa.Value) {
+	results := r.Results
+	if len(results) == 1 {
+		// When there is only one return value, the destination register does not
+		// have a tuple type.
+		b.addInFlowEdge(b.nodeFromVal(results[0]), b.nodeFromVal(site))
+		return
+	}
+
+	tup := site.Type().Underlying().(*types.Tuple)
+	for i, r := range results {
+		local := indexedLocal{val: site, typ: tup.At(i).Type(), index: i}
+		b.addInFlowEdge(b.nodeFromVal(r), local)
 	}
 }
 
