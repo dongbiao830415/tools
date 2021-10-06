@@ -47,7 +47,7 @@ var summaryFile = "summary.txt"
 
 func init() {
 	if typeparams.Enabled {
-		summaryFile = "summary_generics.txt"
+		summaryFile = "summary_go1.18.txt"
 	}
 }
 
@@ -70,6 +70,7 @@ type Imports []span.Span
 type SemanticTokens []span.Span
 type SuggestedFixes map[span.Span][]string
 type FunctionExtractions map[span.Span]span.Span
+type MethodExtractions map[span.Span]span.Span
 type Definitions map[span.Span]Definition
 type Implementations map[span.Span][]span.Span
 type Highlights map[span.Span][]span.Span
@@ -83,6 +84,7 @@ type WorkspaceSymbols map[WorkspaceSymbolsTestType]map[span.URI][]string
 type Signatures map[span.Span]*protocol.SignatureHelp
 type Links map[span.URI][]Link
 type AddImport map[span.URI]string
+type Hovers map[span.Span]string
 
 type Data struct {
 	Config                   packages.Config
@@ -104,6 +106,7 @@ type Data struct {
 	SemanticTokens           SemanticTokens
 	SuggestedFixes           SuggestedFixes
 	FunctionExtractions      FunctionExtractions
+	MethodExtractions        MethodExtractions
 	Definitions              Definitions
 	Implementations          Implementations
 	Highlights               Highlights
@@ -117,6 +120,7 @@ type Data struct {
 	Signatures               Signatures
 	Links                    Links
 	AddImport                AddImport
+	Hovers                   Hovers
 
 	t         testing.TB
 	fragments map[string]string
@@ -147,6 +151,7 @@ type Tests interface {
 	SemanticTokens(*testing.T, span.Span)
 	SuggestedFix(*testing.T, span.Span, []string, int)
 	FunctionExtraction(*testing.T, span.Span, span.Span)
+	MethodExtraction(*testing.T, span.Span, span.Span)
 	Definition(*testing.T, span.Span, Definition)
 	Implementation(*testing.T, span.Span, []span.Span)
 	Highlight(*testing.T, span.Span, []span.Span)
@@ -158,6 +163,7 @@ type Tests interface {
 	SignatureHelp(*testing.T, span.Span, *protocol.SignatureHelp)
 	Link(*testing.T, span.URI, []Link)
 	AddImport(*testing.T, span.URI, string)
+	Hover(*testing.T, span.Span, string)
 }
 
 type Definition struct {
@@ -298,6 +304,7 @@ func load(t testing.TB, mode string, dir string) *Data {
 		PrepareRenames:           make(PrepareRenames),
 		SuggestedFixes:           make(SuggestedFixes),
 		FunctionExtractions:      make(FunctionExtractions),
+		MethodExtractions:        make(MethodExtractions),
 		Symbols:                  make(Symbols),
 		symbolsChildren:          make(SymbolsChildren),
 		symbolInformation:        make(SymbolInformation),
@@ -305,6 +312,7 @@ func load(t testing.TB, mode string, dir string) *Data {
 		Signatures:               make(Signatures),
 		Links:                    make(Links),
 		AddImport:                make(AddImport),
+		Hovers:                   make(Hovers),
 
 		t:         t,
 		dir:       dir,
@@ -455,7 +463,8 @@ func load(t testing.TB, mode string, dir string) *Data {
 		"godef":           datum.collectDefinitions,
 		"implementations": datum.collectImplementations,
 		"typdef":          datum.collectTypeDefinitions,
-		"hover":           datum.collectHoverDefinitions,
+		"hoverdef":        datum.collectHoverDefinitions,
+		"hover":           datum.collectHovers,
 		"highlight":       datum.collectHighlights,
 		"refs":            datum.collectReferences,
 		"rename":          datum.collectRenames,
@@ -465,6 +474,7 @@ func load(t testing.TB, mode string, dir string) *Data {
 		"link":            datum.collectLinks,
 		"suggestedfix":    datum.collectSuggestedFixes,
 		"extractfunc":     datum.collectFunctionExtractions,
+		"extractmethod":   datum.collectMethodExtractions,
 		"incomingcalls":   datum.collectIncomingCalls,
 		"outgoingcalls":   datum.collectOutgoingCalls,
 		"addimport":       datum.collectAddImports,
@@ -480,7 +490,7 @@ func load(t testing.TB, mode string, dir string) *Data {
 	// Collect names for the entries that require golden files.
 	if err := datum.Exported.Expect(map[string]interface{}{
 		"godef":                        datum.collectDefinitionNames,
-		"hover":                        datum.collectDefinitionNames,
+		"hoverdef":                     datum.collectDefinitionNames,
 		"workspacesymbol":              datum.collectWorkspaceSymbols(WorkspaceSymbolsDefault),
 		"workspacesymbolfuzzy":         datum.collectWorkspaceSymbols(WorkspaceSymbolsFuzzy),
 		"workspacesymbolcasesensitive": datum.collectWorkspaceSymbols(WorkspaceSymbolsCaseSensitive),
@@ -675,6 +685,20 @@ func Run(t *testing.T, tests Tests, data *Data) {
 		}
 	})
 
+	t.Run("MethodExtraction", func(t *testing.T) {
+		t.Helper()
+		for start, end := range data.MethodExtractions {
+			// Check if we should skip this spn if the -modfile flag is not available.
+			if shouldSkip(data, start.URI()) {
+				continue
+			}
+			t.Run(SpanName(start), func(t *testing.T) {
+				t.Helper()
+				tests.MethodExtraction(t, start, end)
+			})
+		}
+	})
+
 	t.Run("Definition", func(t *testing.T) {
 		t.Helper()
 		for spn, d := range data.Definitions {
@@ -707,6 +731,16 @@ func Run(t *testing.T, tests Tests, data *Data) {
 			t.Run(SpanName(pos), func(t *testing.T) {
 				t.Helper()
 				tests.Highlight(t, pos, locations)
+			})
+		}
+	})
+
+	t.Run("Hover", func(t *testing.T) {
+		t.Helper()
+		for pos, info := range data.Hovers {
+			t.Run(SpanName(pos), func(t *testing.T) {
+				t.Helper()
+				tests.Hover(t, pos, info)
 			})
 		}
 	})
@@ -895,6 +929,7 @@ func checkData(t *testing.T, data *Data) {
 	fmt.Fprintf(buf, "SemanticTokenCount = %v\n", len(data.SemanticTokens))
 	fmt.Fprintf(buf, "SuggestedFixCount = %v\n", len(data.SuggestedFixes))
 	fmt.Fprintf(buf, "FunctionExtractionCount = %v\n", len(data.FunctionExtractions))
+	fmt.Fprintf(buf, "MethodExtractionCount = %v\n", len(data.MethodExtractions))
 	fmt.Fprintf(buf, "DefinitionsCount = %v\n", definitionCount)
 	fmt.Fprintf(buf, "TypeDefinitionsCount = %v\n", typeDefinitionCount)
 	fmt.Fprintf(buf, "HighlightsCount = %v\n", len(data.Highlights))
@@ -1128,6 +1163,12 @@ func (data *Data) collectFunctionExtractions(start span.Span, end span.Span) {
 	}
 }
 
+func (data *Data) collectMethodExtractions(start span.Span, end span.Span) {
+	if _, ok := data.MethodExtractions[start]; !ok {
+		data.MethodExtractions[start] = end
+	}
+}
+
 func (data *Data) collectDefinitions(src, target span.Span) {
 	data.Definitions[src] = Definition{
 		Src: src,
@@ -1194,6 +1235,10 @@ func (data *Data) collectHoverDefinitions(src, target span.Span) {
 		Def:       target,
 		OnlyHover: true,
 	}
+}
+
+func (data *Data) collectHovers(src span.Span, expected string) {
+	data.Hovers[src] = expected
 }
 
 func (data *Data) collectTypeDefinitions(src, target span.Span) {

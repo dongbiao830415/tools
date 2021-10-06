@@ -30,7 +30,7 @@ func (s *snapshot) Analyze(ctx context.Context, id string, analyzers []*source.A
 		if !a.IsEnabled(s.view) {
 			continue
 		}
-		ah, err := s.actionHandle(ctx, packageID(id), a.Analyzer)
+		ah, err := s.actionHandle(ctx, PackageID(id), a.Analyzer)
 		if err != nil {
 			return nil, err
 		}
@@ -46,7 +46,9 @@ func (s *snapshot) Analyze(ctx context.Context, id string, analyzers []*source.A
 	for _, ah := range roots {
 		diagnostics, _, err := ah.analyze(ctx, s)
 		if err != nil {
-			return nil, err
+			// Keep going if a single analyzer failed.
+			event.Error(ctx, fmt.Sprintf("analyzer %q failed", ah.analyzer.Name), err)
+			continue
 		}
 		results = append(results, diagnostics...)
 	}
@@ -84,7 +86,7 @@ type packageFactKey struct {
 	typ reflect.Type
 }
 
-func (s *snapshot) actionHandle(ctx context.Context, id packageID, a *analysis.Analyzer) (*actionHandle, error) {
+func (s *snapshot) actionHandle(ctx context.Context, id PackageID, a *analysis.Analyzer) (*actionHandle, error) {
 	ph, err := s.buildPackageHandle(ctx, id, source.ParseFull)
 	if err != nil {
 		return nil, err
@@ -121,13 +123,13 @@ func (s *snapshot) actionHandle(ctx context.Context, id packageID, a *analysis.A
 		// An analysis that consumes/produces facts
 		// must run on the package's dependencies too.
 		if len(a.FactTypes) > 0 {
-			importIDs := make([]string, 0, len(ph.m.deps))
-			for _, importID := range ph.m.deps {
+			importIDs := make([]string, 0, len(ph.m.Deps))
+			for _, importID := range ph.m.Deps {
 				importIDs = append(importIDs, string(importID))
 			}
 			sort.Strings(importIDs) // for determinism
 			for _, importID := range importIDs {
-				depActionHandle, err := s.actionHandle(ctx, packageID(importID), a)
+				depActionHandle, err := s.actionHandle(ctx, PackageID(importID), a)
 				if err != nil {
 					return nil, err
 				}
@@ -257,7 +259,7 @@ func runAnalysis(ctx context.Context, snapshot *snapshot, analyzer *analysis.Ana
 	// Run the analysis.
 	pass := &analysis.Pass{
 		Analyzer:   analyzer,
-		Fset:       snapshot.view.session.cache.fset,
+		Fset:       snapshot.FileSet(),
 		Files:      syntax,
 		Pkg:        pkg.GetTypes(),
 		TypesInfo:  pkg.GetTypesInfo(),

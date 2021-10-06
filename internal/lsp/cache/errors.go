@@ -41,7 +41,7 @@ func goPackagesErrorDiagnostics(snapshot *snapshot, pkg *pkg, e packages.Error) 
 
 	var spn span.Span
 	if e.Pos == "" {
-		spn = parseGoListError(e.Msg, pkg.m.config.Dir)
+		spn = parseGoListError(e.Msg, pkg.m.Config.Dir)
 		// We may not have been able to parse a valid span. Apply the errors to all files.
 		if _, err := spanToRange(pkg, spn); err != nil {
 			var diags []*source.Diagnostic
@@ -56,7 +56,7 @@ func goPackagesErrorDiagnostics(snapshot *snapshot, pkg *pkg, e packages.Error) 
 			return diags, nil
 		}
 	} else {
-		spn = span.ParseInDir(e.Pos, pkg.m.config.Dir)
+		spn = span.ParseInDir(e.Pos, pkg.m.Config.Dir)
 	}
 
 	rng, err := spanToRange(pkg, spn)
@@ -257,7 +257,7 @@ func suggestedAnalysisFixes(snapshot *snapshot, pkg *pkg, diag *analysis.Diagnos
 	for _, fix := range diag.SuggestedFixes {
 		edits := make(map[span.URI][]protocol.TextEdit)
 		for _, e := range fix.TextEdits {
-			spn, err := span.NewRange(snapshot.view.session.cache.fset, e.Pos, e.End).Span()
+			spn, err := span.NewRange(snapshot.FileSet(), e.Pos, e.End).Span()
 			if err != nil {
 				return nil, err
 			}
@@ -373,7 +373,7 @@ func parseGoListImportCycleError(snapshot *snapshot, e packages.Error, pkg *pkg)
 		// Search file imports for the import that is causing the import cycle.
 		for _, imp := range cgf.File.Imports {
 			if imp.Path.Value == circImp {
-				spn, err := span.NewRange(snapshot.view.session.cache.fset, imp.Pos(), imp.End()).Span()
+				spn, err := span.NewRange(snapshot.FileSet(), imp.Pos(), imp.End()).Span()
 				if err != nil {
 					return msg, span.Span{}, false
 				}

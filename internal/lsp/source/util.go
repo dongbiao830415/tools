@@ -274,19 +274,33 @@ func CompareDiagnostic(a, b *Diagnostic) int {
 	return 1
 }
 
-// FindPackageFromPos finds the parsed file for a position in a given search
-// package.
+// FindPackageFromPos finds the first package containing pos in its
+// type-checked AST.
 func FindPackageFromPos(ctx context.Context, snapshot Snapshot, pos token.Pos) (Package, error) {
 	tok := snapshot.FileSet().File(pos)
 	if tok == nil {
 		return nil, errors.Errorf("no file for pos %v", pos)
 	}
 	uri := span.URIFromPath(tok.Name())
-	pkgs, err := snapshot.PackagesForFile(ctx, uri, TypecheckWorkspace)
+	pkgs, err := snapshot.PackagesForFile(ctx, uri, TypecheckAll, true)
 	if err != nil {
 		return nil, err
 	}
-	return pkgs[0], nil
+	// Only return the package if it actually type-checked the given position.
+	for _, pkg := range pkgs {
+		parsed, err := pkg.File(uri)
+		if err != nil {
+			return nil, err
+		}
+		if parsed == nil {
+			continue
+		}
+		if parsed.Tok.Base() != tok.Base() {
+			continue
+		}
+		return pkg, nil
+	}
+	return nil, errors.Errorf("no package for given file position")
 }
 
 // findFileInDeps finds uri in pkg or its dependencies.
@@ -527,4 +541,10 @@ func IsValidImport(pkgPath, importPkgPath string) bool {
 // should not check that a value equals "command-line-arguments" directly.
 func IsCommandLineArguments(s string) bool {
 	return strings.Contains(s, "command-line-arguments")
+}
+
+// InRange reports whether the given position is in the given token.File.
+func InRange(tok *token.File, pos token.Pos) bool {
+	size := tok.Pos(tok.Size())
+	return int(pos) >= tok.Base() && pos <= size
 }

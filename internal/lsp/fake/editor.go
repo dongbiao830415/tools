@@ -256,9 +256,7 @@ func (e *Editor) configuration() map[string]interface{} {
 		config["importShortcut"] = e.Config.ImportShortcut
 	}
 
-	// TODO(rFindley): change to the new settings name once it is no longer
-	// designated experimental.
-	config["experimentalDiagnosticsDelay"] = "10ms"
+	config["diagnosticsDelay"] = "10ms"
 
 	// ExperimentalWorkspaceModule is only set as a mode, not a configuration.
 	return config
@@ -1095,6 +1093,49 @@ func (e *Editor) References(ctx context.Context, path string, pos Pos) ([]protoc
 		return nil, err
 	}
 	return locations, nil
+}
+
+func (e *Editor) Rename(ctx context.Context, path string, pos Pos, newName string) error {
+	if e.Server == nil {
+		return nil
+	}
+	params := &protocol.RenameParams{
+		TextDocument: e.textDocumentIdentifier(path),
+		Position:     pos.ToProtocolPosition(),
+		NewName:      newName,
+	}
+	wsEdits, err := e.Server.Rename(ctx, params)
+	if err != nil {
+		return err
+	}
+	for _, change := range wsEdits.DocumentChanges {
+		if err := e.applyProtocolEdit(ctx, change); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *Editor) applyProtocolEdit(ctx context.Context, change protocol.TextDocumentEdit) error {
+	path := e.sandbox.Workdir.URIToPath(change.TextDocument.URI)
+	if ver := int32(e.BufferVersion(path)); ver != change.TextDocument.Version {
+		return fmt.Errorf("buffer versions for %q do not match: have %d, editing %d", path, ver, change.TextDocument.Version)
+	}
+	if !e.HasBuffer(path) {
+		err := e.OpenFile(ctx, path)
+		if os.IsNotExist(err) {
+			// TODO: it's unclear if this is correct. Here we create the buffer (with
+			// version 1), then apply edits. Perhaps we should apply the edits before
+			// sending the didOpen notification.
+			e.CreateBuffer(ctx, path, "")
+			err = nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+	fakeEdits := convertEdits(change.Edits)
+	return e.EditBuffer(ctx, path, fakeEdits)
 }
 
 // CodeAction executes a codeAction request on the server.

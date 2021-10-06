@@ -70,7 +70,7 @@ Include only project_a: `-` (exclude everything), `+project_a`
 
 Include only project_a, but not node_modules inside it: `-`, `+project_a`, `-project_a/node_modules`
 
-Default: `[]`.
+Default: `["-node_modules"]`.
 
 #### **memoryMode** *enum*
 
@@ -196,7 +196,7 @@ Example Usage:
 ```json5
 "gopls": {
 ...
-  "codelens": {
+  "codelenses": {
     "generate": false,  // Don't show the `go generate` lens.
     "gc_details": true  // Show a code lens toggling the display of gc's choices.
   }
@@ -308,11 +308,11 @@ Can contain any of:
 
 Default: `{"bounds":true,"escape":true,"inline":true,"nil":true}`.
 
-##### **experimentalDiagnosticsDelay** *time.Duration*
+##### **diagnosticsDelay** *time.Duration*
 
-**This setting is experimental and may be deleted.**
+**This is an advanced setting and should not be configured by most `gopls` users.**
 
-experimentalDiagnosticsDelay controls the amount of time that gopls waits
+diagnosticsDelay controls the amount of time that gopls waits
 after the most recent file modification before computing deep diagnostics.
 Simple diagnostics (parsing and type-checking) are always run immediately
 on recently modified packages.
@@ -320,6 +320,20 @@ on recently modified packages.
 This option must be set to a valid duration string, for example `"250ms"`.
 
 Default: `"250ms"`.
+
+##### **experimentalWatchedFileDelay** *time.Duration*
+
+**This setting is experimental and may be deleted.**
+
+experimentalWatchedFileDelay controls the amount of time that gopls waits
+for additional workspace/didChangeWatchedFiles notifications to arrive,
+before processing all such notifications in a single batch. This is
+intended for use by LSP clients that don't support their own batching of
+file system notifications.
+
+This option must be set to a valid duration string, for example `"100ms"`.
+
+Default: `"0s"`.
 
 #### Documentation
 
@@ -383,6 +397,7 @@ Must be one of:
 
 * `"CaseInsensitive"`
 * `"CaseSensitive"`
+* `"FastFuzzy"`
 * `"Fuzzy"`
 Default: `"Fuzzy"`.
 
@@ -397,7 +412,7 @@ Example Usage:
 ```json5
 "gopls": {
 ...
-  "symbolStyle": "dynamic",
+  "symbolStyle": "Dynamic",
 ...
 }
 ```
