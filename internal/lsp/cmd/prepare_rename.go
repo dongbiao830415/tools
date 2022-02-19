@@ -21,6 +21,7 @@ type prepareRename struct {
 }
 
 func (r *prepareRename) Name() string      { return "prepare_rename" }
+func (r *prepareRename) Parent() string    { return r.app.Name() }
 func (r *prepareRename) Usage() string     { return "<position>" }
 func (r *prepareRename) ShortHelp() string { return "test validity of a rename operation at location" }
 func (r *prepareRename) DetailedHelp(f *flag.FlagSet) {
@@ -31,7 +32,7 @@ Example:
 	$ gopls prepare_rename helper/helper.go:8:6
 	$ gopls prepare_rename helper/helper.go:#53
 `)
-	f.PrintDefaults()
+	printFlagDefaults(f)
 }
 
 // ErrInvalidRenamePosition is returned when prepareRename is run at a position that
@@ -72,7 +73,7 @@ func (r *prepareRename) Run(ctx context.Context, args ...string) error {
 		return ErrInvalidRenamePosition
 	}
 
-	l := protocol.Location{Range: *result}
+	l := protocol.Location{Range: result.Range}
 	s, err := file.mapper.Span(l)
 	if err != nil {
 		return err

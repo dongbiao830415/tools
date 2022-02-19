@@ -72,19 +72,13 @@ Include only project_a, but not node_modules inside it: `-`, `+project_a`, `-pro
 
 Default: `["-node_modules"]`.
 
-#### **templateSupport** *bool*
-
-templateSupport can be used to turn off support for template files.
-
-Default: `true`.
-
 #### **templateExtensions** *[]string*
 
 templateExtensions gives the extensions of file names that are treateed
 as template files. (The extension
 is the part of the file name after the final dot.)
 
-Default: `["tmpl","gotmpl"]`.
+Default: `[]`.
 
 #### **memoryMode** *enum*
 
@@ -100,8 +94,8 @@ Must be one of:
 * `"DegradeClosed"`: In DegradeClosed mode, `gopls` will collect less information about
 packages without open files. As a result, features like Find
 References and Rename will miss results in such packages.
-
 * `"Normal"`
+
 Default: `"Normal"`.
 
 #### **expandWorkspaceToModule** *bool*
@@ -253,6 +247,7 @@ Must be one of:
 * `"CaseInsensitive"`
 * `"CaseSensitive"`
 * `"Fuzzy"`
+
 Default: `"Fuzzy"`.
 
 ##### **experimentalPostfixCompletions** *bool*
@@ -304,11 +299,8 @@ that should be reported by the gc_details command.
 Can contain any of:
 
 * `"bounds"` controls bounds checking diagnostics.
-
 * `"escape"` controls diagnostics about escape choices.
-
 * `"inline"` controls diagnostics about inlining choices.
-
 * `"nil"` controls nil checks.
 
 Default: `{"bounds":true,"escape":true,"inline":true,"nil":true}`.
@@ -356,8 +348,8 @@ Must be one of:
 This format separates the signature from the documentation, so that the client
 can do more manipulation of these fields.\
 This should only be used by clients that support this behavior.
-
 * `"SynopsisDocumentation"`
+
 Default: `"FullDocumentation"`.
 
 ##### **linkTarget** *string*
@@ -390,6 +382,7 @@ Must be one of:
 * `"Both"`
 * `"Definition"`
 * `"Link"`
+
 Default: `"Both"`.
 
 ##### **symbolMatcher** *enum*
@@ -404,7 +397,8 @@ Must be one of:
 * `"CaseSensitive"`
 * `"FastFuzzy"`
 * `"Fuzzy"`
-Default: `"Fuzzy"`.
+
+Default: `"FastFuzzy"`.
 
 ##### **symbolStyle** *enum*
 
@@ -428,10 +422,8 @@ Must be one of:
 match for the given symbol query. Here a "qualifier" is any "/" or "."
 delimited suffix of the fully qualified symbol. i.e. "to/pkg.Foo.Field" or
 just "Foo.Field".
-
 * `"Full"` is fully qualified symbols, i.e.
 "path/to/pkg.Foo.Field".
-
 * `"Package"` is package qualified symbols i.e.
 "pkg.Foo.Field".
 

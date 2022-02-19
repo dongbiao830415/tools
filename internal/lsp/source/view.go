@@ -129,6 +129,9 @@ type Snapshot interface {
 	// GoModForFile returns the URI of the go.mod file for the given URI.
 	GoModForFile(uri span.URI) span.URI
 
+	// ParseWork is used to parse go.work files.
+	ParseWork(ctx context.Context, fh FileHandle) (*ParsedWorkFile, error)
+
 	// BuiltinFile returns information about the special builtin package.
 	BuiltinFile(ctx context.Context) (*ParsedGoFile, error)
 
@@ -201,9 +204,6 @@ const (
 	// Normal is appropriate for commands that might be run by a user and don't
 	// deliberately modify go.mod files, e.g. `go test`.
 	Normal InvocationFlags = iota
-	// UpdateUserModFile is for commands that intend to update the user's real
-	// go.mod file, e.g. `go mod tidy` in response to a user's request to tidy.
-	UpdateUserModFile
 	// WriteTemporaryModFile is for commands that need information from a
 	// modified version of the user's go.mod file, e.g. `go mod tidy` used to
 	// generate diagnostics.
@@ -235,10 +235,6 @@ type View interface {
 	// Folder returns the folder with which this view was created.
 	Folder() span.URI
 
-	// TempWorkspace returns the folder this view uses for its temporary
-	// workspace module.
-	TempWorkspace() span.URI
-
 	// Shutdown closes this view, and detaches it from its session.
 	Shutdown(ctx context.Context)
 
@@ -266,6 +262,9 @@ type View interface {
 
 	// RegisterModuleUpgrades registers that upgrades exist for the given modules.
 	RegisterModuleUpgrades(upgrades map[string]string)
+
+	// FileKind returns the type of a file
+	FileKind(FileHandle) FileKind
 }
 
 // A FileSource maps uris to FileHandles. This abstraction exists both for
@@ -293,6 +292,14 @@ type ParsedGoFile struct {
 type ParsedModule struct {
 	URI         span.URI
 	File        *modfile.File
+	Mapper      *protocol.ColumnMapper
+	ParseErrors []*Diagnostic
+}
+
+// A ParsedWorkFile contains the results of parsing a go.work file.
+type ParsedWorkFile struct {
+	URI         span.URI
+	File        *modfile.WorkFile
 	Mapper      *protocol.ColumnMapper
 	ParseErrors []*Diagnostic
 }
@@ -325,7 +332,7 @@ type Session interface {
 	// non-empty tempWorkspace directory is provided, the View will record a copy
 	// of its gopls workspace module in that directory, so that client tooling
 	// can execute in the same main module.
-	NewView(ctx context.Context, name string, folder, tempWorkspace span.URI, options *Options) (View, Snapshot, func(), error)
+	NewView(ctx context.Context, name string, folder span.URI, options *Options) (View, Snapshot, func(), error)
 
 	// Cache returns the cache that created this session, for debugging only.
 	Cache() interface{}
@@ -377,6 +384,7 @@ var ErrViewExists = errors.New("view already exists for session")
 
 // Overlay is the type for a file held in memory on a session.
 type Overlay interface {
+	Kind() FileKind
 	VersionedFileHandle
 }
 
@@ -498,7 +506,6 @@ type VersionedFileIdentity struct {
 // FileHandle represents a handle to a specific version of a single file.
 type FileHandle interface {
 	URI() span.URI
-	Kind() FileKind
 
 	// FileIdentity returns a FileIdentity for the file, even if there was an
 	// error reading it.
@@ -516,17 +523,14 @@ type FileIdentity struct {
 
 	// Identifier represents a unique identifier for the file's content.
 	Hash string
-
-	// Kind is the file's kind.
-	Kind FileKind
 }
 
 func (id FileIdentity) String() string {
-	return fmt.Sprintf("%s%s%s", id.URI, id.Hash, id.Kind)
+	return fmt.Sprintf("%s%s", id.URI, id.Hash)
 }
 
 // FileKind describes the kind of the file in question.
-// It can be one of Go, mod, or sum.
+// It can be one of Go,mod, Sum, or Tmpl.
 type FileKind int
 
 const (
@@ -541,6 +545,8 @@ const (
 	Sum
 	// Tmpl is a template file.
 	Tmpl
+	// Work is a go.work file.
+	Work
 )
 
 // Analyzer represents a go/analysis analyzer with some boolean properties
@@ -645,6 +651,7 @@ const (
 	ModTidyError             DiagnosticSource = "go mod tidy"
 	OptimizationDetailsError DiagnosticSource = "optimizer details"
 	UpgradeNotification      DiagnosticSource = "upgrade available"
+	TemplateError            DiagnosticSource = "template"
 )
 
 func AnalyzerErrorKind(name string) DiagnosticSource {

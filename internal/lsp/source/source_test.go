@@ -52,7 +52,7 @@ func testSource(t *testing.T, datum *tests.Data) {
 	options := source.DefaultOptions().Clone()
 	tests.DefaultOptions(options)
 	options.SetEnvSlice(datum.Config.Env)
-	view, _, release, err := session.NewView(ctx, "source_test", span.URIFromPath(datum.Config.Dir), "", options)
+	view, _, release, err := session.NewView(ctx, "source_test", span.URIFromPath(datum.Config.Dir), options)
 	release()
 	if err != nil {
 		t.Fatal(err)
@@ -66,8 +66,7 @@ func testSource(t *testing.T, datum *tests.Data) {
 
 	var modifications []source.FileModification
 	for filename, content := range datum.Config.Overlay {
-		kind := source.DetectLanguage("", filename)
-		if kind != source.Go {
+		if filepath.Ext(filename) != ".go" {
 			continue
 		}
 		modifications = append(modifications, source.FileModification{

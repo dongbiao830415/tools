@@ -7,6 +7,9 @@ package vta
 import (
 	"testing"
 
+	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/analysistest"
+	"golang.org/x/tools/go/analysis/passes/buildssa"
 	"golang.org/x/tools/go/callgraph/cha"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
@@ -14,13 +17,13 @@ import (
 
 func TestVTACallGraph(t *testing.T) {
 	for _, file := range []string{
-		"testdata/callgraph_static.go",
-		"testdata/callgraph_ho.go",
-		"testdata/callgraph_interfaces.go",
-		"testdata/callgraph_pointers.go",
-		"testdata/callgraph_collections.go",
-		"testdata/callgraph_fields.go",
-		"testdata/callgraph_field_funcs.go",
+		"testdata/src/callgraph_static.go",
+		"testdata/src/callgraph_ho.go",
+		"testdata/src/callgraph_interfaces.go",
+		"testdata/src/callgraph_pointers.go",
+		"testdata/src/callgraph_collections.go",
+		"testdata/src/callgraph_fields.go",
+		"testdata/src/callgraph_field_funcs.go",
 	} {
 		t.Run(file, func(t *testing.T) {
 			prog, want, err := testProg(file)
@@ -43,12 +46,12 @@ func TestVTACallGraph(t *testing.T) {
 // enabled by having an arbitrary function set as input to CallGraph
 // instead of the whole program (i.e., ssautil.AllFunctions(prog)).
 func TestVTAProgVsFuncSet(t *testing.T) {
-	prog, want, err := testProg("testdata/callgraph_nested_ptr.go")
+	prog, want, err := testProg("testdata/src/callgraph_nested_ptr.go")
 	if err != nil {
-		t.Fatalf("couldn't load test `testdata/callgraph_nested_ptr.go`: %s", err)
+		t.Fatalf("couldn't load test `testdata/src/callgraph_nested_ptr.go`: %s", err)
 	}
 	if len(want) == 0 {
-		t.Fatal("couldn't find want in `testdata/callgraph_nested_ptr.go`")
+		t.Fatal("couldn't find want in `testdata/src/callgraph_nested_ptr.go`")
 	}
 
 	allFuncs := ssautil.AllFunctions(prog)
@@ -74,5 +77,37 @@ func TestVTAProgVsFuncSet(t *testing.T) {
 	g = CallGraph(noBarFuncs, cha.CallGraph(prog))
 	if got := callGraphStr(g); !subGraph(want, got) {
 		t.Errorf("pruned callgraph %v should contain %v", got, want)
+	}
+}
+
+// TestVTAPanicMissingDefinitions tests if VTA gracefully handles the case
+// where VTA panics when a definition of a function or method is not
+// available, which can happen when using analysis package. A successful
+// test simply does not panic.
+func TestVTAPanicMissingDefinitions(t *testing.T) {
+	run := func(pass *analysis.Pass) (interface{}, error) {
+		s := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
+		CallGraph(ssautil.AllFunctions(s.Pkg.Prog), cha.CallGraph(s.Pkg.Prog))
+		return nil, nil
+	}
+
+	analyzer := &analysis.Analyzer{
+		Name: "test",
+		Doc:  "test",
+		Run:  run,
+		Requires: []*analysis.Analyzer{
+			buildssa.Analyzer,
+		},
+	}
+
+	testdata := analysistest.TestData()
+	res := analysistest.Run(t, testdata, analyzer, "t", "d")
+	if len(res) != 2 {
+		t.Errorf("want analysis results for 2 packages; got %v", len(res))
+	}
+	for _, r := range res {
+		if r.Err != nil {
+			t.Errorf("want no error for package %v; got %v", r.Pass.Pkg.Path(), r.Err)
+		}
 	}
 }

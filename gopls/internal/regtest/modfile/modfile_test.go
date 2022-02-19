@@ -6,6 +6,7 @@ package modfile
 
 import (
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -513,6 +514,10 @@ require (
 
 // Reproduces golang/go#38232.
 func TestUnknownRevision(t *testing.T) {
+	if runtime.GOOS == "plan9" {
+		t.Skipf("skipping test that fails for unknown reasons on plan9; see https://go.dev/issue/50477")
+	}
+
 	testenv.NeedsGo1Point(t, 14)
 
 	const unknown = `
@@ -1113,5 +1118,22 @@ func main() {
 			EmptyDiagnostics("main.go"),
 			NoDiagnostics("go.mod"),
 		)
+	})
+}
+
+func TestInvalidGoVersion(t *testing.T) {
+	testenv.NeedsGo1Point(t, 14) // Times out on 1.13 for reasons unclear. Not worth worrying about.
+	const files = `
+-- go.mod --
+module mod.com
+
+go foo
+-- main.go --
+package main
+`
+	Run(t, files, func(t *testing.T, env *Env) {
+		env.Await(env.DiagnosticAtRegexpWithMessage("go.mod", `go foo`, "invalid go version"))
+		env.WriteWorkspaceFile("go.mod", "module mod.com \n\ngo 1.12\n")
+		env.Await(EmptyDiagnostics("go.mod"))
 	})
 }

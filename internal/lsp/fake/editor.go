@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -113,6 +114,18 @@ type EditorConfig struct {
 
 	// Whether to edit files with windows line endings.
 	WindowsLineEndings bool
+
+	// Map of language ID -> regexp to match, used to set the file type of new
+	// buffers. Applied as an overlay on top of the following defaults:
+	//  "go" -> ".*\.go"
+	//  "go.mod" -> "go\.mod"
+	//  "go.sum" -> "go\.sum"
+	//  "gotmpl" -> ".*tmpl"
+	FileAssociations map[string]string
+
+	// Settings holds arbitrary additional settings to apply to the gopls config.
+	// TODO(rfindley): replace existing EditorConfig fields with Settings.
+	Settings map[string]interface{}
 
 	ImportShortcut                 string
 	DirectoryFilters               []string
@@ -223,6 +236,10 @@ func (e *Editor) configuration() map[string]interface{} {
 		"completionBudget":        "10s",
 	}
 
+	for k, v := range e.Config.Settings {
+		config[k] = v
+	}
+
 	if e.Config.BuildFlags != nil {
 		config["buildFlags"] = e.Config.BuildFlags
 	}
@@ -287,6 +304,14 @@ func (e *Editor) initialize(ctx context.Context, workspaceFolders []string) erro
 	}
 
 	params.Capabilities.TextDocument.Completion.CompletionItem.SnippetSupport = true
+	params.Capabilities.TextDocument.SemanticTokens.Requests.Full = true
+	// copied from lsp/semantic.go to avoid import cycle in tests
+	params.Capabilities.TextDocument.SemanticTokens.TokenTypes = []string{
+		"namespace", "type", "class", "enum", "interface",
+		"struct", "typeParameter", "parameter", "variable", "property", "enumMember",
+		"event", "function", "method", "macro", "keyword", "modifier", "comment",
+		"string", "number", "regexp", "operator",
+	}
 
 	// This is a bit of a hack, since the fake editor doesn't actually support
 	// watching changed files that match a specific glob pattern. However, the
@@ -370,21 +395,6 @@ func (e *Editor) OpenFile(ctx context.Context, path string) error {
 	return e.createBuffer(ctx, path, false, content)
 }
 
-func textDocumentItem(wd *Workdir, buf buffer) protocol.TextDocumentItem {
-	uri := wd.URI(buf.path)
-	languageID := ""
-	if strings.HasSuffix(buf.path, ".go") {
-		// TODO: what about go.mod files? What is their language ID?
-		languageID = "go"
-	}
-	return protocol.TextDocumentItem{
-		URI:        uri,
-		LanguageID: languageID,
-		Version:    int32(buf.version),
-		Text:       buf.text(),
-	}
-}
-
 // CreateBuffer creates a new unsaved buffer corresponding to the workdir path,
 // containing the given textual content.
 func (e *Editor) CreateBuffer(ctx context.Context, path, content string) error {
@@ -402,7 +412,13 @@ func (e *Editor) createBuffer(ctx context.Context, path string, dirty bool, cont
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.buffers[path] = buf
-	item := textDocumentItem(e.sandbox.Workdir, buf)
+
+	item := protocol.TextDocumentItem{
+		URI:        e.sandbox.Workdir.URI(buf.path),
+		LanguageID: e.languageID(buf.path),
+		Version:    int32(buf.version),
+		Text:       buf.text(),
+	}
 
 	if e.Server != nil {
 		if err := e.Server.DidOpen(ctx, &protocol.DidOpenTextDocumentParams{
@@ -415,6 +431,30 @@ func (e *Editor) createBuffer(ctx context.Context, path string, dirty bool, cont
 		e.callsMu.Unlock()
 	}
 	return nil
+}
+
+var defaultFileAssociations = map[string]*regexp.Regexp{
+	"go":      regexp.MustCompile(`^.*\.go$`), // '$' is important: don't match .gotmpl!
+	"go.mod":  regexp.MustCompile(`^go\.mod$`),
+	"go.sum":  regexp.MustCompile(`^go(\.work)?\.sum$`),
+	"go.work": regexp.MustCompile(`^go\.work$`),
+	"gotmpl":  regexp.MustCompile(`^.*tmpl$`),
+}
+
+func (e *Editor) languageID(p string) string {
+	base := path.Base(p)
+	for lang, re := range e.Config.FileAssociations {
+		re := regexp.MustCompile(re)
+		if re.MatchString(base) {
+			return lang
+		}
+	}
+	for lang, re := range defaultFileAssociations {
+		if re.MatchString(base) {
+			return lang
+		}
+	}
+	return ""
 }
 
 // lines returns line-ending agnostic line representation of content.

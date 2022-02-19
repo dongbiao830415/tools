@@ -60,6 +60,10 @@ func (s *Server) DidChangeConfiguration(ctx context.Context, _gen *protocol.DidC
 	return s.didChangeConfiguration(ctx, _gen)
 }
 
+func (s *Server) DidChangeNotebookDocument(context.Context, *protocol.DidChangeNotebookDocumentParams) error {
+	return notImplemented("DidChangeNotebookDocument")
+}
+
 func (s *Server) DidChangeWatchedFiles(ctx context.Context, params *protocol.DidChangeWatchedFilesParams) error {
 	return s.didChangeWatchedFiles(ctx, params)
 }
@@ -72,6 +76,10 @@ func (s *Server) DidClose(ctx context.Context, params *protocol.DidCloseTextDocu
 	return s.didClose(ctx, params)
 }
 
+func (s *Server) DidCloseNotebookDocument(context.Context, *protocol.DidCloseNotebookDocumentParams) error {
+	return notImplemented("DidCloseNotebookDocument")
+}
+
 func (s *Server) DidCreateFiles(context.Context, *protocol.CreateFilesParams) error {
 	return notImplemented("DidCreateFiles")
 }
@@ -82,6 +90,10 @@ func (s *Server) DidDeleteFiles(context.Context, *protocol.DeleteFilesParams) er
 
 func (s *Server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocumentParams) error {
 	return s.didOpen(ctx, params)
+}
+
+func (s *Server) DidOpenNotebookDocument(context.Context, *protocol.DidOpenNotebookDocumentParams) error {
+	return notImplemented("DidOpenNotebookDocument")
 }
 
 func (s *Server) DidRenameFiles(context.Context, *protocol.RenameFilesParams) error {
@@ -144,6 +156,14 @@ func (s *Server) Initialized(ctx context.Context, params *protocol.InitializedPa
 	return s.initialized(ctx, params)
 }
 
+func (s *Server) InlineValues(context.Context, *protocol.InlineValuesParams) ([]protocol.InlineValue, error) {
+	return nil, notImplemented("InlineValues")
+}
+
+func (s *Server) InlineValuesRefresh(context.Context) error {
+	return notImplemented("InlineValuesRefresh")
+}
+
 func (s *Server) LinkedEditingRange(context.Context, *protocol.LinkedEditingRangeParams) (*protocol.LinkedEditingRanges, error) {
 	return nil, notImplemented("LinkedEditingRange")
 }
@@ -172,7 +192,7 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 	return s.prepareCallHierarchy(ctx, params)
 }
 
-func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRenameParams) (*protocol.Range, error) {
+func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRenameParams) (*protocol.PrepareRename2Gn, error) {
 	return s.prepareRename(ctx, params)
 }
 
@@ -206,6 +226,10 @@ func (s *Server) ResolveCodeLens(context.Context, *protocol.CodeLens) (*protocol
 
 func (s *Server) ResolveDocumentLink(context.Context, *protocol.DocumentLink) (*protocol.DocumentLink, error) {
 	return nil, notImplemented("ResolveDocumentLink")
+}
+
+func (s *Server) ResolveWorkspaceSymbol(context.Context, *protocol.WorkspaceSymbol) (*protocol.WorkspaceSymbol, error) {
+	return nil, notImplemented("ResolveWorkspaceSymbol")
 }
 
 func (s *Server) SelectionRange(context.Context, *protocol.SelectionRangeParams) ([]protocol.SelectionRange, error) {

@@ -62,7 +62,6 @@ func (o *overlay) FileIdentity() source.FileIdentity {
 	return source.FileIdentity{
 		URI:  o.uri,
 		Hash: o.hash,
-		Kind: o.kind,
 	}
 }
 
@@ -156,7 +155,7 @@ func (s *Session) Cache() interface{} {
 	return s.cache
 }
 
-func (s *Session) NewView(ctx context.Context, name string, folder, tempWorkspace span.URI, options *source.Options) (source.View, source.Snapshot, func(), error) {
+func (s *Session) NewView(ctx context.Context, name string, folder span.URI, options *source.Options) (source.View, source.Snapshot, func(), error) {
 	s.viewMu.Lock()
 	defer s.viewMu.Unlock()
 	for _, view := range s.views {
@@ -164,7 +163,7 @@ func (s *Session) NewView(ctx context.Context, name string, folder, tempWorkspac
 			return nil, nil, nil, source.ErrViewExists
 		}
 	}
-	view, snapshot, release, err := s.createView(ctx, name, folder, tempWorkspace, options, 0)
+	view, snapshot, release, err := s.createView(ctx, name, folder, options, 0)
 	if err != nil {
 		return nil, nil, func() {}, err
 	}
@@ -174,7 +173,7 @@ func (s *Session) NewView(ctx context.Context, name string, folder, tempWorkspac
 	return view, snapshot, release, nil
 }
 
-func (s *Session) createView(ctx context.Context, name string, folder, tempWorkspace span.URI, options *source.Options, snapshotID uint64) (*View, *snapshot, func(), error) {
+func (s *Session) createView(ctx context.Context, name string, folder span.URI, options *source.Options, snapshotID uint64) (*View, *snapshot, func(), error) {
 	index := atomic.AddInt64(&viewIndex, 1)
 
 	if s.cache.options != nil {
@@ -219,7 +218,6 @@ func (s *Session) createView(ctx context.Context, name string, folder, tempWorks
 		filesByBase:          map[string][]*fileBase{},
 		rootURI:              root,
 		workspaceInformation: *ws,
-		tempWorkspace:        tempWorkspace,
 	}
 	v.importsState = &importsState{
 		ctx: backgroundCtx,
@@ -245,6 +243,7 @@ func (s *Session) createView(ctx context.Context, name string, folder, tempWorks
 		workspacePackages: make(map[PackageID]PackagePath),
 		unloadableFiles:   make(map[span.URI]struct{}),
 		parseModHandles:   make(map[span.URI]*parseModHandle),
+		parseWorkHandles:  make(map[span.URI]*parseWorkHandle),
 		modTidyHandles:    make(map[span.URI]*modTidyHandle),
 		modWhyHandles:     make(map[span.URI]*modWhyHandle),
 		workspace:         workspace,
@@ -254,17 +253,12 @@ func (s *Session) createView(ctx context.Context, name string, folder, tempWorks
 	initCtx, initCancel := context.WithCancel(xcontext.Detach(ctx))
 	v.initCancelFirstAttempt = initCancel
 	snapshot := v.snapshot
-	release := snapshot.generation.Acquire(initCtx)
+	release := snapshot.generation.Acquire()
 	go func() {
 		defer release()
 		snapshot.initialize(initCtx, true)
-		// Ensure that the view workspace is written at least once following
-		// initialization.
-		if err := v.updateWorkspace(initCtx); err != nil {
-			event.Error(ctx, "copying workspace dir", err)
-		}
 	}()
-	return v, snapshot, snapshot.generation.Acquire(ctx), nil
+	return v, snapshot, snapshot.generation.Acquire(), nil
 }
 
 // View returns the view by name.
@@ -367,16 +361,24 @@ func (s *Session) removeView(ctx context.Context, view *View) error {
 func (s *Session) updateView(ctx context.Context, view *View, options *source.Options) (*View, error) {
 	s.viewMu.Lock()
 	defer s.viewMu.Unlock()
+
+	// Preserve the snapshot ID if we are recreating the view.
+	view.snapshotMu.Lock()
+	if view.snapshot == nil {
+		view.snapshotMu.Unlock()
+		panic("updateView called after View was already shut down")
+	}
+	snapshotID := view.snapshot.id
+	view.snapshotMu.Unlock()
+
 	i, err := s.dropView(ctx, view)
 	if err != nil {
 		return nil, err
 	}
-	// Preserve the snapshot ID if we are recreating the view.
-	view.snapshotMu.Lock()
-	snapshotID := view.snapshot.id
-	view.snapshotMu.Unlock()
-	v, _, release, err := s.createView(ctx, view.name, view.folder, view.tempWorkspace, options, snapshotID)
+
+	v, _, release, err := s.createView(ctx, view.name, view.folder, options, snapshotID)
 	release()
+
 	if err != nil {
 		// we have dropped the old view, but could not create the new one
 		// this should not happen and is very bad, but we still need to clean
@@ -530,7 +532,7 @@ func (s *Session) ExpandModificationsToDirectories(ctx context.Context, changes 
 	defer s.viewMu.RUnlock()
 	var snapshots []*snapshot
 	for _, v := range s.views {
-		snapshot, release := v.getSnapshot(ctx)
+		snapshot, release := v.getSnapshot()
 		defer release()
 		snapshots = append(snapshots, snapshot)
 	}
@@ -609,15 +611,12 @@ func (s *Session) updateOverlays(ctx context.Context, changes []source.FileModif
 		var kind source.FileKind
 		switch c.Action {
 		case source.Open:
-			kind = source.DetectLanguage(c.LanguageID, c.URI.Filename())
+			kind = source.FileKindForLang(c.LanguageID)
 		default:
 			if !ok {
 				return nil, errors.Errorf("updateOverlays: modifying unopened overlay %v", c.URI)
 			}
 			kind = o.kind
-		}
-		if kind == source.UnknownKind {
-			return nil, errors.Errorf("updateOverlays: unknown file kind for %s", c.URI)
 		}
 
 		// Closing a file just deletes its overlay.
@@ -672,6 +671,18 @@ func (s *Session) updateOverlays(ctx context.Context, changes []source.FileModif
 			hash:    hash,
 			saved:   sameContentOnDisk,
 		}
+
+		// When opening files, ensure that we actually have a well-defined view and file kind.
+		if c.Action == source.Open {
+			view, err := s.ViewOf(o.uri)
+			if err != nil {
+				return nil, errors.Errorf("updateOverlays: finding view for %s: %v", o.uri, err)
+			}
+			if kind := view.FileKind(o); kind == source.UnknownKind {
+				return nil, errors.Errorf("updateOverlays: unknown file kind for %s", o.uri)
+			}
+		}
+
 		s.overlays[c.URI] = o
 	}
 
@@ -720,7 +731,7 @@ func (s *Session) FileWatchingGlobPatterns(ctx context.Context) map[string]struc
 	defer s.viewMu.RUnlock()
 	patterns := map[string]struct{}{}
 	for _, view := range s.views {
-		snapshot, release := view.getSnapshot(ctx)
+		snapshot, release := view.getSnapshot()
 		for k, v := range snapshot.fileWatchingGlobPatterns(ctx) {
 			patterns[k] = v
 		}

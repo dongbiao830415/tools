@@ -46,36 +46,42 @@ editor.
 
 ## Working with generic code
 
-Gopls has experimental support for generic Go, as defined by the type
+Gopls has beta support for editing generic Go code, as defined by the type
 parameters proposal ([golang/go#43651](https://golang.org/issues/43651)) and
 type set addendum ([golang/go#45346](https://golang.org/issues/45346)).
 
-To enable this support, you need to build gopls with a version of Go that
-supports type parameters, currently just tip. This can be done by checking
-out the `master` branch in the Go repository, or by using
-`golang.org/dl/gotip`:
+To enable this support, you need to **build gopls with a version of Go that
+supports generics**. The easiest way to do this is by installing the Go 1.18 Beta
+as described at
+[Tutorial: Getting started with generics#prerequisites](https://go.dev/doc/tutorial/generics),
+and then using this Go version to build gopls:
 
 ```
-$ go install golang.org/dl/gotip@latest
-$ gotip download
+$ go1.18beta2 install golang.org/x/tools/gopls@latest
 ```
 
-For building gopls with type parameter support, it is recommended that you
-build gopls at tip. External APIs are under active development on the Go
-`master` branch, so building gopls at tip minimizes the chances of a build
-failure. You will also need to update the `go` directive in your `go.mod`
-file to refer to `go 1.18` to use generics.
+When using the Go 1.18, it is strongly recommended that you install the latest
+version of `gopls`, or the latest **unstable** version as
+[described above](#installing-unreleased-versions).
 
-Build and install the latest **unstable** version of `gopls` following
-[the instruction](#installing-unreleased-versions).
-Remember to use `gotip` instead of `go`.
+You also need to make `gopls` select the beta version of `go` (in `<GOROOT>/go/bin`
+where GOROOT is the location reported by `go1.18beta2 env GOROOT`) by adding
+it to your `PATH` or by configuring your editor.
 
-The `gopls` build with this instruction understands generic code. To actually
-run the generic code you develop, you must also use the tip version of the Go
+The `gopls` built with these instructions understands generic code. To actually
+run the generic code you develop, you must also use the beta version of the Go
 compiler. For example:
 
 ```
-$ gotip run .
+$ go1.18beta2 run .
 ```
+
+### Known issues
+
+  * [`staticcheck`](https://github.com/golang/tools/blob/master/gopls/doc/settings.md#staticcheck-bool)
+    on generic code is not supported yet.
+
+please follow the [v0.8.0](https://github.com/golang/go/milestone/244) milestone
+to see the list of go1.18-related known issues and our progress.
 
 [Go project]: https://go.googlesource.com/go

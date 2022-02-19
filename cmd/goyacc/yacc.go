@@ -51,6 +51,7 @@ import (
 	"fmt"
 	"go/format"
 	"io/ioutil"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -2180,7 +2181,7 @@ func output() {
 	if !lflag {
 		fmt.Fprintf(ftable, "\n//line yacctab:1")
 	}
-	fmt.Fprintf(ftable, "\nvar %sExca = [...]int{\n", prefix)
+	var actions []int
 
 	if len(errors) > 0 {
 		stateTable = make([]Row, nstate)
@@ -2253,10 +2254,11 @@ func output() {
 				}
 			}
 		}
-		wract(i)
+		actions = addActions(actions, i)
 	}
 
-	fmt.Fprintf(ftable, "}\n")
+	arrayOutColumns("Exca", actions, 2, false)
+	fmt.Fprintf(ftable, "\n")
 	ftable.WriteRune('\n')
 	fmt.Fprintf(ftable, "const %sPrivate = %v\n", prefix, PRIVATE)
 }
@@ -2301,7 +2303,7 @@ func precftn(r, t, s int) {
 // output state i
 // temp1 has the actions, lastred the default
 //
-func wract(i int) {
+func addActions(act []int, i int) []int {
 	var p, p1 int
 
 	// find the best choice for lastred
@@ -2374,18 +2376,19 @@ func wract(i int) {
 				continue
 			}
 			if flag == 0 {
-				fmt.Fprintf(ftable, "\t-1, %v,\n", i)
+				act = append(act, -1, i)
 			}
 			flag++
-			fmt.Fprintf(ftable, "\t%v, %v,\n", p, p1)
+			act = append(act, p, p1)
 			zzexcp++
 		}
 	}
 	if flag != 0 {
 		defact[i] = -2
-		fmt.Fprintf(ftable, "\t-2, %v,\n", lastred)
+		act = append(act, -2, lastred)
 	}
 	optst[i] = os
+	return act
 }
 
 //
@@ -2878,7 +2881,7 @@ func others() {
 		}
 	}
 	arout("Chk", temp1, nstate)
-	arout("Def", defact, nstate)
+	arrayOutColumns("Def", defact[:nstate], 10, false)
 
 	// put out token translation tables
 	// table 1 has 0-256
@@ -2926,8 +2929,7 @@ func others() {
 
 	// table 3 has everything else
 	ftable.WriteRune('\n')
-	fmt.Fprintf(ftable, "var %sTok3 = [...]int{\n\t", prefix)
-	c = 0
+	var v []int
 	for i = 1; i <= ntokens; i++ {
 		j = tokset[i].value
 		if j >= 0 && j < 256 {
@@ -2937,19 +2939,11 @@ func others() {
 			continue
 		}
 
-		if c%5 != 0 {
-			ftable.WriteRune(' ')
-		}
-		fmt.Fprintf(ftable, "%d, %d,", j, i)
-		c++
-		if c%5 == 0 {
-			fmt.Fprint(ftable, "\n\t")
-		}
+		v = append(v, j, i)
 	}
-	if c%5 != 0 {
-		ftable.WriteRune(' ')
-	}
-	fmt.Fprintf(ftable, "%d,\n}\n", 0)
+	v = append(v, 0)
+	arout("Tok3", v, len(v))
+	fmt.Fprintf(ftable, "\n")
 
 	// Custom error messages.
 	fmt.Fprintf(ftable, "\n")
@@ -3038,19 +3032,63 @@ Loop:
 	}
 }
 
-func arout(s string, v []int, n int) {
+func minMax(v []int) (min, max int) {
+	if len(v) == 0 {
+		return
+	}
+	min = v[0]
+	max = v[0]
+	for _, i := range v {
+		if i < min {
+			min = i
+		}
+		if i > max {
+			max = i
+		}
+	}
+	return
+}
+
+// return the smaller integral base type to store the values in v
+func minType(v []int, allowUnsigned bool) (typ string) {
+	typ = "int"
+	typeLen := 8
+	min, max := minMax(v)
+	checkType := func(name string, size, minType, maxType int) {
+		if min >= minType && max <= maxType && typeLen > size {
+			typ = name
+			typeLen = size
+		}
+	}
+	checkType("int32", 4, math.MinInt32, math.MaxInt32)
+	checkType("int16", 2, math.MinInt16, math.MaxInt16)
+	checkType("int8", 1, math.MinInt8, math.MaxInt8)
+	if allowUnsigned {
+		// Do not check for uint32, not worth and won't compile on 32 bit systems
+		checkType("uint16", 2, 0, math.MaxUint16)
+		checkType("uint8", 1, 0, math.MaxUint8)
+	}
+	return
+}
+
+func arrayOutColumns(s string, v []int, columns int, allowUnsigned bool) {
 	s = prefix + s
 	ftable.WriteRune('\n')
-	fmt.Fprintf(ftable, "var %v = [...]int{", s)
-	for i := 0; i < n; i++ {
-		if i%10 == 0 {
+	minType := minType(v, allowUnsigned)
+	fmt.Fprintf(ftable, "var %v = [...]%s{", s, minType)
+	for i, val := range v {
+		if i%columns == 0 {
 			fmt.Fprintf(ftable, "\n\t")
 		} else {
 			ftable.WriteRune(' ')
 		}
-		fmt.Fprintf(ftable, "%d,", v[i])
+		fmt.Fprintf(ftable, "%d,", val)
 	}
 	fmt.Fprintf(ftable, "\n}\n")
+}
+
+func arout(s string, v []int, n int) {
+	arrayOutColumns(s, v[:n], 10, true)
 }
 
 //
@@ -3373,9 +3411,9 @@ func $$ErrorMessage(state, lookAhead int) string {
 	expected := make([]int, 0, 4)
 
 	// Look for shiftable tokens.
-	base := $$Pact[state]
+	base := int($$Pact[state])
 	for tok := TOKSTART; tok-1 < len($$Toknames); tok++ {
-		if n := base + tok; n >= 0 && n < $$Last && $$Chk[$$Act[n]] == tok {
+		if n := base + tok; n >= 0 && n < $$Last && int($$Chk[int($$Act[n])]) == tok {
 			if len(expected) == cap(expected) {
 				return res
 			}
@@ -3385,13 +3423,13 @@ func $$ErrorMessage(state, lookAhead int) string {
 
 	if $$Def[state] == -2 {
 		i := 0
-		for $$Exca[i] != -1 || $$Exca[i+1] != state {
+		for $$Exca[i] != -1 || int($$Exca[i+1]) != state {
 			i += 2
 		}
 
 		// Look for tokens that we accept or reduce.
 		for i += 2; $$Exca[i] >= 0; i += 2 {
-			tok := $$Exca[i]
+			tok := int($$Exca[i])
 			if tok < TOKSTART || $$Exca[i+1] == 0 {
 				continue
 			}
@@ -3421,30 +3459,30 @@ func $$ErrorMessage(state, lookAhead int) string {
 func $$lex2(char int) (token int) {
 	token = 0
 	if char <= 0 {
-		token = $$Tok1[0]
+		token = int($$Tok1[0])
 		goto out
 	}
 	if char < len($$Tok1) { //单个字符的token
-		token = $$Tok1[char] //token字符串的数组的下标
+		token = int($$Tok1[char]) //token字符串的数组的下标
 		goto out
 	}
 	if char >= $$Private { //多个字符组成的token
 		if char < $$Private+len($$Tok2) {
-			token = $$Tok2[char-$$Private]
+			token = int($$Tok2[char-$$Private])
 			goto out
 		}
 	}
 	for i := 0; i < len($$Tok3); i += 2 {
-		token = $$Tok3[i+0]
+		token = int($$Tok3[i+0])
 		if token == char {
-			token = $$Tok3[i+1]
+			token = int($$Tok3[i+1])
 			goto out
 		}
 	}
 
 out:
 	if token == 0 {
-		token = $$Tok2[1] /* unknown char */
+		token = int($$Tok2[1]) /* unknown char */
 	}
 
 	return token
@@ -3511,7 +3549,7 @@ $$stack:
 	$$S[$$p].yys = $$state
 
 $$newstate:
-	$$n = $$Pact[$$state]
+	$$n = int($$Pact[$$state])
 	if $$n <= $$Flag {
 		goto $$default /* simple state */
 	}
@@ -3523,7 +3561,7 @@ $$newstate:
 		goto $$default
 	}
 	$$n = $$Act[$$n]
-	if $$Chk[$$n] == $$token { /* valid shift 有效 shift*/
+	if int($$Chk[$$n]) == $$token { /* valid shift 有效 shift*/
 		$$rcvr.char = -1
 		$$token = -1
 		$$VAL = $$rcvr.lval
@@ -3536,7 +3574,7 @@ $$newstate:
 
 $$default:
 	/* default state action */
-	$$n = $$Def[$$state]
+	$$n = int($$Def[$$state])
 	if $$n == -2 {
 		if $$rcvr.char < 0 {
 			$$rcvr.char, $$token = $$lex1($$lex, &$$rcvr.lval)
@@ -3545,18 +3583,18 @@ $$default:
 		/* look through exception table */
 		xi := 0
 		for {
-			if $$Exca[xi+0] == -1 && $$Exca[xi+1] == $$state {
+			if $$Exca[xi+0] == -1 && int($$Exca[xi+1]) == $$state {
 				break
 			}
 			xi += 2
 		}
 		for xi += 2; ; xi += 2 {
-			$$n = $$Exca[xi+0]
+			$$n = int($$Exca[xi+0])
 			if $$n < 0 || $$n == $$token {
 				break
 			}
 		}
-		$$n = $$Exca[xi+1]
+		$$n = int($$Exca[xi+1])
 		if $$n < 0 {
 			goto ret0
 		}
@@ -3578,10 +3616,10 @@ $$default:
 
 			/* find a state where "error" is a legal shift action 找到“错误”是合法shift动作的状态*/
 			for $$p >= 0 {
-				$$n = $$Pact[$$S[$$p].yys] + $$ErrCode
+				$$n = int($$Pact[$$S[$$p].yys]) + $$ErrCode
 				if $$n >= 0 && $$n < $$Last {
-					$$state = $$Act[$$n] /* simulate a shift of "error" */
-					if $$Chk[$$state] == $$ErrCode {
+					$$state = int($$Act[$$n]) /* simulate a shift of "error" */
+					if int($$Chk[$$state]) == $$ErrCode {
 						goto $$stack
 					}
 				}
@@ -3618,7 +3656,7 @@ $$default:
 	$$pt := $$p
 	_ = $$pt // guard against "declared and not used"
 
-	$$p -= $$R2[$$n]
+	$$p -= int($$R2[$$n])
 	// $$p is now the index of $0. Perform the default action. Iff the
 	// reduced production is ε, $1 is possibly out of range.
 	if $$p+1 >= len($$S) {
@@ -3629,16 +3667,16 @@ $$default:
 	$$VAL = $$S[$$p+1]//从栈中取一个数据?
 
 	/* consult goto table to find next state */
-	$$n = $$R1[$$n]
-	$$g := $$Pgo[$$n]
+	$$n = int($$R1[$$n])
+	$$g := int($$Pgo[$$n])
 	$$j := $$g + $$S[$$p].yys + 1
 
 	if $$j >= $$Last {
-		$$state = $$Act[$$g]
+		$$state = int($$Act[$$g])
 	} else {
-		$$state = $$Act[$$j]
-		if $$Chk[$$state] != -$$n {
-			$$state = $$Act[$$g]
+		$$state = int($$Act[$$j])
+		if int($$Chk[$$state]) != -$$n {
+			$$state = int($$Act[$$g])
 		}
 	}
 	// dummy call; replaced with literal code

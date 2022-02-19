@@ -6,8 +6,8 @@ package protocol
 
 // Package protocol contains data types and code for LSP jsonrpcs
 // generated automatically from vscode-languageserver-node
-// commit: 10b56de150ad67c3c330da8e2df53ebf2cf347c4
-// last fetched Wed Sep 29 2021 12:31:31 GMT-0400 (Eastern Daylight Time)
+// commit: f17727af04704c0e2ede73dfdbeb463156e94561
+// last fetched Thu Feb 10 2022 14:34:11 GMT-0700 (Mountain Standard Time)
 
 // Code generated (see typescript/README.md) DO NOT EDIT.
 
@@ -34,6 +34,9 @@ type Server interface {
 	DidSave(context.Context, *DidSaveTextDocumentParams) error
 	WillSave(context.Context, *WillSaveTextDocumentParams) error
 	DidChangeWatchedFiles(context.Context, *DidChangeWatchedFilesParams) error
+	DidOpenNotebookDocument(context.Context, *DidOpenNotebookDocumentParams) error
+	DidChangeNotebookDocument(context.Context, *DidChangeNotebookDocumentParams) error
+	DidCloseNotebookDocument(context.Context, *DidCloseNotebookDocumentParams) error
 	SetTrace(context.Context, *SetTraceParams) error
 	LogTrace(context.Context, *LogTraceParams) error
 	Implementation(context.Context, *ImplementationParams) (Definition /*Definition | DefinitionLink[] | null*/, error)
@@ -58,6 +61,8 @@ type Server interface {
 	PrepareTypeHierarchy(context.Context, *TypeHierarchyPrepareParams) ([]TypeHierarchyItem /*TypeHierarchyItem[] | null*/, error)
 	Supertypes(context.Context, *TypeHierarchySupertypesParams) ([]TypeHierarchyItem /*TypeHierarchyItem[] | null*/, error)
 	Subtypes(context.Context, *TypeHierarchySubtypesParams) ([]TypeHierarchyItem /*TypeHierarchyItem[] | null*/, error)
+	InlineValues(context.Context, *InlineValuesParams) ([]InlineValue /*InlineValue[] | null*/, error)
+	InlineValuesRefresh(context.Context) error
 	Initialize(context.Context, *ParamInitialize) (*InitializeResult, error)
 	Shutdown(context.Context) error
 	WillSaveWaitUntil(context.Context, *WillSaveTextDocumentParams) ([]TextEdit /*TextEdit[] | null*/, error)
@@ -71,7 +76,8 @@ type Server interface {
 	DocumentSymbol(context.Context, *DocumentSymbolParams) ([]interface{} /*SymbolInformation[] | DocumentSymbol[] | null*/, error)
 	CodeAction(context.Context, *CodeActionParams) ([]CodeAction /*(Command | CodeAction)[] | null*/, error)
 	ResolveCodeAction(context.Context, *CodeAction) (*CodeAction, error)
-	Symbol(context.Context, *WorkspaceSymbolParams) ([]SymbolInformation /*SymbolInformation[] | null*/, error)
+	Symbol(context.Context, *WorkspaceSymbolParams) ([]SymbolInformation /*SymbolInformation[] | WorkspaceSymbol[] | null*/, error)
+	ResolveWorkspaceSymbol(context.Context, *WorkspaceSymbol) (*WorkspaceSymbol, error)
 	CodeLens(context.Context, *CodeLensParams) ([]CodeLens /*CodeLens[] | null*/, error)
 	ResolveCodeLens(context.Context, *CodeLens) (*CodeLens, error)
 	CodeLensRefresh(context.Context) error
@@ -81,8 +87,8 @@ type Server interface {
 	RangeFormatting(context.Context, *DocumentRangeFormattingParams) ([]TextEdit /*TextEdit[] | null*/, error)
 	OnTypeFormatting(context.Context, *DocumentOnTypeFormattingParams) ([]TextEdit /*TextEdit[] | null*/, error)
 	Rename(context.Context, *RenameParams) (*WorkspaceEdit /*WorkspaceEdit | null*/, error)
-	PrepareRename(context.Context, *PrepareRenameParams) (*Range /*Range | { range: Range, placeholder: string } | { defaultBehavior: boolean } | null*/, error)
-	ExecuteCommand(context.Context, *ExecuteCommandParams) (interface{} /*any | null*/, error)
+	PrepareRename(context.Context, *PrepareRenameParams) (*PrepareRename2Gn /*Range | { range: Range, placeholder: string } | { defaultBehavior: boolean } | null*/, error)
+	ExecuteCommand(context.Context, *ExecuteCommandParams) (interface{} /* LSPAny | void | float64*/, error)
 	Diagnostic(context.Context, *string) (*string, error)
 	DiagnosticWorkspace(context.Context, *WorkspaceDiagnosticParams) (*WorkspaceDiagnosticReport, error)
 	DiagnosticRefresh(context.Context) error
@@ -184,6 +190,27 @@ func serverDispatch(ctx context.Context, server Server, reply jsonrpc2.Replier, 
 			return true, sendParseError(ctx, reply, err)
 		}
 		err := server.DidChangeWatchedFiles(ctx, &params)
+		return true, reply(ctx, nil, err)
+	case "notebookDocument/didOpen": // notif
+		var params DidOpenNotebookDocumentParams
+		if err := json.Unmarshal(r.Params(), &params); err != nil {
+			return true, sendParseError(ctx, reply, err)
+		}
+		err := server.DidOpenNotebookDocument(ctx, &params)
+		return true, reply(ctx, nil, err)
+	case "notebookDocument/didChange": // notif
+		var params DidChangeNotebookDocumentParams
+		if err := json.Unmarshal(r.Params(), &params); err != nil {
+			return true, sendParseError(ctx, reply, err)
+		}
+		err := server.DidChangeNotebookDocument(ctx, &params)
+		return true, reply(ctx, nil, err)
+	case "notebookDocument/didClose": // notif
+		var params DidCloseNotebookDocumentParams
+		if err := json.Unmarshal(r.Params(), &params); err != nil {
+			return true, sendParseError(ctx, reply, err)
+		}
+		err := server.DidCloseNotebookDocument(ctx, &params)
 		return true, reply(ctx, nil, err)
 	case "$/setTrace": // notif
 		var params SetTraceParams
@@ -352,6 +379,19 @@ func serverDispatch(ctx context.Context, server Server, reply jsonrpc2.Replier, 
 		}
 		resp, err := server.Subtypes(ctx, &params)
 		return true, reply(ctx, resp, err)
+	case "textDocument/inlineValues": // req
+		var params InlineValuesParams
+		if err := json.Unmarshal(r.Params(), &params); err != nil {
+			return true, sendParseError(ctx, reply, err)
+		}
+		resp, err := server.InlineValues(ctx, &params)
+		return true, reply(ctx, resp, err)
+	case "workspace/inlineValues/refresh": // req
+		if len(r.Params()) > 0 {
+			return true, reply(ctx, nil, errors.Errorf("%w: expected no params", jsonrpc2.ErrInvalidParams))
+		}
+		err := server.InlineValuesRefresh(ctx)
+		return true, reply(ctx, nil, err)
 	case "initialize": // req
 		var params ParamInitialize
 		if err := json.Unmarshal(r.Params(), &params); err != nil {
@@ -450,6 +490,13 @@ func serverDispatch(ctx context.Context, server Server, reply jsonrpc2.Replier, 
 			return true, sendParseError(ctx, reply, err)
 		}
 		resp, err := server.Symbol(ctx, &params)
+		return true, reply(ctx, resp, err)
+	case "workspaceSymbol/resolve": // req
+		var params WorkspaceSymbol
+		if err := json.Unmarshal(r.Params(), &params); err != nil {
+			return true, sendParseError(ctx, reply, err)
+		}
+		resp, err := server.ResolveWorkspaceSymbol(ctx, &params)
 		return true, reply(ctx, resp, err)
 	case "textDocument/codeLens": // req
 		var params CodeLensParams
@@ -607,6 +654,18 @@ func (s *serverDispatcher) WillSave(ctx context.Context, params *WillSaveTextDoc
 
 func (s *serverDispatcher) DidChangeWatchedFiles(ctx context.Context, params *DidChangeWatchedFilesParams) error {
 	return s.sender.Notify(ctx, "workspace/didChangeWatchedFiles", params)
+}
+
+func (s *serverDispatcher) DidOpenNotebookDocument(ctx context.Context, params *DidOpenNotebookDocumentParams) error {
+	return s.sender.Notify(ctx, "notebookDocument/didOpen", params)
+}
+
+func (s *serverDispatcher) DidChangeNotebookDocument(ctx context.Context, params *DidChangeNotebookDocumentParams) error {
+	return s.sender.Notify(ctx, "notebookDocument/didChange", params)
+}
+
+func (s *serverDispatcher) DidCloseNotebookDocument(ctx context.Context, params *DidCloseNotebookDocumentParams) error {
+	return s.sender.Notify(ctx, "notebookDocument/didClose", params)
 }
 
 func (s *serverDispatcher) SetTrace(ctx context.Context, params *SetTraceParams) error {
@@ -788,6 +847,18 @@ func (s *serverDispatcher) Subtypes(ctx context.Context, params *TypeHierarchySu
 	return result, nil
 }
 
+func (s *serverDispatcher) InlineValues(ctx context.Context, params *InlineValuesParams) ([]InlineValue /*InlineValue[] | null*/, error) {
+	var result []InlineValue /*InlineValue[] | null*/
+	if err := s.sender.Call(ctx, "textDocument/inlineValues", params, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *serverDispatcher) InlineValuesRefresh(ctx context.Context) error {
+	return s.sender.Call(ctx, "workspace/inlineValues/refresh", nil, nil)
+}
+
 func (s *serverDispatcher) Initialize(ctx context.Context, params *ParamInitialize) (*InitializeResult, error) {
 	var result *InitializeResult
 	if err := s.sender.Call(ctx, "initialize", params, &result); err != nil {
@@ -888,9 +959,17 @@ func (s *serverDispatcher) ResolveCodeAction(ctx context.Context, params *CodeAc
 	return result, nil
 }
 
-func (s *serverDispatcher) Symbol(ctx context.Context, params *WorkspaceSymbolParams) ([]SymbolInformation /*SymbolInformation[] | null*/, error) {
-	var result []SymbolInformation /*SymbolInformation[] | null*/
+func (s *serverDispatcher) Symbol(ctx context.Context, params *WorkspaceSymbolParams) ([]SymbolInformation /*SymbolInformation[] | WorkspaceSymbol[] | null*/, error) {
+	var result []SymbolInformation /*SymbolInformation[] | WorkspaceSymbol[] | null*/
 	if err := s.sender.Call(ctx, "workspace/symbol", params, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *serverDispatcher) ResolveWorkspaceSymbol(ctx context.Context, params *WorkspaceSymbol) (*WorkspaceSymbol, error) {
+	var result *WorkspaceSymbol
+	if err := s.sender.Call(ctx, "workspaceSymbol/resolve", params, &result); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -964,16 +1043,16 @@ func (s *serverDispatcher) Rename(ctx context.Context, params *RenameParams) (*W
 	return result, nil
 }
 
-func (s *serverDispatcher) PrepareRename(ctx context.Context, params *PrepareRenameParams) (*Range /*Range | { range: Range, placeholder: string } | { defaultBehavior: boolean } | null*/, error) {
-	var result *Range /*Range | { range: Range, placeholder: string } | { defaultBehavior: boolean } | null*/
+func (s *serverDispatcher) PrepareRename(ctx context.Context, params *PrepareRenameParams) (*PrepareRename2Gn /*Range | { range: Range, placeholder: string } | { defaultBehavior: boolean } | null*/, error) {
+	var result *PrepareRename2Gn /*Range | { range: Range, placeholder: string } | { defaultBehavior: boolean } | null*/
 	if err := s.sender.Call(ctx, "textDocument/prepareRename", params, &result); err != nil {
 		return nil, err
 	}
 	return result, nil
 }
 
-func (s *serverDispatcher) ExecuteCommand(ctx context.Context, params *ExecuteCommandParams) (interface{} /*any | null*/, error) {
-	var result interface{} /*any | null*/
+func (s *serverDispatcher) ExecuteCommand(ctx context.Context, params *ExecuteCommandParams) (interface{} /* LSPAny | void | float64*/, error) {
+	var result interface{} /* LSPAny | void | float64*/
 	if err := s.sender.Call(ctx, "workspace/executeCommand", params, &result); err != nil {
 		return nil, err
 	}

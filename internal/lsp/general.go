@@ -149,8 +149,8 @@ See https://github.com/golang/go/issues/45732 for more information.`,
 					IncludeText: false,
 				},
 			},
-			Workspace: protocol.Workspace5Gn{
-				WorkspaceFolders: protocol.WorkspaceFolders4Gn{
+			Workspace: protocol.Workspace6Gn{
+				WorkspaceFolders: protocol.WorkspaceFolders5Gn{
 					Supported:           true,
 					ChangeNotifications: "workspace/didChangeWorkspaceFolders",
 				},
@@ -466,7 +466,8 @@ func (s *Server) beginFileRequest(ctx context.Context, pURI protocol.DocumentURI
 		release()
 		return nil, nil, false, func() {}, err
 	}
-	if expectKind != source.UnknownKind && fh.Kind() != expectKind {
+	kind := snapshot.View().FileKind(fh)
+	if expectKind != source.UnknownKind && kind != expectKind {
 		// Wrong kind of file. Nothing to do.
 		release()
 		return nil, nil, false, func() {}, nil

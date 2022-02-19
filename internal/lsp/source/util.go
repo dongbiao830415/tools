@@ -161,7 +161,9 @@ func posToMappedRange(snapshot Snapshot, pkg Package, pos, end token.Pos) (Mappe
 //	https://golang.org/s/generatedcode
 var generatedRx = regexp.MustCompile(`// .*DO NOT EDIT\.?`)
 
-func DetectLanguage(langID, filename string) FileKind {
+// FileKindForLang returns the file kind associated with the given language ID,
+// or UnknownKind if the language ID is not recognized.
+func FileKindForLang(langID string) FileKind {
 	switch langID {
 	case "go":
 		return Go
@@ -169,35 +171,29 @@ func DetectLanguage(langID, filename string) FileKind {
 		return Mod
 	case "go.sum":
 		return Sum
-	case "tmpl":
+	case "tmpl", "gotmpl":
 		return Tmpl
-	}
-	// Fallback to detecting the language based on the file extension.
-	switch ext := filepath.Ext(filename); ext {
-	case ".mod":
-		return Mod
-	case ".sum":
-		return Sum
+	case "go.work":
+		return Work
 	default:
-		if strings.HasSuffix(ext, "tmpl") {
-			// .tmpl, .gotmpl, etc
-			return Tmpl
-		}
-		// It's a Go file, or we shouldn't be seeing it
-		return Go
+		return UnknownKind
 	}
 }
 
 func (k FileKind) String() string {
 	switch k {
+	case Go:
+		return "go"
 	case Mod:
 		return "go.mod"
 	case Sum:
 		return "go.sum"
 	case Tmpl:
 		return "tmpl"
+	case Work:
+		return "go.work"
 	default:
-		return "go"
+		return fmt.Sprintf("unk%d", k)
 	}
 }
 
@@ -544,13 +540,22 @@ func IsCommandLineArguments(s string) bool {
 	return strings.Contains(s, "command-line-arguments")
 }
 
-// Offset returns tok.Offset(pos), but it also checks that the pos is in range
+// Offset returns tok.Offset(pos), but first checks that the pos is in range
 // for the given file.
 func Offset(tok *token.File, pos token.Pos) (int, error) {
 	if !InRange(tok, pos) {
 		return -1, fmt.Errorf("pos %v is not in range for file [%v:%v)", pos, tok.Base(), tok.Base()+tok.Size())
 	}
 	return tok.Offset(pos), nil
+}
+
+// Pos returns tok.Pos(offset), but first checks that the offset is valid for
+// the given file.
+func Pos(tok *token.File, offset int) (token.Pos, error) {
+	if offset < 0 || offset > tok.Size() {
+		return token.NoPos, fmt.Errorf("offset %v is not in range for file of size %v", offset, tok.Size())
+	}
+	return tok.Pos(offset), nil
 }
 
 // InRange reports whether the given position is in the given token.File.

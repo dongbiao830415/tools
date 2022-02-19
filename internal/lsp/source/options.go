@@ -55,6 +55,7 @@ import (
 	"golang.org/x/tools/internal/lsp/analysis/simplifycompositelit"
 	"golang.org/x/tools/internal/lsp/analysis/simplifyrange"
 	"golang.org/x/tools/internal/lsp/analysis/simplifyslice"
+	"golang.org/x/tools/internal/lsp/analysis/stubmethods"
 	"golang.org/x/tools/internal/lsp/analysis/undeclaredname"
 	"golang.org/x/tools/internal/lsp/analysis/unusedparams"
 	"golang.org/x/tools/internal/lsp/analysis/useany"
@@ -103,6 +104,7 @@ func DefaultOptions() *Options {
 						protocol.SourceOrganizeImports: true,
 						protocol.QuickFix:              true,
 					},
+					Work: {},
 					Sum:  {},
 					Tmpl: {},
 				},
@@ -114,8 +116,7 @@ func DefaultOptions() *Options {
 					ExperimentalPackageCacheKey: true,
 					MemoryMode:                  ModeNormal,
 					DirectoryFilters:            []string{"-node_modules"},
-					TemplateSupport:             true,
-					TemplateExtensions:          []string{"tmpl", "gotmpl"},
+					TemplateExtensions:          []string{},
 				},
 				UIOptions: UIOptions{
 					DiagnosticOptions: DiagnosticOptions{
@@ -134,7 +135,7 @@ func DefaultOptions() *Options {
 					},
 					NavigationOptions: NavigationOptions{
 						ImportShortcut: Both,
-						SymbolMatcher:  SymbolFuzzy,
+						SymbolMatcher:  SymbolFastFuzzy,
 						SymbolStyle:    DynamicSymbols,
 					},
 					CompletionOptions: CompletionOptions{
@@ -232,9 +233,6 @@ type BuildOptions struct {
 	//
 	// Include only project_a, but not node_modules inside it: `-`, `+project_a`, `-project_a/node_modules`
 	DirectoryFilters []string
-
-	// TemplateSupport can be used to turn off support for template files.
-	TemplateSupport bool
 
 	// TemplateExtensions gives the extensions of file names that are treateed
 	// as template files. (The extension
@@ -755,6 +753,7 @@ func (o *Options) EnableAllExperiments() {
 	o.ExperimentalPostfixCompletions = true
 	o.ExperimentalUseInvalidMetadata = true
 	o.ExperimentalWatchedFileDelay = 50 * time.Millisecond
+	o.SymbolMatcher = SymbolFastFuzzy
 }
 
 func (o *Options) enableAllExperimentMaps() {
@@ -940,22 +939,23 @@ func (o *Options) set(name string, value interface{}, seen map[string]struct{}) 
 	case "experimentalWorkspaceModule":
 		result.setBool(&o.ExperimentalWorkspaceModule)
 
-	case "experimentalTemplateSupport", // remove after June 2022
-		"templateSupport":
-		if name == "experimentalTemplateSupport" {
-			result.State = OptionDeprecated
-			result.Replacement = "templateSupport"
-		}
-		result.setBool(&o.TemplateSupport)
+	case "experimentalTemplateSupport": // remove after June 2022
+		result.State = OptionDeprecated
 
 	case "templateExtensions":
-		iexts, ok := value.([]string)
-		if !ok {
-			result.errorf("invalid type %T, expect []string", value)
+		if iexts, ok := value.([]interface{}); ok {
+			ans := []string{}
+			for _, x := range iexts {
+				ans = append(ans, fmt.Sprint(x))
+			}
+			o.TemplateExtensions = ans
 			break
 		}
-		o.TemplateExtensions = iexts
-
+		if value == nil {
+			o.TemplateExtensions = nil
+			break
+		}
+		result.errorf(fmt.Sprintf("unexpected type %T not []string", value))
 	case "experimentalDiagnosticsDelay", "diagnosticsDelay":
 		if name == "experimentalDiagnosticsDelay" {
 			result.State = OptionDeprecated
@@ -1218,6 +1218,12 @@ func convenienceAnalyzers() map[string]*Analyzer {
 			Enabled:    true,
 			ActionKind: []protocol.CodeActionKind{protocol.RefactorRewrite},
 		},
+		stubmethods.Analyzer.Name: {
+			Analyzer:   stubmethods.Analyzer,
+			ActionKind: []protocol.CodeActionKind{protocol.RefactorRewrite},
+			Fix:        StubMethods,
+			Enabled:    true,
+		},
 	}
 }
 
@@ -1338,12 +1344,9 @@ func collectEnums(opt *OptionJSON) string {
 	write := func(name, doc string, index, len int) {
 		if doc != "" {
 			unbroken := parBreakRE.ReplaceAllString(doc, "\\\n")
-			fmt.Fprintf(&b, "* %s", unbroken)
+			fmt.Fprintf(&b, "* %s\n", strings.TrimSpace(unbroken))
 		} else {
-			fmt.Fprintf(&b, "* `%s`", name)
-		}
-		if index < len-1 {
-			fmt.Fprint(&b, "\n")
+			fmt.Fprintf(&b, "* `%s`\n", name)
 		}
 	}
 	if len(opt.EnumValues) > 0 && opt.Type == "enum" {

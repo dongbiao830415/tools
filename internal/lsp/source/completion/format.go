@@ -5,8 +5,11 @@
 package completion
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"go/ast"
+	"go/doc"
 	"go/types"
 	"strings"
 
@@ -17,6 +20,7 @@ import (
 	"golang.org/x/tools/internal/lsp/snippet"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
+	"golang.org/x/tools/internal/typeparams"
 	errors "golang.org/x/xerrors"
 )
 
@@ -56,6 +60,14 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 	)
 	if obj.Type() == nil {
 		detail = ""
+	}
+	if isTypeName(obj) && c.wantTypeParams() {
+		x := cand.obj.(*types.TypeName)
+		if named, ok := x.Type().(*types.Named); ok {
+			tp := typeparams.ForNamed(named)
+			label += string(formatTypeParams(tp))
+			insert = label // maintain invariant above (label == insert)
+		}
 	}
 
 	snip.WriteText(insert)
@@ -235,17 +247,18 @@ Suffixes:
 	if err != nil {
 		return CompletionItem{}, err
 	}
-	hover, err := source.HoverInfo(ctx, c.snapshot, pkg, obj, decl, nil)
+	hover, err := source.FindHoverContext(ctx, c.snapshot, pkg, obj, decl, nil)
 	if err != nil {
 		event.Error(ctx, "failed to find Hover", err, tag.URI.Of(uri))
 		return item, nil
 	}
-	item.Documentation = hover.Synopsis
 	if c.opts.fullDocumentation {
-		item.Documentation = hover.FullDocumentation
+		item.Documentation = hover.Comment.Text()
+	} else {
+		item.Documentation = doc.Synopsis(hover.Comment.Text())
 	}
 	// The desired pattern is `^// Deprecated`, but the prefix has been removed
-	if strings.HasPrefix(hover.FullDocumentation, "Deprecated") {
+	if strings.HasPrefix(hover.Comment.Text(), "Deprecated") {
 		if c.snapshot.View().Options().CompletionTags {
 			item.Tags = []protocol.CompletionItemTag{protocol.ComplDeprecated}
 		} else if c.snapshot.View().Options().CompletionDeprecated {
@@ -306,4 +319,39 @@ func (c *completer) formatBuiltin(ctx context.Context, cand candidate) (Completi
 		item.Kind = protocol.VariableCompletion
 	}
 	return item, nil
+}
+
+// decide if the type params (if any) should be part of the completion
+// which only possible for types.Named and types.Signature
+// (so far, only in receivers, e.g.; func (s *GENERIC[K, V])..., which is a types.Named)
+func (c *completer) wantTypeParams() bool {
+	// Need to be lexically in a receiver, and a child of an IndexListExpr
+	// (but IndexListExpr only exists with go1.18)
+	start := c.path[0].Pos()
+	for i, nd := range c.path {
+		if fd, ok := nd.(*ast.FuncDecl); ok {
+			if i > 0 && fd.Recv != nil && start < fd.Recv.End() {
+				return true
+			} else {
+				return false
+			}
+		}
+	}
+	return false
+}
+
+func formatTypeParams(tp *typeparams.TypeParamList) []byte {
+	var buf bytes.Buffer
+	if tp == nil || tp.Len() == 0 {
+		return nil
+	}
+	buf.WriteByte('[')
+	for i := 0; i < tp.Len(); i++ {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(tp.At(i).Obj().Name())
+	}
+	buf.WriteByte(']')
+	return buf.Bytes()
 }

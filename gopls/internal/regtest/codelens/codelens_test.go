@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"golang.org/x/tools/gopls/internal/hooks"
 	. "golang.org/x/tools/internal/lsp/regtest"
@@ -311,8 +310,6 @@ func main() {
 			CodeLenses: map[string]bool{
 				"gc_details": true,
 			}},
-		// TestGCDetails seems to suffer from poor performance on certain builders. Give it some more time to complete.
-		Timeout(60*time.Second),
 	).Run(t, mod, func(t *testing.T, env *Env) {
 		env.OpenFile("main.go")
 		env.ExecuteCodeLensCommand("main.go", command.GCDetails)
