@@ -485,6 +485,13 @@ func Completion(ctx context.Context, snapshot source.Snapshot, fh source.FileHan
 					qual := types.RelativeTo(pkg.GetTypes())
 					objStr = types.ObjectString(obj, qual)
 				}
+				ans, sel := definition(path, obj, snapshot.FileSet(), pgf.Mapper, fh)
+				if ans != nil {
+					sort.Slice(ans, func(i, j int) bool {
+						return ans[i].Score > ans[j].Score
+					})
+					return ans, sel, nil
+				}
 				return nil, nil, ErrIsDefinition{objStr: objStr}
 			}
 		}
@@ -1229,6 +1236,13 @@ func (c *completer) methodsAndFields(typ types.Type, addressable bool, imp *impo
 			mset = types.NewMethodSet(typ)
 		}
 		c.methodSetCache[methodSetKey{typ, addressable}] = mset
+	}
+
+	if typ.String() == "*testing.F" && addressable {
+		// is that a sufficient test? (or is more care needed?)
+		if c.fuzz(typ, mset, imp, cb, c.snapshot.FileSet()) {
+			return
+		}
 	}
 
 	for i := 0; i < mset.Len(); i++ {
