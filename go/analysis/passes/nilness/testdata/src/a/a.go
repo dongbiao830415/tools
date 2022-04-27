@@ -158,3 +158,39 @@ func f9(x interface {
 func unknown() bool {
 	return false
 }
+
+func f10(a interface{}) {
+	switch a.(type) {
+	case nil:
+		return
+	}
+	switch a.(type) {
+	case nil: // want "impossible condition: non-nil == nil"
+		return
+	}
+}
+
+func f11(a interface{}) {
+	switch a {
+	case nil:
+		return
+	}
+	switch a {
+	case 5,
+		nil: // want "impossible condition: non-nil == nil"
+		return
+	}
+}
+
+type Y struct {
+	innerY
+}
+
+type innerY struct {
+	value int
+}
+
+func f12() {
+	var d *Y
+	print(d.value) // want "nil dereference in field selection"
+}

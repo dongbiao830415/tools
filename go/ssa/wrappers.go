@@ -22,6 +22,7 @@ package ssa
 import (
 	"fmt"
 
+	"go/token"
 	"go/types"
 )
 
@@ -41,8 +42,7 @@ import (
 //   - the result may be a thunk or a wrapper.
 //
 // EXCLUSIVE_LOCKS_REQUIRED(prog.methodsMu)
-//
-func makeWrapper(prog *Program, sel *types.Selection) *Function {
+func makeWrapper(prog *Program, sel selection, cr *creator) *Function {
 	obj := sel.Obj().(*types.Func)       // the declared function
 	sig := sel.Type().(*types.Signature) // type of this wrapper
 
@@ -74,6 +74,7 @@ func makeWrapper(prog *Program, sel *types.Selection) *Function {
 		pos:       obj.Pos(),
 		info:      nil, // info is not set on wrappers.
 	}
+	cr.Add(fn)
 	fn.startBody()
 	fn.addSpilledParam(recv)
 	createParams(fn, start)
@@ -112,7 +113,7 @@ func makeWrapper(prog *Program, sel *types.Selection) *Function {
 	// Load) in preference to value extraction (Field possibly
 	// preceded by Load).
 
-	v = emitImplicitSelections(fn, v, indices[:len(indices)-1])
+	v = emitImplicitSelections(fn, v, indices[:len(indices)-1], token.NoPos)
 
 	// Invariant: v is a pointer, either
 	//   value of implicit *C field, or
@@ -123,7 +124,11 @@ func makeWrapper(prog *Program, sel *types.Selection) *Function {
 		if !isPointer(r) {
 			v = emitLoad(fn, v)
 		}
-		c.Call.Value = prog.declaredFunc(obj)
+		callee := prog.originFunc(obj)
+		if len(callee._TypeParams) > 0 {
+			callee = prog.instances[callee].lookupOrCreate(receiverTypeArgs(obj), cr)
+		}
+		c.Call.Value = callee
 		c.Call.Args = append(c.Call.Args, v)
 	} else {
 		c.Call.Method = obj
@@ -134,13 +139,13 @@ func makeWrapper(prog *Program, sel *types.Selection) *Function {
 	}
 	emitTailCall(fn, &c)
 	fn.finishBody()
+	fn.done()
 	return fn
 }
 
 // createParams creates parameters for wrapper method fn based on its
 // Signature.Params, which do not include the receiver.
 // start is the index of the first regular parameter to use.
-//
 func createParams(fn *Function, start int) {
 	tparams := fn.Signature.Params()
 	for i, n := start, tparams.Len(); i < n; i++ {
@@ -159,26 +164,28 @@ func createParams(fn *Function, start int) {
 // Use MakeClosure with such a wrapper to construct a bound method
 // closure.  e.g.:
 //
-//   type T int          or:  type T interface { meth() }
-//   func (t T) meth()
-//   var t T
-//   f := t.meth
-//   f() // calls t.meth()
+//	type T int          or:  type T interface { meth() }
+//	func (t T) meth()
+//	var t T
+//	f := t.meth
+//	f() // calls t.meth()
 //
 // f is a closure of a synthetic wrapper defined as if by:
 //
-//   f := func() { return t.meth() }
+//	f := func() { return t.meth() }
 //
 // Unlike makeWrapper, makeBound need perform no indirection or field
 // selections because that can be done before the closure is
 // constructed.
 //
 // EXCLUSIVE_LOCKS_ACQUIRED(meth.Prog.methodsMu)
-//
-func makeBound(prog *Program, obj *types.Func) *Function {
+func makeBound(prog *Program, obj *types.Func, cr *creator) *Function {
+	targs := receiverTypeArgs(obj)
+	key := boundsKey{obj, prog.canon.List(targs)}
+
 	prog.methodsMu.Lock()
 	defer prog.methodsMu.Unlock()
-	fn, ok := prog.bounds[obj]
+	fn, ok := prog.bounds[key]
 	if !ok {
 		description := fmt.Sprintf("bound method wrapper for %s", obj)
 		if prog.mode&LogSource != 0 {
@@ -193,6 +200,7 @@ func makeBound(prog *Program, obj *types.Func) *Function {
 			pos:       obj.Pos(),
 			info:      nil, // info is not set on wrappers.
 		}
+		cr.Add(fn)
 
 		fv := &FreeVar{name: "recv", typ: recvType(obj), parent: fn}
 		fn.FreeVars = []*FreeVar{fv}
@@ -201,7 +209,11 @@ func makeBound(prog *Program, obj *types.Func) *Function {
 		var c Call
 
 		if !isInterface(recvType(obj)) { // concrete
-			c.Call.Value = prog.declaredFunc(obj)
+			callee := prog.originFunc(obj)
+			if len(callee._TypeParams) > 0 {
+				callee = prog.instances[callee].lookupOrCreate(targs, cr)
+			}
+			c.Call.Value = callee
 			c.Call.Args = []Value{fv}
 		} else {
 			c.Call.Value = fv
@@ -212,8 +224,9 @@ func makeBound(prog *Program, obj *types.Func) *Function {
 		}
 		emitTailCall(fn, &c)
 		fn.finishBody()
+		fn.done()
 
-		prog.bounds[obj] = fn
+		prog.bounds[key] = fn
 	}
 	return fn
 }
@@ -227,23 +240,22 @@ func makeBound(prog *Program, obj *types.Func) *Function {
 //
 // Precondition: sel.Kind() == types.MethodExpr.
 //
-//   type T int          or:  type T interface { meth() }
-//   func (t T) meth()
-//   f := T.meth
-//   var t T
-//   f(t) // calls t.meth()
+//	type T int          or:  type T interface { meth() }
+//	func (t T) meth()
+//	f := T.meth
+//	var t T
+//	f(t) // calls t.meth()
 //
 // f is a synthetic wrapper defined as if by:
 //
-//   f := func(t T) { return t.meth() }
+//	f := func(t T) { return t.meth() }
 //
 // TODO(adonovan): opt: currently the stub is created even when used
 // directly in a function call: C.f(i, 0).  This is less efficient
 // than inlining the stub.
 //
 // EXCLUSIVE_LOCKS_ACQUIRED(meth.Prog.methodsMu)
-//
-func makeThunk(prog *Program, sel *types.Selection) *Function {
+func makeThunk(prog *Program, sel selection, cr *creator) *Function {
 	if sel.Kind() != types.MethodExpr {
 		panic(sel)
 	}
@@ -263,7 +275,7 @@ func makeThunk(prog *Program, sel *types.Selection) *Function {
 
 	fn, ok := prog.thunks[key]
 	if !ok {
-		fn = makeWrapper(prog, sel)
+		fn = makeWrapper(prog, sel, cr)
 		if fn.Signature.Recv() != nil {
 			panic(fn) // unexpected receiver
 		}
@@ -283,4 +295,51 @@ type selectionKey struct {
 	obj      types.Object
 	index    string
 	indirect bool
+}
+
+// boundsKey is a unique for the object and a type instantiation.
+type boundsKey struct {
+	obj  types.Object // t.meth
+	inst *typeList    // canonical type instantiation list.
+}
+
+// methodExpr is an copy of a *types.Selection.
+// This exists as there is no way to create MethodExpr's for an instantiation.
+type methodExpr struct {
+	recv     types.Type
+	typ      types.Type
+	obj      types.Object
+	index    []int
+	indirect bool
+}
+
+func (*methodExpr) Kind() types.SelectionKind { return types.MethodExpr }
+func (m *methodExpr) Type() types.Type        { return m.typ }
+func (m *methodExpr) Recv() types.Type        { return m.recv }
+func (m *methodExpr) Obj() types.Object       { return m.obj }
+func (m *methodExpr) Index() []int            { return m.index }
+func (m *methodExpr) Indirect() bool          { return m.indirect }
+
+// create MethodExpr from a MethodValue.
+func toMethodExpr(mv *types.Selection) *methodExpr {
+	if mv.Kind() != types.MethodVal {
+		panic(mv)
+	}
+	return &methodExpr{
+		recv:     mv.Recv(),
+		typ:      recvAsFirstArg(mv.Type().(*types.Signature)),
+		obj:      mv.Obj(),
+		index:    mv.Index(),
+		indirect: mv.Indirect(),
+	}
+}
+
+// generalization of a *types.Selection and a methodExpr.
+type selection interface {
+	Kind() types.SelectionKind
+	Type() types.Type
+	Recv() types.Type
+	Obj() types.Object
+	Index() []int
+	Indirect() bool
 }

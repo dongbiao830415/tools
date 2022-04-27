@@ -3,11 +3,10 @@
 // license that can be found in the LICENSE file.
 
 /*
-
 Goyacc is a version of yacc for Go.
 It is written in Go and generates parsers written in Go.
-Goyaccæ˜¯yaccçš„goç‰ˆæœ¬ã€‚
-å®ƒç”¨Goç¼–å†™ï¼Œå¹¶ç”Ÿæˆç”¨Goç¼–å†™çš„è§£æå™¨ã€‚
+GoyaccÊÇyaccµÄgo°æ±¾¡£
+ËüÓÃGo±àĞ´£¬²¢Éú³ÉÓÃGo±àĞ´µÄ½âÎöÆ÷¡£
 Usage:
 
 	goyacc args...
@@ -15,23 +14,23 @@ Usage:
 It is largely transliterated from the Inferno version written in Limbo
 which in turn was largely transliterated from the Plan 9 version
 written in C and documented at
-å®ƒå¾ˆå¤§ç¨‹åº¦ä¸Šæ˜¯ä»Limboç¼–å†™çš„Infernoç‰ˆæœ¬è½¬è¯‘è€Œæ¥çš„ï¼Œè€ŒInfernoç‰ˆæœ¬åˆæ˜¯ä»Cè¯­è¨€ç¼–å†™çš„Plan 9ç‰ˆæœ¬è½¬è¯‘è€Œæ¥ï¼Œåœ¨
+ËüºÜ´ó³Ì¶ÈÉÏÊÇ´ÓLimbo±àĞ´µÄInferno°æ±¾×ªÒë¶øÀ´µÄ£¬¶øInferno°æ±¾ÓÖÊÇ´ÓCÓïÑÔ±àĞ´µÄPlan 9°æ±¾×ªÒë¶øÀ´£¬ÔÚ
 	https://9p.io/magic/man2html/1/yacc
 
 Adepts of the original yacc will have no trouble adapting to this
 form of the tool.
-åŸå§‹yaccçš„ä¸“å®¶å°†å¯ä»¥è½»æ¾é€‚åº”è¿™ç§å½¢å¼çš„å·¥å…·ã€‚
+Ô­Ê¼yaccµÄ×¨¼Ò½«¿ÉÒÔÇáËÉÊÊÓ¦ÕâÖÖĞÎÊ½µÄ¹¤¾ß¡£
 
 The directory $GOPATH/src/golang.org/x/tools/cmd/goyacc/testdata/expr
 is a yacc program for a very simple expression parser. See expr.y and
 main.go in that directory for examples of how to write and build
 goyacc programs.
-$ GOPATH / src / golang.org / x / tools / cmd / goyacc / testdata / exprç›®å½•æ˜¯ç”¨äºéå¸¸ç®€å•çš„è¡¨è¾¾å¼è§£æå™¨çš„yaccç¨‹åºã€‚ 
-æœ‰å…³å¦‚ä½•ç¼–å†™å’Œæ„å»ºgoyaccç¨‹åºçš„ç¤ºä¾‹ï¼Œè¯·å‚è§è¯¥ç›®å½•ä¸­çš„expr.yå’Œmain.goã€‚
+$ GOPATH / src / golang.org / x / tools / cmd / goyacc / testdata / exprÄ¿Â¼ÊÇÓÃÓÚ·Ç³£¼òµ¥µÄ±í´ïÊ½½âÎöÆ÷µÄyacc³ÌĞò¡£ 
+ÓĞ¹ØÈçºÎ±àĞ´ºÍ¹¹½¨goyacc³ÌĞòµÄÊ¾Àı£¬Çë²Î¼û¸ÃÄ¿Â¼ÖĞµÄexpr.yºÍmain.go¡£
 
 The generated parser is reentrant. The parsing function yyParse expects
 to be given an argument that conforms to the following interface:
-ç”Ÿæˆçš„è§£æå™¨æ˜¯å¯é‡å…¥çš„ã€‚ è§£æå‡½æ•°yyParseæœŸæœ›å¾—åˆ°ä¸€ä¸ªç¬¦åˆä»¥ä¸‹æ¥å£çš„å‚æ•°ï¼š
+Éú³ÉµÄ½âÎöÆ÷ÊÇ¿ÉÖØÈëµÄ¡£ ½âÎöº¯ÊıyyParseÆÚÍûµÃµ½Ò»¸ö·ûºÏÒÔÏÂ½Ó¿ÚµÄ²ÎÊı£º
 
 	type yyLexer interface {
 		Lex(lval *yySymType) int
@@ -41,19 +40,19 @@ to be given an argument that conforms to the following interface:
 Lex should return the token identifier, and place other token
 information in lval (which replaces the usual yylval).
 Error is equivalent to yyerror in the original yacc.
-Lexåº”è¯¥è¿”å›ä»¤ç‰Œæ ‡è¯†ç¬¦ï¼Œå¹¶å°†å…¶ä»–ä»¤ç‰Œä¿¡æ¯æ”¾å…¥lvalï¼ˆä»£æ›¿é€šå¸¸çš„yylvalï¼‰ã€‚ 
-é”™è¯¯ç­‰åŒäºåŸå§‹yaccä¸­çš„yyerrorã€‚
+LexÓ¦¸Ã·µ»ØÁîÅÆ±êÊ¶·û£¬²¢½«ÆäËûÁîÅÆĞÅÏ¢·ÅÈëlval£¨´úÌæÍ¨³£µÄyylval£©¡£ 
+´íÎóµÈÍ¬ÓÚÔ­Ê¼yaccÖĞµÄyyerror¡£
 
 Code inside the grammar actions may refer to the variable yylex,
 which holds the yyLexer passed to yyParse.
-è¯­æ³•æ“ä½œä¸­çš„ä»£ç å¯èƒ½å¼•ç”¨å˜é‡yylexï¼Œè¯¥å˜é‡ä¿å­˜ä¼ é€’ç»™yyParseçš„yyLexerã€‚
+Óï·¨²Ù×÷ÖĞµÄ´úÂë¿ÉÄÜÒıÓÃ±äÁ¿yylex£¬¸Ã±äÁ¿±£´æ´«µİ¸øyyParseµÄyyLexer¡£
 
 Clients that need to understand more about the parser state can
 create the parser separately from invoking it. The function yyNewParser
 returns a yyParser conforming to the following interface:
 
-éœ€è¦äº†è§£æœ‰å…³è§£æå™¨çŠ¶æ€çš„æ›´å¤šä¿¡æ¯çš„å®¢æˆ·ç«¯å¯ä»¥ä¸è°ƒç”¨å®ƒåˆ†å¼€åˆ›å»ºè§£æå™¨ã€‚
-å‡½æ•°yyNewParserè¿”å›ç¬¦åˆä»¥ä¸‹æ¥å£çš„yyParserï¼š
+ĞèÒªÁË½âÓĞ¹Ø½âÎöÆ÷×´Ì¬µÄ¸ü¶àĞÅÏ¢µÄ¿Í»§¶Ë¿ÉÒÔÓëµ÷ÓÃËü·Ö¿ª´´½¨½âÎöÆ÷¡£
+º¯ÊıyyNewParser·µ»Ø·ûºÏÒÔÏÂ½Ó¿ÚµÄyyParser£º
 
 	type yyParser interface {
 		Parse(yyLex) int
@@ -62,7 +61,7 @@ returns a yyParser conforming to the following interface:
 
 Parse runs the parser; the top-level call yyParse(yylex) is equivalent
 to yyNewParser().Parse(yylex).
-è§£æè¿è¡Œè§£æå™¨ï¼› é¡¶çº§è°ƒç”¨yyParseï¼ˆyylexï¼‰ç­‰æ•ˆäºyyNewParserï¼ˆï¼‰ã€‚Parseï¼ˆyylexï¼‰ã€‚
+½âÎöÔËĞĞ½âÎöÆ÷£» ¶¥¼¶µ÷ÓÃyyParse£¨yylex£©µÈĞ§ÓÚyyNewParser£¨£©¡£Parse£¨yylex£©¡£
 
 Lookahead can be called during grammar actions to read (but not consume)
 the value of the current lookahead token, as returned by yylex.Lex.
@@ -70,9 +69,9 @@ If there is no current lookahead token (because the parser has not called Lex
 or has consumed the token returned by the most recent call to Lex),
 Lookahead returns -1. Calling Lookahead is equivalent to reading
 yychar from within in a grammar action.
-å¯ä»¥åœ¨è¯­æ³•æ“ä½œæœŸé—´è°ƒç”¨å‰ç»ï¼Œä»¥è¯»å–ï¼ˆä½†ä¸æ¶ˆè€—ï¼‰yalex.Lexè¿”å›çš„å½“å‰å‰ç»æ ‡è®°çš„å€¼ã€‚ 
-å¦‚æœæ²¡æœ‰å½“å‰çš„å‰ç»ä»¤ç‰Œï¼ˆå› ä¸ºè§£æå™¨æœªè°ƒç”¨Lexæˆ–å·²æ¶ˆè€—äº†å¯¹Lexçš„æœ€è¿‘è°ƒç”¨è¿”å›çš„ä»¤ç‰Œï¼‰ï¼Œ
-åˆ™Lookaheadè¿”å›-1ã€‚ è°ƒç”¨Lookaheadç­‰åŒäºä»è¯­æ³•æ“ä½œä¸­è¯»å–yycharã€‚
+¿ÉÒÔÔÚÓï·¨²Ù×÷ÆÚ¼äµ÷ÓÃÇ°Õ°£¬ÒÔ¶ÁÈ¡£¨µ«²»ÏûºÄ£©yalex.Lex·µ»ØµÄµ±Ç°Ç°Õ°±ê¼ÇµÄÖµ¡£ 
+Èç¹ûÃ»ÓĞµ±Ç°µÄÇ°Õ°ÁîÅÆ£¨ÒòÎª½âÎöÆ÷Î´µ÷ÓÃLex»òÒÑÏûºÄÁË¶ÔLexµÄ×î½üµ÷ÓÃ·µ»ØµÄÁîÅÆ£©£¬
+ÔòLookahead·µ»Ø-1¡£ µ÷ÓÃLookaheadµÈÍ¬ÓÚ´ÓÓï·¨²Ù×÷ÖĞ¶ÁÈ¡yychar¡£
 
 
 Multiple grammars compiled into a single program should be placed in
@@ -81,8 +80,8 @@ goyacc sets the prefix, by default yy, that begins the names of
 symbols, including types, the parser, and the lexer, generated and
 referenced by yacc's generated code.  Setting it to distinct values
 allows multiple grammars to be placed in a single package.
-ç¼–è¯‘æˆä¸€ä¸ªç¨‹åºçš„å¤šä¸ªè¯­æ³•åº”æ”¾åœ¨ä¸åŒçš„ç¨‹åºåŒ…ä¸­ã€‚ å¦‚æœä¸å¯èƒ½ï¼Œåˆ™goyaccçš„â€œ -på‰ç¼€â€æ ‡å¿—è®¾ç½®å‰ç¼€ï¼ˆé»˜è®¤ä¸ºyyï¼‰ï¼Œ
-è¯¥å‰ç¼€ä»¥yaccçš„ç”Ÿæˆä»£ç ç”Ÿæˆå’Œå¼•ç”¨çš„ç¬¦å·åç§°å¼€å¤´ï¼ŒåŒ…æ‹¬ç±»å‹ï¼Œè§£æå™¨å’Œè¯æ³•åˆ†æå™¨ã€‚ 
-å°†å…¶è®¾ç½®ä¸ºä¸åŒçš„å€¼å¯ä»¥å°†å¤šä¸ªè¯­æ³•æ”¾åœ¨ä¸€ä¸ªåŒ…ä¸­ã€‚
+±àÒë³ÉÒ»¸ö³ÌĞòµÄ¶à¸öÓï·¨Ó¦·ÅÔÚ²»Í¬µÄ³ÌĞò°üÖĞ¡£ Èç¹û²»¿ÉÄÜ£¬ÔògoyaccµÄ¡° -pÇ°×º¡±±êÖ¾ÉèÖÃÇ°×º£¨Ä¬ÈÏÎªyy£©£¬
+¸ÃÇ°×ºÒÔyaccµÄÉú³É´úÂëÉú³ÉºÍÒıÓÃµÄ·ûºÅÃû³Æ¿ªÍ·£¬°üÀ¨ÀàĞÍ£¬½âÎöÆ÷ºÍ´Ê·¨·ÖÎöÆ÷¡£ 
+½«ÆäÉèÖÃÎª²»Í¬µÄÖµ¿ÉÒÔ½«¶à¸öÓï·¨·ÅÔÚÒ»¸ö°üÖĞ¡£
 */
 package main
