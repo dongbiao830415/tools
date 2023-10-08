@@ -52,6 +52,40 @@ func (f *Function) instanceType(id *ast.Ident) types.Type {
 	return f.typeOf(id)
 }
 
+// selection returns a *selection corresponding to f.info.Selections[selector]
+// with potential updates for type substitution.
+func (f *Function) selection(selector *ast.SelectorExpr) *selection {
+	sel := f.info.Selections[selector]
+	if sel == nil {
+		return nil
+	}
+
+	switch sel.Kind() {
+	case types.MethodExpr, types.MethodVal:
+		if recv := f.typ(sel.Recv()); recv != sel.Recv() {
+			// recv changed during type substitution.
+			pkg := f.declaredPackage().Pkg
+			obj, index, indirect := types.LookupFieldOrMethod(recv, true, pkg, sel.Obj().Name())
+
+			// sig replaces sel.Type(). See (types.Selection).Typ() for details.
+			sig := obj.Type().(*types.Signature)
+			sig = changeRecv(sig, newVar(sig.Recv().Name(), recv))
+			if sel.Kind() == types.MethodExpr {
+				sig = recvAsFirstArg(sig)
+			}
+			return &selection{
+				kind:     sel.Kind(),
+				recv:     recv,
+				typ:      sig,
+				obj:      obj,
+				index:    index,
+				indirect: indirect,
+			}
+		}
+	}
+	return toSelection(sel)
+}
+
 // Destinations associated with unlabelled for/switch/select stmts.
 // We push/pop one of these as we enter/leave each construct and for
 // each BranchStmt we scan for the innermost target of the right type.
@@ -217,7 +251,10 @@ func buildReferrers(f *Function) {
 }
 
 // mayNeedRuntimeTypes returns all of the types in the body of fn that might need runtime types.
+//
+// EXCLUSIVE_LOCKS_ACQUIRED(meth.Prog.methodsMu)
 func mayNeedRuntimeTypes(fn *Function) []types.Type {
+	// Collect all types that may need rtypes, i.e. those that flow into an interface.
 	var ts []types.Type
 	for _, bb := range fn.Blocks {
 		for _, instr := range bb.Instrs {
@@ -226,7 +263,21 @@ func mayNeedRuntimeTypes(fn *Function) []types.Type {
 			}
 		}
 	}
-	return ts
+
+	// Types that contain a parameterized type are considered to not be runtime types.
+	if fn.typeparams.Len() == 0 {
+		return ts // No potentially parameterized types.
+	}
+	// Filter parameterized types, in place.
+	fn.Prog.methodsMu.Lock()
+	defer fn.Prog.methodsMu.Unlock()
+	filtered := ts[:0]
+	for _, t := range ts {
+		if !fn.Prog.parameterized.isParameterized(t) {
+			filtered = append(filtered, t)
+		}
+	}
+	return filtered
 }
 
 // finishBody() finalizes the contents of the function after SSA code generation of its body.
@@ -331,7 +382,9 @@ func (pkg *Package) SetDebugMode(debug bool) {
 
 // debugInfo reports whether debug info is wanted for this function.
 func (f *Function) debugInfo() bool {
-	return f.Pkg != nil && f.Pkg.debug
+	// debug info for instantiations follows the debug info of their origin.
+	p := f.declaredPackage()
+	return p != nil && p.debug
 }
 
 // addNamedLocal creates a local variable, adds it to function f and
@@ -440,7 +493,7 @@ func (f *Function) RelString(from *types.Package) string {
 
 	// Thunk?
 	if f.method != nil {
-		return f.relMethod(from, f.method.Recv())
+		return f.relMethod(from, f.method.recv)
 	}
 
 	// Bound?
@@ -463,15 +516,15 @@ func (f *Function) relMethod(from *types.Package, recv types.Type) string {
 }
 
 // writeSignature writes to buf the signature sig in declaration syntax.
-func writeSignature(buf *bytes.Buffer, from *types.Package, name string, sig *types.Signature, params []*Parameter) {
+func writeSignature(buf *bytes.Buffer, from *types.Package, name string, sig *types.Signature) {
 	buf.WriteString("func ")
 	if recv := sig.Recv(); recv != nil {
 		buf.WriteString("(")
-		if n := params[0].Name(); n != "" {
-			buf.WriteString(n)
+		if name := recv.Name(); name != "" {
+			buf.WriteString(name)
 			buf.WriteString(" ")
 		}
-		types.WriteType(buf, params[0].Type(), types.RelativeTo(from))
+		types.WriteType(buf, recv.Type(), types.RelativeTo(from))
 		buf.WriteString(") ")
 	}
 	buf.WriteString(name)
@@ -484,8 +537,8 @@ func (fn *Function) declaredPackage() *Package {
 	switch {
 	case fn.Pkg != nil:
 		return fn.Pkg // non-generic function
-	case fn._Origin != nil:
-		return fn._Origin.Pkg // instance of a named generic function
+	case fn.topLevelOrigin != nil:
+		return fn.topLevelOrigin.Pkg // instance of a named generic function
 	case fn.parent != nil:
 		return fn.parent.declaredPackage() // instance of an anonymous [generic] function
 	default:
@@ -543,10 +596,10 @@ func WriteFunction(buf *bytes.Buffer, f *Function) {
 	if len(f.Locals) > 0 {
 		buf.WriteString("# Locals:\n")
 		for i, l := range f.Locals {
-			fmt.Fprintf(buf, "# % 3d:\t%s %s\n", i, l.Name(), relType(deref(l.Type()), from))
+			fmt.Fprintf(buf, "# % 3d:\t%s %s\n", i, l.Name(), relType(mustDeref(l.Type()), from))
 		}
 	}
-	writeSignature(buf, from, f.Name(), f.Signature, f.Params)
+	writeSignature(buf, from, f.Name(), f.Signature)
 	buf.WriteString(":\n")
 
 	if f.Blocks == nil {

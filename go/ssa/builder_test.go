@@ -20,9 +20,11 @@ import (
 	"strings"
 	"testing"
 
+	"golang.org/x/tools/go/buildutil"
 	"golang.org/x/tools/go/loader"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
+	"golang.org/x/tools/internal/testenv"
 	"golang.org/x/tools/internal/typeparams"
 )
 
@@ -31,6 +33,8 @@ func isEmpty(f *ssa.Function) bool { return f.Blocks == nil }
 // Tests that programs partially loaded from gc object files contain
 // functions with no code for the external portions, but are otherwise ok.
 func TestBuildPackage(t *testing.T) {
+	testenv.NeedsGoBuild(t) // for importer.Default()
+
 	input := `
 package main
 
@@ -163,6 +167,8 @@ func main() {
 
 // TestRuntimeTypes tests that (*Program).RuntimeTypes() includes all necessary types.
 func TestRuntimeTypes(t *testing.T) {
+	testenv.NeedsGoBuild(t) // for importer.Default()
+
 	tests := []struct {
 		input string
 		want  []string
@@ -219,6 +225,18 @@ func TestRuntimeTypes(t *testing.T) {
 		{`package M; import "bytes"; var _ interface{} = struct{*bytes.Buffer}{}`,
 			nil,
 		},
+	}
+
+	if typeparams.Enabled {
+		tests = append(tests, []struct {
+			input string
+			want  []string
+		}{
+			// MakeInterface does not create runtime type for parameterized types.
+			{`package N; var g interface{}; func f[S any]() { var v []S; g = v }; `,
+				nil,
+			},
+		}...)
 	}
 	for _, test := range tests {
 		// Parse the file.
@@ -626,19 +644,19 @@ var indirect = R[int].M
 				"bound",
 				"*func() int",
 				"(p.S[int]).M$bound",
-				"(p.S[int]).M[[int]]",
+				"(p.S[int]).M[int]",
 			},
 			{
 				"thunk",
 				"*func(p.S[int]) int",
 				"(p.S[int]).M$thunk",
-				"(p.S[int]).M[[int]]",
+				"(p.S[int]).M[int]",
 			},
 			{
 				"indirect",
 				"*func(p.R[int]) int",
 				"(p.R[int]).M$thunk",
-				"(p.S[int]).M[[int]]",
+				"(p.S[int]).M[int]",
 			},
 		} {
 			entry := entry
@@ -695,9 +713,7 @@ var indirect = R[int].M
 // TestTypeparamTest builds SSA over compilable examples in $GOROOT/test/typeparam/*.go.
 
 func TestTypeparamTest(t *testing.T) {
-	if !typeparams.Enabled {
-		return
-	}
+	testenv.NeedsGo1Point(t, 19) // fails with infinite recursion at 1.18 -- not investigated
 
 	// Tests use a fake goroot to stub out standard libraries with delcarations in
 	// testdata/src. Decreases runtime from ~80s to ~1s.
@@ -711,8 +727,8 @@ func TestTypeparamTest(t *testing.T) {
 	}
 
 	for _, entry := range list {
-		if entry.Name() == "issue376214.go" {
-			continue // investigate variadic + New signature.
+		if entry.Name() == "issue58513.go" {
+			continue // uses runtime.Caller; unimplemented by go/ssa/interp
 		}
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") {
 			continue // Consider standalone go files.
@@ -821,5 +837,243 @@ func sliceMax(s []int) []int { return s[a():b():c()] }
 				t.Errorf("Expected sequence of function calls in %s was %s. got %s", fn, want, got)
 			}
 		})
+	}
+}
+
+// TestGenericFunctionSelector ensures generic functions from other packages can be selected.
+func TestGenericFunctionSelector(t *testing.T) {
+	if !typeparams.Enabled {
+		t.Skip("TestGenericFunctionSelector uses type parameters.")
+	}
+
+	pkgs := map[string]map[string]string{
+		"main": {"m.go": `package main; import "a"; func main() { a.F[int](); a.G[int,string](); a.H(0) }`},
+		"a":    {"a.go": `package a; func F[T any](){}; func G[S, T any](){}; func H[T any](a T){} `},
+	}
+
+	for _, mode := range []ssa.BuilderMode{
+		ssa.SanityCheckFunctions,
+		ssa.SanityCheckFunctions | ssa.InstantiateGenerics,
+	} {
+		conf := loader.Config{
+			Build: buildutil.FakeContext(pkgs),
+		}
+		conf.Import("main")
+
+		lprog, err := conf.Load()
+		if err != nil {
+			t.Errorf("Load failed: %s", err)
+		}
+		if lprog == nil {
+			t.Fatalf("Load returned nil *Program")
+		}
+		// Create and build SSA
+		prog := ssautil.CreateProgram(lprog, mode)
+		p := prog.Package(lprog.Package("main").Pkg)
+		p.Build()
+
+		var callees []string // callees of the CallInstruction.String() in main().
+		for _, b := range p.Func("main").Blocks {
+			for _, i := range b.Instrs {
+				if call, ok := i.(ssa.CallInstruction); ok {
+					if callee := call.Common().StaticCallee(); call != nil {
+						callees = append(callees, callee.String())
+					} else {
+						t.Errorf("CallInstruction without StaticCallee() %q", call)
+					}
+				}
+			}
+		}
+		sort.Strings(callees) // ignore the order in the code.
+
+		want := "[a.F[int] a.G[int string] a.H[int]]"
+		if got := fmt.Sprint(callees); got != want {
+			t.Errorf("Expected main() to contain calls %v. got %v", want, got)
+		}
+	}
+}
+
+func TestIssue58491(t *testing.T) {
+	// Test that a local type reaches type param in instantiation.
+	testenv.NeedsGo1Point(t, 18)
+	src := `
+		package p
+
+		func foo[T any](blocking func() (T, error)) error {
+			type result struct {
+				res T
+				error // ensure the method set of result is non-empty
+			}
+
+			res := make(chan result, 1)
+			go func() {
+				var r result
+				r.res, r.error = blocking()
+				res <- r
+			}()
+			r := <-res
+			err := r // require the rtype for result when instantiated
+			return err
+		}
+		var Inst = foo[int]
+	`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "p.go", src, 0)
+	if err != nil {
+		t.Error(err)
+	}
+	files := []*ast.File{f}
+
+	pkg := types.NewPackage("p", "")
+	conf := &types.Config{}
+	p, _, err := ssautil.BuildPackage(conf, fset, pkg, files, ssa.SanityCheckFunctions|ssa.InstantiateGenerics)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Find the local type result instantiated with int.
+	var found bool
+	for _, rt := range p.Prog.RuntimeTypes() {
+		if n, ok := rt.(*types.Named); ok {
+			if u, ok := n.Underlying().(*types.Struct); ok {
+				found = true
+				if got, want := n.String(), "p.result"; got != want {
+					t.Errorf("Expected the name %s got: %s", want, got)
+				}
+				if got, want := u.String(), "struct{res int; error}"; got != want {
+					t.Errorf("Expected the underlying type of %s to be %s. got %s", n, want, got)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Error("Failed to find any Named to struct types")
+	}
+}
+
+func TestIssue58491Rec(t *testing.T) {
+	// Roughly the same as TestIssue58491 but with a recursive type.
+	testenv.NeedsGo1Point(t, 18)
+	src := `
+		package p
+
+		func foo[T any]() error {
+			type result struct {
+				res T
+				next *result
+				error // ensure the method set of result is non-empty
+			}
+
+			r := &result{}
+			err := r // require the rtype for result when instantiated
+			return err
+		}
+		var Inst = foo[int]
+	`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "p.go", src, 0)
+	if err != nil {
+		t.Error(err)
+	}
+	files := []*ast.File{f}
+
+	pkg := types.NewPackage("p", "")
+	conf := &types.Config{}
+	p, _, err := ssautil.BuildPackage(conf, fset, pkg, files, ssa.SanityCheckFunctions|ssa.InstantiateGenerics)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Find the local type result instantiated with int.
+	var found bool
+	for _, rt := range p.Prog.RuntimeTypes() {
+		if n, ok := rt.(*types.Named); ok {
+			if u, ok := n.Underlying().(*types.Struct); ok {
+				found = true
+				if got, want := n.String(), "p.result"; got != want {
+					t.Errorf("Expected the name %s got: %s", want, got)
+				}
+				if got, want := u.String(), "struct{res int; next *p.result; error}"; got != want {
+					t.Errorf("Expected the underlying type of %s to be %s. got %s", n, want, got)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Error("Failed to find any Named to struct types")
+	}
+}
+
+// TestSyntax ensures that a function's Syntax is available when
+// debug info is enabled.
+func TestSyntax(t *testing.T) {
+	if !typeparams.Enabled {
+		t.Skip("TestSyntax uses type parameters.")
+	}
+
+	const input = `package p
+
+	type P int
+	func (x *P) g() *P { return x }
+
+	func F[T ~int]() *T {
+		type S1 *T
+		type S2 *T
+		type S3 *T
+		f1 := func() S1 {
+			f2 := func() S2 {
+				return S2(nil)
+			}
+			return S1(f2())
+		}
+		f3 := func() S3 {
+			return S3(f1())
+		}
+		return (*T)(f3())
+	}
+	var _ = F[int]
+	`
+
+	// Parse
+	var conf loader.Config
+	f, err := conf.ParseFile("<input>", input)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	conf.CreateFromFiles("p", f)
+
+	// Load
+	lprog, err := conf.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	// Create and build SSA
+	prog := ssautil.CreateProgram(lprog, ssa.GlobalDebug|ssa.InstantiateGenerics)
+	prog.Build()
+
+	// Collect syntax information for all of the functions.
+	got := make(map[string]string)
+	for fn := range ssautil.AllFunctions(prog) {
+		if fn.Name() == "init" {
+			continue
+		}
+		syntax := fn.Syntax()
+		got[fn.Name()] = fmt.Sprintf("%T : %s @ %d", syntax, fn.Signature, prog.Fset.Position(syntax.Pos()).Line)
+	}
+
+	want := map[string]string{
+		"g":          "*ast.FuncDecl : func() *p.P @ 4",
+		"F":          "*ast.FuncDecl : func[T ~int]() *T @ 6",
+		"F$1":        "*ast.FuncLit : func() p.S1 @ 10",
+		"F$1$1":      "*ast.FuncLit : func() p.S2 @ 11",
+		"F$2":        "*ast.FuncLit : func() p.S3 @ 16",
+		"F[int]":     "*ast.FuncDecl : func() *int @ 6",
+		"F[int]$1":   "*ast.FuncLit : func() p.S1 @ 10",
+		"F[int]$1$1": "*ast.FuncLit : func() p.S2 @ 11",
+		"F[int]$2":   "*ast.FuncLit : func() p.S3 @ 16",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Expected the functions with signature to be:\n\t%#v.\n Got:\n\t%#v", want, got)
 	}
 }

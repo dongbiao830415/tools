@@ -34,20 +34,26 @@ your workspace root to the directory containing the `go.work` file.
 
 For example, suppose this repo is checked out into the `$WORK/tools` directory.
 We can work on both `golang.org/x/tools` and `golang.org/x/tools/gopls`
-simultaneously by creating a `go.work` file:
+simultaneously by creating a `go.work` file using `go work init`, followed by
+`go work use MODULE_DIRECTORIES...` to add directories containing `go.mod` files to the
+workspace:
 
-```
+```sh
 cd $WORK
 go work init
-go work use tools tools/gopls
+go work use ./tools/ ./tools/gopls/
 ```
 
 ...followed by opening the `$WORK` directory in our editor.
 
-#### Experimental workspace module (Go 1.17 and earlier)
+#### DEPRECATED: Experimental workspace module (Go 1.17 and earlier)
+
+**This feature is deprecated and will be removed in future versions of gopls.
+Please see [issue #52897](https://go.dev/issue/52897) for additional
+information.**
 
 With earlier versions of Go, `gopls` can simulate multi-module workspaces by
-creating a synthetic module requiring the the modules in the workspace root.
+creating a synthetic module requiring the modules in the workspace root.
 See [the design document](https://github.com/golang/proposal/blob/master/design/37720-gopls-workspaces.md)
 for more information.
 

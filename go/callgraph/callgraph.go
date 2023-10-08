@@ -37,6 +37,8 @@ package callgraph // import "golang.org/x/tools/go/callgraph"
 // More generally, we could eliminate "uninteresting" nodes such as
 // nodes from packages we don't care about.
 
+// TODO(zpavlinovic): decide how callgraphs handle calls to and from generic function bodies.
+
 import (
 	"fmt"
 	"go/token"
@@ -62,6 +64,7 @@ func New(root *ssa.Function) *Graph {
 }
 
 // CreateNode returns the Node for fn, creating it if not present.
+// The root node may have fn=nil.
 func (g *Graph) CreateNode(fn *ssa.Function) *Node {
 	n, ok := g.Nodes[fn]
 	if !ok {

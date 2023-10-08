@@ -9,6 +9,7 @@ import (
 
 	"golang.org/x/tools/go/callgraph"
 	"golang.org/x/tools/go/ssa"
+	"golang.org/x/tools/internal/typeparams"
 )
 
 func canAlias(n1, n2 node) bool {
@@ -56,24 +57,7 @@ func hasInFlow(n node) bool {
 		return true
 	}
 
-	return isInterface(t) || isFunction(t)
-}
-
-// hasInitialTypes check if a node can have initial types.
-// Returns true iff `n` is not a panic or recover node as
-// those are artificial.
-func hasInitialTypes(n node) bool {
-	switch n.(type) {
-	case panicArg, recoverReturn:
-		return false
-	default:
-		return true
-	}
-}
-
-func isInterface(t types.Type) bool {
-	_, ok := t.Underlying().(*types.Interface)
-	return ok
+	return types.IsInterface(t) || isFunction(t)
 }
 
 func isFunction(t types.Type) bool {
@@ -98,7 +82,7 @@ func interfaceUnderPtr(t types.Type) types.Type {
 			return nil
 		}
 
-		if isInterface(p.Elem()) {
+		if types.IsInterface(p.Elem()) {
 			return p.Elem()
 		}
 
@@ -134,19 +118,34 @@ func functionUnderPtr(t types.Type) types.Type {
 }
 
 // sliceArrayElem returns the element type of type `t` that is
-// expected to be a (pointer to) array or slice, consistent with
+// expected to be a (pointer to) array, slice or string, consistent with
 // the ssa.Index and ssa.IndexAddr instructions. Panics otherwise.
 func sliceArrayElem(t types.Type) types.Type {
-	u := t.Underlying()
-
-	if p, ok := u.(*types.Pointer); ok {
-		u = p.Elem().Underlying()
+	switch u := t.Underlying().(type) {
+	case *types.Pointer:
+		switch e := u.Elem().Underlying().(type) {
+		case *types.Array:
+			return e.Elem()
+		case *types.Interface:
+			return sliceArrayElem(e) // e is a type param with matching element types.
+		default:
+			panic(t)
+		}
+	case *types.Array:
+		return u.Elem()
+	case *types.Slice:
+		return u.Elem()
+	case *types.Basic:
+		return types.Typ[types.Byte]
+	case *types.Interface: // type param.
+		terms, err := typeparams.InterfaceTermSet(u)
+		if err != nil || len(terms) == 0 {
+			panic(t)
+		}
+		return sliceArrayElem(terms[0].Type()) // Element types must match.
+	default:
+		panic(t)
 	}
-
-	if a, ok := u.(*types.Array); ok {
-		return a.Elem()
-	}
-	return u.(*types.Slice).Elem()
 }
 
 // siteCallees computes a set of callees for call site `c` given program `callgraph`.

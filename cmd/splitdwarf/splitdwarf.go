@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !js && !nacl && !plan9 && !solaris && !windows
-// +build !js,!nacl,!plan9,!solaris,!windows
+//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd
+// +build aix darwin dragonfly freebsd linux netbsd openbsd
 
 /*
 Splitdwarf uncompresses and copies the DWARF segment of a Mach-O
@@ -182,7 +182,7 @@ for input_exe need to allow writing.
 		oldsym := symtab.Syms[ii]
 		newsymtab.Syms = append(newsymtab.Syms, oldsym)
 
-		linkeditsyms = append(linkeditsyms, macho.Nlist64{Name: uint32(linkeditstringcur),
+		linkeditsyms = append(linkeditsyms, macho.Nlist64{Name: linkeditstringcur,
 			Type: oldsym.Type, Sect: oldsym.Sect, Desc: oldsym.Desc, Value: oldsym.Value})
 		linkeditstringcur += uint32(len(oldsym.Name)) + 1
 		linkeditstrings = append(linkeditstrings, oldsym.Name)

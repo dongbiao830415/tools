@@ -12,7 +12,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -107,7 +106,7 @@ func docmd(cmd []string, dir string) int {
 	return st
 }
 
-// docodmout forks and execs command 'cmd' in dir 'dir', redirecting
+// docmdout forks and execs command 'cmd' in dir 'dir', redirecting
 // stderr and stdout from the execution to file 'outfile'.
 func docmdout(cmd []string, dir string, outfile string) int {
 	of, err := os.OpenFile(outfile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
@@ -196,7 +195,7 @@ func (c *config) gen(singlepk int, singlefn int) {
 func (c *config) action(cmd []string, outfile string, emitout bool) int {
 	st := docmdout(cmd, c.gendir, outfile)
 	if emitout {
-		content, err := ioutil.ReadFile(outfile)
+		content, err := os.ReadFile(outfile)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -405,7 +404,7 @@ func main() {
 	}
 	verb(1, "in main, verblevel=%d", *verbflag)
 
-	tmpdir, err := ioutil.TempDir("", "fuzzrun")
+	tmpdir, err := os.MkdirTemp("", "fuzzrun")
 	if err != nil {
 		fatal("creation of tempdir failed: %v", err)
 	}

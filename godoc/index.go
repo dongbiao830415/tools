@@ -50,6 +50,7 @@ import (
 	"index/suffixarray"
 	"io"
 	"log"
+	"math"
 	"os"
 	pathpkg "path"
 	"path/filepath"
@@ -161,7 +162,7 @@ func newKindRun(h RunList) interface{} {
 		// bit is always the same for all infos in one
 		// list we can simply compare the entire info.
 		k := 0
-		prev := SpotInfo(1<<32 - 1) // an unlikely value
+		prev := SpotInfo(math.MaxUint32) // an unlikely value
 		for _, x := range run {
 			if x != prev {
 				run[k] = x
@@ -627,7 +628,7 @@ func (x *Indexer) addFile(f vfs.ReadSeekCloser, filename string, goFile bool) (f
 
 	// The file set's base offset and x.sources size must be in lock-step;
 	// this permits the direct mapping of suffix array lookup results to
-	// to corresponding Pos values.
+	// corresponding Pos values.
 	//
 	// When a file is added to the file set, its offset base increases by
 	// the size of the file + 1; and the initial base offset is 1. Add an
@@ -1421,7 +1422,7 @@ func (x *Index) LookupRegexp(r *regexp.Regexp, n int) (found int, result []FileL
 	return
 }
 
-// InvalidateIndex should be called whenever any of the file systems
+// invalidateIndex should be called whenever any of the file systems
 // under godoc's observation change so that the indexer is kicked on.
 func (c *Corpus) invalidateIndex() {
 	c.fsModified.Set(nil)
