@@ -12,8 +12,8 @@ import (
 	"unicode"
 
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/snippet"
 	"golang.org/x/tools/gopls/internal/lsp/source"
+	"golang.org/x/tools/gopls/internal/lsp/source/completion/snippet"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/typeparams"
 )
@@ -21,7 +21,7 @@ import (
 // literal generates composite literal, function literal, and make()
 // completion items.
 func (c *completer) literal(ctx context.Context, literalType types.Type, imp *importInfo) {
-	if !c.opts.literal {
+	if !c.opts.snippets {
 		return
 	}
 

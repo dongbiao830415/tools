@@ -18,10 +18,13 @@ import (
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/ast/astutil"
-	"golang.org/x/tools/gopls/internal/bug"
-	"golang.org/x/tools/gopls/internal/lsp/analysis/stubmethods"
+	"golang.org/x/tools/gopls/internal/analysis/stubmethods"
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/lsp/cache"
+	"golang.org/x/tools/gopls/internal/lsp/cache/metadata"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/safetoken"
+	"golang.org/x/tools/gopls/internal/util/bug"
+	"golang.org/x/tools/gopls/internal/util/safetoken"
 	"golang.org/x/tools/internal/diff"
 	"golang.org/x/tools/internal/tokeninternal"
 	"golang.org/x/tools/internal/typeparams"
@@ -30,25 +33,29 @@ import (
 // stubSuggestedFixFunc returns a suggested fix to declare the missing
 // methods of the concrete type that is assigned to an interface type
 // at the cursor position.
-func stubSuggestedFixFunc(ctx context.Context, snapshot Snapshot, fh FileHandle, rng protocol.Range) (*token.FileSet, *analysis.SuggestedFix, error) {
+func stubSuggestedFixFunc(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, rng protocol.Range) ([]protocol.TextDocumentEdit, error) {
 	pkg, pgf, err := NarrowestPackageForFile(ctx, snapshot, fh.URI())
 	if err != nil {
-		return nil, nil, fmt.Errorf("GetTypedFile: %w", err)
+		return nil, fmt.Errorf("GetTypedFile: %w", err)
 	}
 	start, end, err := pgf.RangePos(rng)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	nodes, _ := astutil.PathEnclosingInterval(pgf.File, start, end)
 	si := stubmethods.GetStubInfo(pkg.FileSet(), pkg.GetTypesInfo(), nodes, start)
 	if si == nil {
-		return nil, nil, fmt.Errorf("nil interface request")
+		return nil, fmt.Errorf("nil interface request")
 	}
-	return stub(ctx, snapshot, si)
+	fset, fix, err := stub(ctx, snapshot, si)
+	if err != nil {
+		return nil, err
+	}
+	return suggestedFixToEdits(ctx, snapshot, fset, fix)
 }
 
 // stub returns a suggested fix to declare the missing methods of si.Concrete.
-func stub(ctx context.Context, snapshot Snapshot, si *stubmethods.StubInfo) (*token.FileSet, *analysis.SuggestedFix, error) {
+func stub(ctx context.Context, snapshot *cache.Snapshot, si *stubmethods.StubInfo) (*token.FileSet, *analysis.SuggestedFix, error) {
 	// A function-local type cannot be stubbed
 	// since there's nowhere to put the methods.
 	conc := si.Concrete.Obj()
@@ -68,7 +75,7 @@ func stub(ctx context.Context, snapshot Snapshot, si *stubmethods.StubInfo) (*to
 	// Build import environment for the declaring file.
 	importEnv := make(map[ImportPath]string) // value is local name
 	for _, imp := range declPGF.File.Imports {
-		importPath := UnquoteImportPath(imp)
+		importPath := metadata.UnquoteImportPath(imp)
 		var name string
 		if imp.Name != nil {
 			name = imp.Name.Name

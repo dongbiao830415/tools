@@ -25,18 +25,20 @@ import (
 
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/tools/go/types/objectpath"
-	"golang.org/x/tools/gopls/internal/bug"
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/lsp/cache"
+	"golang.org/x/tools/gopls/internal/lsp/cache/metadata"
+	"golang.org/x/tools/gopls/internal/lsp/cache/methodsets"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/safetoken"
-	"golang.org/x/tools/gopls/internal/lsp/source/methodsets"
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/util/bug"
+	"golang.org/x/tools/gopls/internal/util/safetoken"
 	"golang.org/x/tools/internal/event"
 )
 
 // References returns a list of all references (sorted with
 // definitions before uses) to the object denoted by the identifier at
 // the given file/position, searching the entire workspace.
-func References(ctx context.Context, snapshot Snapshot, fh FileHandle, pp protocol.Position, includeDeclaration bool) ([]protocol.Location, error) {
+func References(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, pp protocol.Position, includeDeclaration bool) ([]protocol.Location, error) {
 	references, err := references(ctx, snapshot, fh, pp, includeDeclaration)
 	if err != nil {
 		return nil, err
@@ -59,7 +61,7 @@ type reference struct {
 // references returns a list of all references (sorted with
 // definitions before uses) to the object denoted by the identifier at
 // the given file/position, searching the entire workspace.
-func references(ctx context.Context, snapshot Snapshot, f FileHandle, pp protocol.Position, includeDeclaration bool) ([]reference, error) {
+func references(ctx context.Context, snapshot *cache.Snapshot, f file.Handle, pp protocol.Position, includeDeclaration bool) ([]reference, error) {
 	ctx, done := event.Start(ctx, "source.references")
 	defer done()
 
@@ -106,7 +108,7 @@ func references(ctx context.Context, snapshot Snapshot, f FileHandle, pp protoco
 // declaration of the specified name and uri by searching among the
 // import declarations of all packages that directly import the target
 // package.
-func packageReferences(ctx context.Context, snapshot Snapshot, uri span.URI) ([]reference, error) {
+func packageReferences(ctx context.Context, snapshot *cache.Snapshot, uri protocol.DocumentURI) ([]reference, error) {
 	metas, err := snapshot.MetadataForFile(ctx, uri)
 	if err != nil {
 		return nil, err
@@ -148,9 +150,9 @@ func packageReferences(ctx context.Context, snapshot Snapshot, uri span.URI) ([]
 		if err != nil {
 			return nil, err
 		}
-		workspaceMap := make(map[PackageID]*Metadata, len(workspace))
-		for _, m := range workspace {
-			workspaceMap[m.ID] = m
+		workspaceMap := make(map[PackageID]*metadata.Package, len(workspace))
+		for _, mp := range workspace {
+			workspaceMap[mp.ID] = mp
 		}
 
 		for _, rdep := range rdeps {
@@ -167,7 +169,7 @@ func packageReferences(ctx context.Context, snapshot Snapshot, uri span.URI) ([]
 					return nil, err
 				}
 				for _, imp := range f.File.Imports {
-					if rdep.DepsByImpPath[UnquoteImportPath(imp)] == narrowest.ID {
+					if rdep.DepsByImpPath[metadata.UnquoteImportPath(imp)] == narrowest.ID {
 						refs = append(refs, reference{
 							isDeclaration: false,
 							location:      mustLocation(f, imp),
@@ -206,7 +208,7 @@ func packageReferences(ctx context.Context, snapshot Snapshot, uri span.URI) ([]
 }
 
 // ordinaryReferences computes references for all ordinary objects (not package declarations).
-func ordinaryReferences(ctx context.Context, snapshot Snapshot, uri span.URI, pp protocol.Position) ([]reference, error) {
+func ordinaryReferences(ctx context.Context, snapshot *cache.Snapshot, uri protocol.DocumentURI, pp protocol.Position) ([]reference, error) {
 	// Strategy: use the reference information computed by the
 	// type checker to find the declaration. First type-check this
 	// package to find the declaration, then type check the
@@ -259,7 +261,7 @@ func ordinaryReferences(ctx context.Context, snapshot Snapshot, uri span.URI, pp
 	// Find metadata of all packages containing the object's defining file.
 	// This may include the query pkg, and possibly other variants.
 	declPosn := safetoken.StartPosition(pkg.FileSet(), obj.Pos())
-	declURI := span.URIFromPath(declPosn.Filename)
+	declURI := protocol.URIFromPath(declPosn.Filename)
 	variants, err := snapshot.MetadataForFile(ctx, declURI)
 	if err != nil {
 		return nil, err
@@ -272,7 +274,7 @@ func ordinaryReferences(ctx context.Context, snapshot Snapshot, uri span.URI, pp
 	// Is object exported?
 	// If so, compute scope and targets of the global search.
 	var (
-		globalScope   = make(map[PackageID]*Metadata) // (excludes ITVs)
+		globalScope   = make(map[PackageID]*metadata.Package) // (excludes ITVs)
 		globalTargets map[PackagePath]map[objectpath.Path]unit
 		expansions    = make(map[PackageID]unit) // packages that caused search expansion
 	)
@@ -290,11 +292,11 @@ func ordinaryReferences(ctx context.Context, snapshot Snapshot, uri span.URI, pp
 		if err != nil {
 			return nil, err
 		}
-		workspaceMap := make(map[PackageID]*Metadata, len(workspace))
+		workspaceMap := make(map[PackageID]*metadata.Package, len(workspace))
 		workspaceIDs := make([]PackageID, 0, len(workspace))
-		for _, m := range workspace {
-			workspaceMap[m.ID] = m
-			workspaceIDs = append(workspaceIDs, m.ID)
+		for _, mp := range workspace {
+			workspaceMap[mp.ID] = mp
+			workspaceIDs = append(workspaceIDs, mp.ID)
 		}
 
 		// addRdeps expands the global scope to include the
@@ -333,8 +335,8 @@ func ordinaryReferences(ctx context.Context, snapshot Snapshot, uri span.URI, pp
 		// The scope is the union of rdeps of each variant.
 		// (Each set is disjoint so there's no benefit to
 		// combining the metadata graph traversals.)
-		for _, m := range variants {
-			if err := addRdeps(m.ID, transitive); err != nil {
+		for _, mp := range variants {
+			if err := addRdeps(mp.ID, transitive); err != nil {
 				return nil, err
 			}
 		}
@@ -384,7 +386,7 @@ func ordinaryReferences(ctx context.Context, snapshot Snapshot, uri span.URI, pp
 
 	// Compute local references for each variant.
 	// The target objects are identified by (URI, offset).
-	for _, m := range variants {
+	for _, mp := range variants {
 		// We want the ordinary importable package,
 		// plus any test-augmented variants, since
 		// declarations in _test.go files may change
@@ -394,13 +396,13 @@ func ordinaryReferences(ctx context.Context, snapshot Snapshot, uri span.URI, pp
 		// But we don't need intermediate test variants,
 		// as their local references will be covered
 		// already by other variants.
-		if m.IsIntermediateTestVariant() {
+		if mp.IsIntermediateTestVariant() {
 			continue
 		}
-		m := m
+		mp := mp
 		group.Go(func() error {
 			// TODO(adonovan): opt: batch these TypeChecks.
-			pkgs, err := snapshot.TypeCheck(ctx, m.ID)
+			pkgs, err := snapshot.TypeCheck(ctx, mp.ID)
 			if err != nil {
 				return err
 			}
@@ -504,7 +506,7 @@ func ordinaryReferences(ctx context.Context, snapshot Snapshot, uri span.URI, pp
 // The scope is expanded by a sequence of calls (not concurrent) to addRdeps.
 //
 // recv is the method's effective receiver type, for method-set computations.
-func expandMethodSearch(ctx context.Context, snapshot Snapshot, workspaceIDs []PackageID, method *types.Func, recv types.Type, addRdeps func(id PackageID, transitive bool) error, targets map[PackagePath]map[objectpath.Path]unit, expansions map[PackageID]unit) error {
+func expandMethodSearch(ctx context.Context, snapshot *cache.Snapshot, workspaceIDs []PackageID, method *types.Func, recv types.Type, addRdeps func(id PackageID, transitive bool) error, targets map[PackagePath]map[objectpath.Path]unit, expansions map[PackageID]unit) error {
 	// Compute the method-set fingerprint used as a key to the global search.
 	key, hasMethods := methodsets.KeyOf(recv)
 	if !hasMethods {
@@ -561,7 +563,7 @@ func expandMethodSearch(ctx context.Context, snapshot Snapshot, workspaceIDs []P
 // localReferences traverses syntax and reports each reference to one
 // of the target objects, or (if correspond is set) an object that
 // corresponds to one of them via interface satisfaction.
-func localReferences(pkg Package, targets map[types.Object]bool, correspond bool, report func(loc protocol.Location, isDecl bool)) error {
+func localReferences(pkg *cache.Package, targets map[types.Object]bool, correspond bool, report func(loc protocol.Location, isDecl bool)) error {
 	// If we're searching for references to a method optionally
 	// broaden the search to include references to corresponding
 	// methods of mutually assignable receiver types.
@@ -668,7 +670,7 @@ func objectsAt(info *types.Info, file *ast.File, pos token.Pos) (map[types.Objec
 		// Look up the implicit *types.PkgName.
 		obj := info.Implicits[leaf]
 		if obj == nil {
-			return nil, nil, fmt.Errorf("%w for import %s", errNoObjectFound, UnquoteImportPath(leaf))
+			return nil, nil, fmt.Errorf("%w for import %s", errNoObjectFound, metadata.UnquoteImportPath(leaf))
 		}
 		targets[obj] = leaf
 	}

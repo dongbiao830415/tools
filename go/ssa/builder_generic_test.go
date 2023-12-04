@@ -16,7 +16,6 @@ import (
 	"golang.org/x/tools/go/expect"
 	"golang.org/x/tools/go/loader"
 	"golang.org/x/tools/go/ssa"
-	"golang.org/x/tools/internal/typeparams"
 )
 
 // TestGenericBodies tests that bodies of generic functions and methods containing
@@ -32,9 +31,6 @@ import (
 // serialized using go/types.Type.String().
 // See x/tools/go/expect for details on the syntax.
 func TestGenericBodies(t *testing.T) {
-	if !typeparams.Enabled {
-		t.Skip("TestGenericBodies requires type parameters")
-	}
 	for _, contents := range []string{
 		`
 		package p00
@@ -515,48 +511,19 @@ func TestGenericBodies(t *testing.T) {
 			p := prog.Package(lprog.Package(pkgname).Pkg)
 			p.Build()
 
-			// Collect calls to the builtin print function.
-			probes := make(map[*ssa.CallCommon]*ssa.Function)
-			for _, mem := range p.Members {
-				if fn, ok := mem.(*ssa.Function); ok {
-					for _, bb := range fn.Blocks {
-						for _, i := range bb.Instrs {
-							if i, ok := i.(ssa.CallInstruction); ok {
-								call := i.Common()
-								if b, ok := call.Value.(*ssa.Builtin); ok && b.Name() == "print" {
-									probes[i.Common()] = fn
-								}
-							}
-						}
-					}
-				}
-			}
-
 			// Collect all notes in f, i.e. comments starting with "//@ types".
 			notes, err := expect.ExtractGo(prog.Fset, f)
 			if err != nil {
 				t.Errorf("expect.ExtractGo: %v", err)
 			}
 
-			// Matches each probe with a note that has the same line.
-			sameLine := func(x, y token.Pos) bool {
-				xp := prog.Fset.Position(x)
-				yp := prog.Fset.Position(y)
-				return xp.Filename == yp.Filename && xp.Line == yp.Line
-			}
-			expectations := make(map[*ssa.CallCommon]*expect.Note)
+			// Collect calls to the builtin print function.
+			probes := callsTo(p, "print")
+			expectations := matchNotes(prog.Fset, notes, probes)
+
 			for call := range probes {
-				var match *expect.Note
-				for _, note := range notes {
-					if note.Name == "types" && sameLine(call.Pos(), note.Pos) {
-						match = note // first match is good enough.
-						break
-					}
-				}
-				if match != nil {
-					expectations[call] = match
-				} else {
-					t.Errorf("Unmatched probe: %v", call)
+				if expectations[call] == nil {
+					t.Errorf("Unmatched call: %v", call)
 				}
 			}
 
@@ -575,11 +542,50 @@ func TestGenericBodies(t *testing.T) {
 	}
 }
 
+// callsTo finds all calls to an SSA value named fname,
+// and returns a map from each call site to its enclosing function.
+func callsTo(p *ssa.Package, fname string) map[*ssa.CallCommon]*ssa.Function {
+	callsites := make(map[*ssa.CallCommon]*ssa.Function)
+	for _, mem := range p.Members {
+		if fn, ok := mem.(*ssa.Function); ok {
+			for _, bb := range fn.Blocks {
+				for _, i := range bb.Instrs {
+					if i, ok := i.(ssa.CallInstruction); ok {
+						call := i.Common()
+						if call.Value.Name() == fname {
+							callsites[call] = fn
+						}
+					}
+				}
+			}
+		}
+	}
+	return callsites
+}
+
+// matchNodes returns a mapping from call sites (found by callsTo)
+// to the first "//@ note" comment on the same line.
+func matchNotes(fset *token.FileSet, notes []*expect.Note, calls map[*ssa.CallCommon]*ssa.Function) map[*ssa.CallCommon]*expect.Note {
+	// Matches each probe with a note that has the same line.
+	sameLine := func(x, y token.Pos) bool {
+		xp := fset.Position(x)
+		yp := fset.Position(y)
+		return xp.Filename == yp.Filename && xp.Line == yp.Line
+	}
+	expectations := make(map[*ssa.CallCommon]*expect.Note)
+	for call := range calls {
+		for _, note := range notes {
+			if sameLine(call.Pos(), note.Pos) {
+				expectations[call] = note
+				break // first match is good enough.
+			}
+		}
+	}
+	return expectations
+}
+
 // TestInstructionString tests serializing instructions via Instruction.String().
 func TestInstructionString(t *testing.T) {
-	if !typeparams.Enabled {
-		t.Skip("TestInstructionString requires type parameters")
-	}
 	// Tests (ssa.Instruction).String(). Instructions are from a single go file.
 	// The Instructions tested are those that match a comment of the form:
 	//

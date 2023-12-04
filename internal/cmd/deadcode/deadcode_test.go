@@ -45,35 +45,6 @@ func Test(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			// Parse archive comment as directives of these forms:
-			//
-			//    deadcode args...		command-line arguments
-			//  [!]want "quoted"		expected/unwanted string in output
-			//
-			var args []string
-			want := make(map[string]bool) // string -> sense
-			for _, line := range strings.Split(string(ar.Comment), "\n") {
-				line = strings.TrimSpace(line)
-				if line == "" || line[0] == '#' {
-					continue // skip blanks and comments
-				}
-
-				fields := strings.Fields(line)
-				switch kind := fields[0]; kind {
-				case "deadcode":
-					args = fields[1:] // lossy wrt spaces
-				case "want", "!want":
-					rest := line[len(kind):]
-					str, err := strconv.Unquote(strings.TrimSpace(rest))
-					if err != nil {
-						t.Fatalf("bad %s directive <<%s>>", kind, line)
-					}
-					want[str] = kind[0] != '!'
-				default:
-					t.Fatalf("%s: invalid directive %q", filename, kind)
-				}
-			}
-
 			// Write the archive files to the temp directory.
 			tmpdir := t.TempDir()
 			for _, f := range ar.Files {
@@ -86,31 +57,89 @@ func Test(t *testing.T) {
 				}
 			}
 
-			// Run the command.
-			cmd := exec.Command(exe, args...)
-			cmd.Stdout = new(bytes.Buffer)
-			cmd.Stderr = new(bytes.Buffer)
-			cmd.Dir = tmpdir
-			cmd.Env = append(os.Environ(), "GOPROXY=", "GO111MODULE=on")
-			if err := cmd.Run(); err != nil {
-				t.Fatalf("deadcode failed: %v (stderr=%s)", err, cmd.Stderr)
+			// Parse archive comment as directives of these forms:
+			//
+			//  [!]deadcode args...	command-line arguments
+			//  [!]want arg		expected/unwanted string in output (or stderr)
+			//
+			// Args may be Go-quoted strings.
+			type testcase struct {
+				linenum int
+				args    []string
+				wantErr bool
+				want    map[string]bool // string -> sense
+			}
+			var cases []*testcase
+			var current *testcase
+			for i, line := range strings.Split(string(ar.Comment), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" || line[0] == '#' {
+					continue // skip blanks and comments
+				}
+
+				words, err := words(line)
+				if err != nil {
+					t.Fatalf("cannot break line into words: %v (%s)", err, line)
+				}
+				switch kind := words[0]; kind {
+				case "deadcode", "!deadcode":
+					current = &testcase{
+						linenum: i + 1,
+						want:    make(map[string]bool),
+						args:    words[1:],
+						wantErr: kind[0] == '!',
+					}
+					cases = append(cases, current)
+				case "want", "!want":
+					if current == nil {
+						t.Fatalf("'want' directive must be after 'deadcode'")
+					}
+					if len(words) != 2 {
+						t.Fatalf("'want' directive needs argument <<%s>>", line)
+					}
+					current.want[words[1]] = kind[0] != '!'
+				default:
+					t.Fatalf("%s: invalid directive %q", filename, kind)
+				}
 			}
 
-			// Check each want directive.
-			got := fmt.Sprint(cmd.Stdout)
-			for str, sense := range want {
-				ok := true
-				if strings.Contains(got, str) != sense {
-					if sense {
-						t.Errorf("missing %q", str)
+			for _, tc := range cases {
+				t.Run(fmt.Sprintf("L%d", tc.linenum), func(t *testing.T) {
+					// Run the command.
+					cmd := exec.Command(exe, tc.args...)
+					cmd.Stdout = new(bytes.Buffer)
+					cmd.Stderr = new(bytes.Buffer)
+					cmd.Dir = tmpdir
+					cmd.Env = append(os.Environ(), "GOPROXY=", "GO111MODULE=on")
+					var got string
+					if err := cmd.Run(); err != nil {
+						if !tc.wantErr {
+							t.Fatalf("deadcode failed: %v (stderr=%s)", err, cmd.Stderr)
+						}
+						got = fmt.Sprint(cmd.Stderr)
 					} else {
-						t.Errorf("unwanted %q", str)
+						if tc.wantErr {
+							t.Fatalf("deadcode succeeded unexpectedly (stdout=%s)", cmd.Stdout)
+						}
+						got = fmt.Sprint(cmd.Stdout)
 					}
-					ok = false
-				}
-				if !ok {
-					t.Errorf("got: <<%s>>", got)
-				}
+
+					// Check each want directive.
+					for str, sense := range tc.want {
+						ok := true
+						if strings.Contains(got, str) != sense {
+							if sense {
+								t.Errorf("missing %q", str)
+							} else {
+								t.Errorf("unwanted %q", str)
+							}
+							ok = false
+						}
+						if !ok {
+							t.Errorf("got: <<%s>>", got)
+						}
+					}
+				})
 			}
 		})
 	}
@@ -128,4 +157,28 @@ func buildDeadcode(t *testing.T) string {
 		t.Fatalf("Building deadcode: %v\n%s", err, out)
 	}
 	return bin
+}
+
+// words breaks a string into words, respecting
+// Go string quotations around words with spaces.
+func words(s string) ([]string, error) {
+	var words []string
+	for s != "" {
+		s = strings.TrimSpace(s)
+		var word string
+		if s[0] == '"' || s[0] == '`' {
+			prefix, err := strconv.QuotedPrefix(s)
+			if err != nil {
+				return nil, err
+			}
+			s = s[len(prefix):]
+			word, _ = strconv.Unquote(prefix)
+		} else {
+			prefix, rest, _ := strings.Cut(s, " ")
+			s = rest
+			word = prefix
+		}
+		words = append(words, word)
+	}
+	return words, nil
 }

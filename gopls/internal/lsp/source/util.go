@@ -10,16 +10,17 @@ import (
 	"go/printer"
 	"go/token"
 	"go/types"
-	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 
-	"golang.org/x/tools/gopls/internal/bug"
+	"golang.org/x/tools/gopls/internal/lsp/cache"
+	"golang.org/x/tools/gopls/internal/lsp/cache/metadata"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/safetoken"
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/util/astutil"
+	"golang.org/x/tools/gopls/internal/util/bug"
+	"golang.org/x/tools/gopls/internal/util/safetoken"
+	"golang.org/x/tools/gopls/internal/util/typesutil"
 	"golang.org/x/tools/internal/tokeninternal"
 	"golang.org/x/tools/internal/typeparams"
 )
@@ -30,7 +31,7 @@ import (
 //
 // TODO(adonovan): opt: this function does too much.
 // Move snapshot.ReadFile into the caller (most of which have already done it).
-func IsGenerated(ctx context.Context, snapshot Snapshot, uri span.URI) bool {
+func IsGenerated(ctx context.Context, snapshot *cache.Snapshot, uri protocol.DocumentURI) bool {
 	fh, err := snapshot.ReadFile(ctx, uri)
 	if err != nil {
 		return false
@@ -82,25 +83,6 @@ func adjustedObjEnd(obj types.Object) token.Pos {
 //	https://golang.org/s/generatedcode
 var generatedRx = regexp.MustCompile(`// .*DO NOT EDIT\.?`)
 
-// FileKindForLang returns the file kind associated with the given language ID,
-// or UnknownKind if the language ID is not recognized.
-func FileKindForLang(langID string) FileKind {
-	switch langID {
-	case "go":
-		return Go
-	case "go.mod":
-		return Mod
-	case "go.sum":
-		return Sum
-	case "tmpl", "gotmpl":
-		return Tmpl
-	case "go.work":
-		return Work
-	default:
-		return UnknownKind
-	}
-}
-
 // nodeAtPos returns the index and the node whose position is contained inside
 // the node list.
 func nodeAtPos(nodes []ast.Node, pos token.Pos) (ast.Node, int) {
@@ -119,6 +101,8 @@ func nodeAtPos(nodes []ast.Node, pos token.Pos) (ast.Node, int) {
 func FormatNode(fset *token.FileSet, n ast.Node) string {
 	var buf strings.Builder
 	if err := printer.Fprint(&buf, fset, n); err != nil {
+		// TODO(rfindley): we should use bug.Reportf here.
+		// We encounter this during completion.resolveInvalid.
 		return ""
 	}
 	return buf.String()
@@ -155,13 +139,13 @@ func Deref(typ types.Type) types.Type {
 	}
 }
 
-func SortDiagnostics(d []*Diagnostic) {
+func SortDiagnostics(d []*cache.Diagnostic) {
 	sort.Slice(d, func(i int, j int) bool {
 		return CompareDiagnostic(d[i], d[j]) < 0
 	})
 }
 
-func CompareDiagnostic(a, b *Diagnostic) int {
+func CompareDiagnostic(a, b *cache.Diagnostic) int {
 	if r := protocol.CompareRange(a.Range, b.Range); r != 0 {
 		return r
 	}
@@ -184,47 +168,32 @@ func CompareDiagnostic(a, b *Diagnostic) int {
 // dependencies of m. When using the Go command, the answer is unique.
 //
 // TODO(rfindley): refactor to share logic with findPackageInDeps?
-func findFileInDeps(s MetadataSource, m *Metadata, uri span.URI) *Metadata {
+func findFileInDeps(s metadata.Source, mp *metadata.Package, uri protocol.DocumentURI) *metadata.Package {
 	seen := make(map[PackageID]bool)
-	var search func(*Metadata) *Metadata
-	search = func(m *Metadata) *Metadata {
-		if seen[m.ID] {
+	var search func(*metadata.Package) *metadata.Package
+	search = func(mp *metadata.Package) *metadata.Package {
+		if seen[mp.ID] {
 			return nil
 		}
-		seen[m.ID] = true
-		for _, cgf := range m.CompiledGoFiles {
+		seen[mp.ID] = true
+		for _, cgf := range mp.CompiledGoFiles {
 			if cgf == uri {
-				return m
+				return mp
 			}
 		}
-		for _, dep := range m.DepsByPkgPath {
-			m := s.Metadata(dep)
-			if m == nil {
+		for _, dep := range mp.DepsByPkgPath {
+			mp := s.Metadata(dep)
+			if mp == nil {
 				bug.Reportf("nil metadata for %q", dep)
 				continue
 			}
-			if found := search(m); found != nil {
+			if found := search(mp); found != nil {
 				return found
 			}
 		}
 		return nil
 	}
-	return search(m)
-}
-
-// UnquoteImportPath returns the unquoted import path of s,
-// or "" if the path is not properly quoted.
-func UnquoteImportPath(s *ast.ImportSpec) ImportPath {
-	path, err := strconv.Unquote(s.Path.Value)
-	if err != nil {
-		return ""
-	}
-	return ImportPath(path)
-}
-
-// NodeContains returns true if a node encloses a given position pos.
-func NodeContains(n ast.Node, pos token.Pos) bool {
-	return n != nil && n.Pos() <= pos && pos <= n.End()
+	return search(mp)
 }
 
 // CollectScopes returns all scopes in an ast path, ordered as innermost scope
@@ -236,11 +205,11 @@ func CollectScopes(info *types.Info, path []ast.Node, pos token.Pos) []*types.Sc
 		// Include *FuncType scope if pos is inside the function body.
 		switch node := n.(type) {
 		case *ast.FuncDecl:
-			if node.Body != nil && NodeContains(node.Body, pos) {
+			if node.Body != nil && astutil.NodeContains(node.Body, pos) {
 				n = node.Type
 			}
 		case *ast.FuncLit:
-			if node.Body != nil && NodeContains(node.Body, pos) {
+			if node.Body != nil && astutil.NodeContains(node.Body, pos) {
 				n = node.Type
 			}
 		}
@@ -255,7 +224,7 @@ func Qualifier(f *ast.File, pkg *types.Package, info *types.Info) types.Qualifie
 	// Construct mapping of import paths to their defined or implicit names.
 	imports := make(map[*types.Package]string)
 	for _, imp := range f.Imports {
-		if pkgname, ok := ImportedPkgName(info, imp); ok {
+		if pkgname, ok := typesutil.ImportedPkgName(info, imp); ok {
 			imports[pkgname.Imported()] = pkgname.Name()
 		}
 	}
@@ -276,7 +245,7 @@ func Qualifier(f *ast.File, pkg *types.Package, info *types.Info) types.Qualifie
 
 // requalifier returns a function that re-qualifies identifiers and qualified
 // identifiers contained in targetFile using the given metadata qualifier.
-func requalifier(s MetadataSource, targetFile *ast.File, targetMeta *Metadata, mq MetadataQualifier) func(string) string {
+func requalifier(s metadata.Source, targetFile *ast.File, targetMeta *metadata.Package, mq MetadataQualifier) func(string) string {
 	qm := map[string]string{
 		"": mq(targetMeta.Name, "", targetMeta.PkgPath),
 	}
@@ -307,21 +276,21 @@ type MetadataQualifier func(PackageName, ImportPath, PackagePath) string
 // MetadataQualifierForFile returns a metadata qualifier that chooses the best
 // qualification of an imported package relative to the file f in package with
 // metadata m.
-func MetadataQualifierForFile(s MetadataSource, f *ast.File, m *Metadata) MetadataQualifier {
+func MetadataQualifierForFile(s metadata.Source, f *ast.File, mp *metadata.Package) MetadataQualifier {
 	// Record local names for import paths.
 	localNames := make(map[ImportPath]string) // local names for imports in f
 	for _, imp := range f.Imports {
-		name, _, impPath, _ := importInfo(s, imp, m)
+		name, _, impPath, _ := importInfo(s, imp, mp)
 		localNames[impPath] = name
 	}
 
 	// Record a package path -> import path mapping.
 	inverseDeps := make(map[PackageID]PackagePath)
-	for path, id := range m.DepsByPkgPath {
+	for path, id := range mp.DepsByPkgPath {
 		inverseDeps[id] = path
 	}
 	importsByPkgPath := make(map[PackagePath]ImportPath) // best import paths by pkgPath
-	for impPath, id := range m.DepsByImpPath {
+	for impPath, id := range mp.DepsByImpPath {
 		if id == "" {
 			continue
 		}
@@ -343,12 +312,12 @@ func MetadataQualifierForFile(s MetadataSource, f *ast.File, m *Metadata) Metada
 			if srcImp := importsByPkgPath[pkgPath]; srcImp != "" {
 				impPath = srcImp
 			}
-			if pkgPath == m.PkgPath {
+			if pkgPath == mp.PkgPath {
 				return ""
 			}
 		}
 		if localName, ok := localNames[impPath]; ok && impPath != "" {
-			return string(localName)
+			return localName
 		}
 		if pkgName != "" {
 			return string(pkgName)
@@ -369,11 +338,11 @@ func MetadataQualifierForFile(s MetadataSource, f *ast.File, m *Metadata) Metada
 // extracted from m, for extracting package path even in the case where
 // metadata for a dep was missing. This should not be necessary, as we should
 // always have metadata for IDs contained in DepsByPkgPath.
-func importInfo(s MetadataSource, imp *ast.ImportSpec, m *Metadata) (string, PackageName, ImportPath, PackagePath) {
+func importInfo(s metadata.Source, imp *ast.ImportSpec, mp *metadata.Package) (string, PackageName, ImportPath, PackagePath) {
 	var (
 		name    string // local name
 		pkgName PackageName
-		impPath = UnquoteImportPath(imp)
+		impPath = metadata.UnquoteImportPath(imp)
 		pkgPath PackagePath
 	)
 
@@ -384,13 +353,13 @@ func importInfo(s MetadataSource, imp *ast.ImportSpec, m *Metadata) (string, Pac
 
 	// Try to find metadata for the import. If successful and there is no local
 	// name, the package name is the local name.
-	if depID := m.DepsByImpPath[impPath]; depID != "" {
-		if depm := s.Metadata(depID); depm != nil {
+	if depID := mp.DepsByImpPath[impPath]; depID != "" {
+		if depMP := s.Metadata(depID); depMP != nil {
 			if name == "" {
-				name = string(depm.Name)
+				name = string(depMP.Name)
 			}
-			pkgName = depm.Name
-			pkgPath = depm.PkgPath
+			pkgName = depMP.Name
+			pkgPath = depMP.PkgPath
 		}
 	}
 
@@ -442,70 +411,6 @@ func isDirective(c string) bool {
 	return true
 }
 
-// InDir checks whether path is in the file tree rooted at dir.
-// It checks only the lexical form of the file names.
-// It does not consider symbolic links.
-//
-// Copied from go/src/cmd/go/internal/search/search.go.
-func InDir(dir, path string) bool {
-	pv := strings.ToUpper(filepath.VolumeName(path))
-	dv := strings.ToUpper(filepath.VolumeName(dir))
-	path = path[len(pv):]
-	dir = dir[len(dv):]
-	switch {
-	default:
-		return false
-	case pv != dv:
-		return false
-	case len(path) == len(dir):
-		if path == dir {
-			return true
-		}
-		return false
-	case dir == "":
-		return path != ""
-	case len(path) > len(dir):
-		if dir[len(dir)-1] == filepath.Separator {
-			if path[:len(dir)] == dir {
-				return path[len(dir):] != ""
-			}
-			return false
-		}
-		if path[len(dir)] == filepath.Separator && path[:len(dir)] == dir {
-			if len(path) == len(dir)+1 {
-				return true
-			}
-			return path[len(dir)+1:] != ""
-		}
-		return false
-	}
-}
-
-// IsValidImport returns whether importPkgPath is importable
-// by pkgPath
-func IsValidImport(pkgPath, importPkgPath PackagePath) bool {
-	i := strings.LastIndex(string(importPkgPath), "/internal/")
-	if i == -1 {
-		return true
-	}
-	// TODO(rfindley): this looks wrong: IsCommandLineArguments is meant to
-	// operate on package IDs, not package paths.
-	if IsCommandLineArguments(PackageID(pkgPath)) {
-		return true
-	}
-	// TODO(rfindley): this is wrong. mod.testx/p should not be able to
-	// import mod.test/internal: https://go.dev/play/p/-Ca6P-E4V4q
-	return strings.HasPrefix(string(pkgPath), string(importPkgPath[:i]))
-}
-
-// IsCommandLineArguments reports whether a given value denotes
-// "command-line-arguments" package, which is a package with an unknown ID
-// created by the go command. It can have a test variant, which is why callers
-// should not check that a value equals "command-line-arguments" directly.
-func IsCommandLineArguments(id PackageID) bool {
-	return strings.Contains(string(id), "command-line-arguments")
-}
-
 // embeddedIdent returns the type name identifier for an embedding x, if x in a
 // valid embedding. Otherwise, it returns nil.
 //
@@ -531,3 +436,9 @@ func embeddedIdent(x ast.Expr) *ast.Ident {
 	}
 	return nil
 }
+
+// An importFunc is an implementation of the single-method
+// types.Importer interface based on a function value.
+type ImporterFunc func(path string) (*types.Package, error)
+
+func (f ImporterFunc) Import(path string) (*types.Package, error) { return f(path) }

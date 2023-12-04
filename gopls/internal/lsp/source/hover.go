@@ -24,10 +24,13 @@ import (
 	"golang.org/x/text/unicode/runenames"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/types/typeutil"
-	"golang.org/x/tools/gopls/internal/bug"
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/lsp/cache"
+	"golang.org/x/tools/gopls/internal/lsp/cache/metadata"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/safetoken"
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/settings"
+	"golang.org/x/tools/gopls/internal/util/bug"
+	"golang.org/x/tools/gopls/internal/util/safetoken"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/tokeninternal"
 	"golang.org/x/tools/internal/typeparams"
@@ -62,7 +65,7 @@ type HoverJSON struct {
 }
 
 // Hover implements the "textDocument/hover" RPC for Go files.
-func Hover(ctx context.Context, snapshot Snapshot, fh FileHandle, position protocol.Position) (*protocol.Hover, error) {
+func Hover(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, position protocol.Position) (*protocol.Hover, error) {
 	ctx, done := event.Start(ctx, "source.Hover")
 	defer done()
 
@@ -89,7 +92,7 @@ func Hover(ctx context.Context, snapshot Snapshot, fh FileHandle, position proto
 // hover computes hover information at the given position. If we do not support
 // hovering at the position, it returns _, nil, nil: an error is only returned
 // if the position is valid but we fail to compute hover information.
-func hover(ctx context.Context, snapshot Snapshot, fh FileHandle, pp protocol.Position) (protocol.Range, *HoverJSON, error) {
+func hover(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, pp protocol.Position) (protocol.Range, *HoverJSON, error) {
 	pkg, pgf, err := NarrowestPackageForFile(ctx, snapshot, fh.URI())
 	if err != nil {
 		return protocol.Range{}, nil, err
@@ -131,7 +134,7 @@ func hover(ctx context.Context, snapshot Snapshot, fh FileHandle, pp protocol.Po
 
 	// Handle linkname directive by overriding what to look for.
 	var linkedRange *protocol.Range // range referenced by linkname directive, or nil
-	if pkgPath, name, offset := parseLinkname(ctx, snapshot, fh, pp); pkgPath != "" && name != "" {
+	if pkgPath, name, offset := parseLinkname(pgf.Mapper, pp); pkgPath != "" && name != "" {
 		// rng covering 2nd linkname argument: pkgPath.name.
 		rng, err := pgf.PosRange(pgf.Tok.Pos(offset), pgf.Tok.Pos(offset+len(pkgPath)+len(".")+len(name)))
 		if err != nil {
@@ -182,7 +185,7 @@ func hover(ctx context.Context, snapshot Snapshot, fh FileHandle, pp protocol.Po
 	}
 
 	// Handle builtins, which don't have a package or position.
-	if obj.Pkg() == nil {
+	if !obj.Pos().IsValid() {
 		h, err := hoverBuiltin(ctx, snapshot, obj)
 		return rng, h, err
 	}
@@ -259,10 +262,10 @@ func hover(ctx context.Context, snapshot Snapshot, fh FileHandle, pp protocol.Po
 	//
 	// If linkPath is empty, the symbol is not linkable.
 	var (
-		linkName string    // => link title, always non-empty
-		linkPath string    // => link path
-		anchor   string    // link anchor
-		linkMeta *Metadata // metadata for the linked package
+		linkName string            // => link title, always non-empty
+		linkPath string            // => link path
+		anchor   string            // link anchor
+		linkMeta *metadata.Package // metadata for the linked package
 	)
 	{
 		linkMeta = findFileInDeps(snapshot, pkg.Metadata(), declPGF.URI)
@@ -345,7 +348,7 @@ func hover(ctx context.Context, snapshot Snapshot, fh FileHandle, pp protocol.Po
 		}
 	}
 
-	if snapshot.View().IsGoPrivatePath(linkPath) || linkMeta.ForTest != "" {
+	if snapshot.IsGoPrivatePath(linkPath) || linkMeta.ForTest != "" {
 		linkPath = ""
 	} else if linkMeta.Module != nil && linkMeta.Module.Version != "" {
 		mod := linkMeta.Module
@@ -365,13 +368,10 @@ func hover(ctx context.Context, snapshot Snapshot, fh FileHandle, pp protocol.Po
 
 // hoverBuiltin computes hover information when hovering over a builtin
 // identifier.
-func hoverBuiltin(ctx context.Context, snapshot Snapshot, obj types.Object) (*HoverJSON, error) {
-	// TODO(rfindley): link to the correct version of Go documentation.
-	builtin, err := snapshot.BuiltinFile(ctx)
-	if err != nil {
-		return nil, err
-	}
-
+func hoverBuiltin(ctx context.Context, snapshot *cache.Snapshot, obj types.Object) (*HoverJSON, error) {
+	// Special handling for error.Error, which is the only builtin method.
+	//
+	// TODO(rfindley): can this be unified with the handling below?
 	if obj.Name() == "Error" {
 		signature := obj.String()
 		return &HoverJSON{
@@ -384,18 +384,13 @@ func hoverBuiltin(ctx context.Context, snapshot Snapshot, obj types.Object) (*Ho
 		}, nil
 	}
 
-	builtinObj := builtin.File.Scope.Lookup(obj.Name())
-	if builtinObj == nil {
-		// All builtins should have a declaration in the builtin file.
-		return nil, bug.Errorf("no builtin object for %s", obj.Name())
-	}
-	node, _ := builtinObj.Decl.(ast.Node)
-	if node == nil {
-		return nil, bug.Errorf("no declaration for %s", obj.Name())
+	pgf, node, err := builtinDecl(ctx, snapshot, obj)
+	if err != nil {
+		return nil, err
 	}
 
 	var comment *ast.CommentGroup
-	path, _ := astutil.PathEnclosingInterval(builtin.File, node.Pos(), node.End())
+	path, _ := astutil.PathEnclosingInterval(pgf.File, node.Pos(), node.End())
 	for _, n := range path {
 		switch n := n.(type) {
 		case *ast.GenDecl:
@@ -413,7 +408,7 @@ func hoverBuiltin(ctx context.Context, snapshot Snapshot, obj types.Object) (*Ho
 		}
 	}
 
-	signature := FormatNodeFile(builtin.Tok, node)
+	signature := FormatNodeFile(pgf.Tok, node)
 	// Replace fake types with their common equivalent.
 	// TODO(rfindley): we should instead use obj.Type(), which would have the
 	// *actual* types of the builtin call.
@@ -435,13 +430,13 @@ func hoverBuiltin(ctx context.Context, snapshot Snapshot, obj types.Object) (*Ho
 // imp in the file pgf of pkg.
 //
 // If we do not have metadata for the hovered import, it returns _
-func hoverImport(ctx context.Context, snapshot Snapshot, pkg Package, pgf *ParsedGoFile, imp *ast.ImportSpec) (protocol.Range, *HoverJSON, error) {
+func hoverImport(ctx context.Context, snapshot *cache.Snapshot, pkg *cache.Package, pgf *ParsedGoFile, imp *ast.ImportSpec) (protocol.Range, *HoverJSON, error) {
 	rng, err := pgf.NodeRange(imp.Path)
 	if err != nil {
 		return protocol.Range{}, nil, err
 	}
 
-	importPath := UnquoteImportPath(imp)
+	importPath := metadata.UnquoteImportPath(imp)
 	if importPath == "" {
 		return protocol.Range{}, nil, fmt.Errorf("invalid import path")
 	}
@@ -486,7 +481,7 @@ func hoverImport(ctx context.Context, snapshot Snapshot, pkg Package, pgf *Parse
 
 // hoverPackageName computes hover information for the package name of the file
 // pgf in pkg.
-func hoverPackageName(pkg Package, pgf *ParsedGoFile) (protocol.Range, *HoverJSON, error) {
+func hoverPackageName(pkg *cache.Package, pgf *ParsedGoFile) (protocol.Range, *HoverJSON, error) {
 	var comment *ast.CommentGroup
 	for _, pgf := range pkg.CompiledGoFiles() {
 		if pgf.File.Doc != nil {
@@ -590,8 +585,8 @@ func hoverLit(pgf *ParsedGoFile, lit *ast.BasicLit, pos token.Pos) (protocol.Ran
 					return protocol.Range{}, nil, nil
 				}
 				// Only the rune escape sequence part of the string has to be highlighted, recompute the range.
-				runeLen := len(lit.Value) - (int(i) + len(tail))
-				start = token.Pos(int(lit.Pos()) + int(i))
+				runeLen := len(lit.Value) - (i + len(tail))
+				start = token.Pos(int(lit.Pos()) + i)
 				end = token.Pos(int(start) + runeLen)
 				break
 			}
@@ -635,10 +630,10 @@ func hoverLit(pgf *ParsedGoFile, lit *ast.BasicLit, pos token.Pos) (protocol.Ran
 
 // hoverEmbed computes hover information for a filepath.Match pattern.
 // Assumes that the pattern is relative to the location of fh.
-func hoverEmbed(fh FileHandle, rng protocol.Range, pattern string) (protocol.Range, *HoverJSON, error) {
+func hoverEmbed(fh file.Handle, rng protocol.Range, pattern string) (protocol.Range, *HoverJSON, error) {
 	s := &strings.Builder{}
 
-	dir := filepath.Dir(fh.URI().Filename())
+	dir := filepath.Dir(fh.URI().Path())
 	var matches []string
 	err := filepath.WalkDir(dir, func(abs string, d fs.DirEntry, e error) error {
 		if e != nil {
@@ -760,7 +755,7 @@ func objectString(obj types.Object, qf types.Qualifier, declPos token.Pos, file 
 // fset provides file/line information).
 //
 // TODO(rfindley): there appears to be zero(!) tests for this functionality.
-func HoverDocForObject(ctx context.Context, snapshot Snapshot, fset *token.FileSet, obj types.Object) (*ast.CommentGroup, error) {
+func HoverDocForObject(ctx context.Context, snapshot *cache.Snapshot, fset *token.FileSet, obj types.Object) (*ast.CommentGroup, error) {
 	if _, isTypeName := obj.(*types.TypeName); isTypeName {
 		if _, isTypeParam := obj.Type().(*typeparams.TypeParam); isTypeParam {
 			return nil, nil
@@ -817,13 +812,13 @@ func chooseDocComment(decl ast.Decl, spec ast.Spec, field *ast.Field) *ast.Comme
 //
 // It returns the resulting ParsedGoFile as well as new pos contained in the
 // parsed file.
-func parseFull(ctx context.Context, snapshot Snapshot, fset *token.FileSet, pos token.Pos) (*ParsedGoFile, token.Pos, error) {
+func parseFull(ctx context.Context, snapshot *cache.Snapshot, fset *token.FileSet, pos token.Pos) (*ParsedGoFile, token.Pos, error) {
 	f := fset.File(pos)
 	if f == nil {
 		return nil, 0, bug.Errorf("internal error: no file for position %d", pos)
 	}
 
-	uri := span.URIFromPath(f.Name())
+	uri := protocol.URIFromPath(f.Name())
 	fh, err := snapshot.ReadFile(ctx, uri)
 	if err != nil {
 		return nil, 0, err
@@ -847,15 +842,15 @@ func parseFull(ctx context.Context, snapshot Snapshot, fset *token.FileSet, pos 
 	return pgf, fullPos, nil
 }
 
-func formatHover(h *HoverJSON, options *Options) (string, error) {
+func formatHover(h *HoverJSON, options *settings.Options) (string, error) {
 	signature := formatSignature(h, options)
 
 	switch options.HoverKind {
-	case SingleLine:
+	case settings.SingleLine:
 		return h.SingleLine, nil
-	case NoDocumentation:
+	case settings.NoDocumentation:
 		return signature, nil
-	case Structured:
+	case settings.Structured:
 		b, err := json.Marshal(h)
 		if err != nil {
 			return "", err
@@ -886,7 +881,7 @@ func formatHover(h *HoverJSON, options *Options) (string, error) {
 	return b.String(), nil
 }
 
-func formatSignature(h *HoverJSON, options *Options) string {
+func formatSignature(h *HoverJSON, options *settings.Options) string {
 	signature := h.Signature
 	if signature != "" && options.PreferredContentFormat == protocol.Markdown {
 		signature = fmt.Sprintf("```go\n%s\n```", signature)
@@ -894,11 +889,11 @@ func formatSignature(h *HoverJSON, options *Options) string {
 	return signature
 }
 
-func formatLink(h *HoverJSON, options *Options) string {
+func formatLink(h *HoverJSON, options *settings.Options) string {
 	if !options.LinksInHover || options.LinkTarget == "" || h.LinkPath == "" {
 		return ""
 	}
-	plainLink := BuildLink(options.LinkTarget, h.LinkPath, h.LinkAnchor)
+	plainLink := cache.BuildLink(options.LinkTarget, h.LinkPath, h.LinkAnchor)
 	switch options.PreferredContentFormat {
 	case protocol.Markdown:
 		return fmt.Sprintf("[`%s` on %s](%s)", h.SymbolName, options.LinkTarget, plainLink)
@@ -909,21 +904,12 @@ func formatLink(h *HoverJSON, options *Options) string {
 	}
 }
 
-// BuildLink constructs a URL with the given target, path, and anchor.
-func BuildLink(target, path, anchor string) string {
-	link := fmt.Sprintf("https://%s/%s", target, path)
-	if anchor == "" {
-		return link
-	}
-	return link + "#" + anchor
-}
-
-func formatDoc(h *HoverJSON, options *Options) string {
+func formatDoc(h *HoverJSON, options *settings.Options) string {
 	var doc string
 	switch options.HoverKind {
-	case SynopsisDocumentation:
+	case settings.SynopsisDocumentation:
 		doc = h.Synopsis
-	case FullDocumentation:
+	case settings.FullDocumentation:
 		doc = h.FullDocumentation
 	}
 	if options.PreferredContentFormat == protocol.Markdown {

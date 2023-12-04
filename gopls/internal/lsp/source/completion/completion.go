@@ -27,12 +27,15 @@ import (
 
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/tools/go/ast/astutil"
-	goplsastutil "golang.org/x/tools/gopls/internal/astutil"
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/lsp/cache"
+	"golang.org/x/tools/gopls/internal/lsp/cache/metadata"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/safetoken"
-	"golang.org/x/tools/gopls/internal/lsp/snippet"
 	"golang.org/x/tools/gopls/internal/lsp/source"
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/lsp/source/completion/snippet"
+	"golang.org/x/tools/gopls/internal/settings"
+	goplsastutil "golang.org/x/tools/gopls/internal/util/astutil"
+	"golang.org/x/tools/gopls/internal/util/safetoken"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/fuzzy"
 	"golang.org/x/tools/internal/imports"
@@ -108,10 +111,9 @@ type completionOptions struct {
 	documentation         bool
 	fullDocumentation     bool
 	placeholders          bool
-	literal               bool
 	snippets              bool
 	postfix               bool
-	matcher               source.Matcher
+	matcher               settings.Matcher
 	budget                time.Duration
 	completeFunctionCalls bool
 }
@@ -167,8 +169,8 @@ func (ipm insensitivePrefixMatcher) Score(candidateLabel string) float32 {
 
 // completer contains the necessary information for a single completion request.
 type completer struct {
-	snapshot source.Snapshot
-	pkg      source.Package
+	snapshot *cache.Snapshot
+	pkg      *cache.Package
 	qf       types.Qualifier          // for qualifying typed expressions
 	mq       source.MetadataQualifier // for syntactic qualifying
 	opts     *completionOptions
@@ -178,7 +180,7 @@ type completer struct {
 	completionContext completionContext
 
 	// fh is a handle to the file associated with this completion request.
-	fh source.FileHandle
+	fh file.Handle
 
 	// filename is the name of the file associated with this completion request.
 	filename string
@@ -347,9 +349,9 @@ func (c *completer) setSurrounding(ident *ast.Ident) {
 
 func (c *completer) setMatcherFromPrefix(prefix string) {
 	switch c.opts.matcher {
-	case source.Fuzzy:
+	case settings.Fuzzy:
 		c.matcher = fuzzy.NewMatcher(prefix)
-	case source.CaseSensitive:
+	case settings.CaseSensitive:
 		c.matcher = prefixMatcher(prefix)
 	default:
 		c.matcher = insensitivePrefixMatcher(strings.ToLower(prefix))
@@ -443,7 +445,7 @@ func (e ErrIsDefinition) Error() string {
 // The selection is computed based on the preceding identifier and can be used by
 // the client to score the quality of the completion. For instance, some clients
 // may tolerate imperfect matches as valid completion results, since users may make typos.
-func Completion(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle, protoPos protocol.Position, protoContext protocol.CompletionContext) ([]CompletionItem, *Selection, error) {
+func Completion(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, protoPos protocol.Position, protoContext protocol.CompletionContext) ([]CompletionItem, *Selection, error) {
 	ctx, done := event.Start(ctx, "completion.Completion")
 	defer done()
 
@@ -532,7 +534,7 @@ func Completion(ctx context.Context, snapshot source.Snapshot, fh source.FileHan
 			triggerKind:      protoContext.TriggerKind,
 		},
 		fh:                        fh,
-		filename:                  fh.URI().Filename(),
+		filename:                  fh.URI().Path(),
 		tokFile:                   pgf.Tok,
 		file:                      pgf.File,
 		path:                      path,
@@ -546,10 +548,9 @@ func Completion(ctx context.Context, snapshot source.Snapshot, fh source.FileHan
 		opts: &completionOptions{
 			matcher:               opts.Matcher,
 			unimported:            opts.CompleteUnimported,
-			documentation:         opts.CompletionDocumentation && opts.HoverKind != source.NoDocumentation,
-			fullDocumentation:     opts.HoverKind == source.FullDocumentation,
+			documentation:         opts.CompletionDocumentation && opts.HoverKind != settings.NoDocumentation,
+			fullDocumentation:     opts.HoverKind == settings.FullDocumentation,
 			placeholders:          opts.UsePlaceholders,
-			literal:               opts.LiteralCompletions && opts.InsertTextFormat == protocol.SnippetTextFormat,
 			budget:                opts.CompletionBudget,
 			snippets:              opts.InsertTextFormat == protocol.SnippetTextFormat,
 			postfix:               opts.ExperimentalPostfixCompletions,
@@ -1148,7 +1149,7 @@ func (c *completer) selector(ctx context.Context, sel *ast.SelectorExpr) error {
 	}
 
 	// Treat sel as a qualified identifier.
-	var filter func(*source.Metadata) bool
+	var filter func(*metadata.Package) bool
 	needImport := false
 	if pkgName, ok := c.pkg.GetTypesInfo().Uses[id].(*types.PkgName); ok {
 		// Qualified identifier with import declaration.
@@ -1163,14 +1164,14 @@ func (c *completer) selector(ctx context.Context, sel *ast.SelectorExpr) error {
 		// Imported declaration with missing type information.
 		// Fall through to shallow completion of unimported package members.
 		// Match candidate packages by path.
-		filter = func(m *source.Metadata) bool {
-			return strings.TrimPrefix(string(m.PkgPath), "vendor/") == imp.Path()
+		filter = func(mp *metadata.Package) bool {
+			return strings.TrimPrefix(string(mp.PkgPath), "vendor/") == imp.Path()
 		}
 	} else {
 		// Qualified identifier without import declaration.
 		// Match candidate packages by name.
-		filter = func(m *source.Metadata) bool {
-			return string(m.Name) == id.Name
+		filter = func(mp *metadata.Package) bool {
+			return string(mp.Name) == id.Name
 		}
 		needImport = true
 	}
@@ -1207,27 +1208,27 @@ func (c *completer) selector(ctx context.Context, sel *ast.SelectorExpr) error {
 	if err != nil {
 		return err
 	}
-	known := make(map[source.PackagePath]*source.Metadata)
-	for _, m := range all {
-		if m.Name == "main" {
+	known := make(map[source.PackagePath]*metadata.Package)
+	for _, mp := range all {
+		if mp.Name == "main" {
 			continue // not importable
 		}
-		if m.IsIntermediateTestVariant() {
+		if mp.IsIntermediateTestVariant() {
 			continue
 		}
 		// The only test variant we admit is "p [p.test]"
 		// when we are completing within "p_test [p.test]",
 		// as in that case we would like to offer completions
 		// of the test variants' additional symbols.
-		if m.ForTest != "" && c.pkg.Metadata().PkgPath != m.ForTest+"_test" {
+		if mp.ForTest != "" && c.pkg.Metadata().PkgPath != mp.ForTest+"_test" {
 			continue
 		}
-		if !filter(m) {
+		if !filter(mp) {
 			continue
 		}
 		// Prefer previous entry unless this one is its test variant.
-		if m.ForTest != "" || known[m.PkgPath] == nil {
-			known[m.PkgPath] = m
+		if mp.ForTest != "" || known[mp.PkgPath] == nil {
+			known[mp.PkgPath] = mp
 		}
 	}
 
@@ -1257,7 +1258,7 @@ func (c *completer) selector(ctx context.Context, sel *ast.SelectorExpr) error {
 	// Consider adding a concurrency-safe API for completer.
 	var cMu sync.Mutex // guards c.items and c.matcher
 	var enough int32   // atomic bool
-	quickParse := func(uri span.URI, m *source.Metadata) error {
+	quickParse := func(uri protocol.DocumentURI, mp *metadata.Package) error {
 		if atomic.LoadInt32(&enough) != 0 {
 			return nil
 		}
@@ -1270,7 +1271,7 @@ func (c *completer) selector(ctx context.Context, sel *ast.SelectorExpr) error {
 		if err != nil {
 			return err
 		}
-		path := string(m.PkgPath)
+		path := string(mp.PkgPath)
 		forEachPackageMember(content, func(tok token.Token, id *ast.Ident, fn *ast.FuncDecl) {
 			if atomic.LoadInt32(&enough) != 0 {
 				return
@@ -1294,7 +1295,7 @@ func (c *completer) selector(ctx context.Context, sel *ast.SelectorExpr) error {
 			// of the item? How does this compare with the deepState.enqueue path?
 			item := CompletionItem{
 				Label:      id.Name,
-				Detail:     fmt.Sprintf("%s (from %q)", strings.ToLower(tok.String()), m.PkgPath),
+				Detail:     fmt.Sprintf("%s (from %q)", strings.ToLower(tok.String()), mp.PkgPath),
 				InsertText: id.Name,
 				Score:      float64(score) * unimportedScore(relevances[path]),
 			}
@@ -1312,8 +1313,8 @@ func (c *completer) selector(ctx context.Context, sel *ast.SelectorExpr) error {
 
 			if needImport {
 				imp := &importInfo{importPath: path}
-				if imports.ImportPathToAssumedName(path) != string(m.Name) {
-					imp.name = string(m.Name)
+				if imports.ImportPathToAssumedName(path) != string(mp.Name) {
+					imp.name = string(mp.Name)
 				}
 				item.AdditionalTextEdits, _ = c.importEdits(imp)
 			}
@@ -1365,11 +1366,11 @@ func (c *completer) selector(ctx context.Context, sel *ast.SelectorExpr) error {
 	// Extract the package-level candidates using a quick parse.
 	var g errgroup.Group
 	for _, path := range paths {
-		m := known[source.PackagePath(path)]
-		for _, uri := range m.CompiledGoFiles {
+		mp := known[source.PackagePath(path)]
+		for _, uri := range mp.CompiledGoFiles {
 			uri := uri
 			g.Go(func() error {
-				return quickParse(uri, m)
+				return quickParse(uri, mp)
 			})
 		}
 	}
@@ -1693,18 +1694,18 @@ func (c *completer) unimportedPackages(ctx context.Context, seen map[string]stru
 	}
 	pkgNameByPath := make(map[source.PackagePath]string)
 	var paths []string // actually PackagePaths
-	for _, m := range all {
-		if m.ForTest != "" {
+	for _, mp := range all {
+		if mp.ForTest != "" {
 			continue // skip all test variants
 		}
-		if m.Name == "main" {
+		if mp.Name == "main" {
 			continue // main is non-importable
 		}
-		if !strings.HasPrefix(string(m.Name), prefix) {
+		if !strings.HasPrefix(string(mp.Name), prefix) {
 			continue // not a match
 		}
-		paths = append(paths, string(m.PkgPath))
-		pkgNameByPath[m.PkgPath] = string(m.Name)
+		paths = append(paths, string(mp.PkgPath))
+		pkgNameByPath[mp.PkgPath] = string(mp.Name)
 	}
 
 	// Rank candidates using goimports' algorithm.
@@ -1796,7 +1797,7 @@ func (c *completer) unimportedPackages(ctx context.Context, seen map[string]stru
 // alreadyImports reports whether f has an import with the specified path.
 func alreadyImports(f *ast.File, path source.ImportPath) bool {
 	for _, s := range f.Imports {
-		if source.UnquoteImportPath(s) == path {
+		if metadata.UnquoteImportPath(s) == path {
 			return true
 		}
 	}
@@ -2366,7 +2367,7 @@ Nodes:
 			}
 			return inf
 		case *ast.RangeStmt:
-			if source.NodeContains(node.X, c.pos) {
+			if goplsastutil.NodeContains(node.X, c.pos) {
 				inf.objKind |= kindSlice | kindArray | kindMap | kindString
 				if node.Value == nil {
 					inf.objKind |= kindChan
@@ -2584,11 +2585,11 @@ func breaksExpectedTypeInference(n ast.Node, pos token.Pos) bool {
 	case *ast.CompositeLit:
 		// Doesn't break inference if pos is in type name.
 		// For example: "Foo<>{Bar: 123}"
-		return !source.NodeContains(n.Type, pos)
+		return n.Type == nil || !goplsastutil.NodeContains(n.Type, pos)
 	case *ast.CallExpr:
 		// Doesn't break inference if pos is in func name.
 		// For example: "Foo<>(123)"
-		return !source.NodeContains(n.Fun, pos)
+		return !goplsastutil.NodeContains(n.Fun, pos)
 	case *ast.FuncLit, *ast.IndexExpr, *ast.SliceExpr:
 		return true
 	default:
@@ -2701,7 +2702,7 @@ Nodes:
 		case *ast.MapType:
 			inf.wantTypeName = true
 			if n.Key != nil {
-				inf.wantComparable = source.NodeContains(n.Key, c.pos)
+				inf.wantComparable = goplsastutil.NodeContains(n.Key, c.pos)
 			} else {
 				// If the key is empty, assume we are completing the key if
 				// pos is directly after the "map[".
@@ -2709,10 +2710,10 @@ Nodes:
 			}
 			break Nodes
 		case *ast.ValueSpec:
-			inf.wantTypeName = source.NodeContains(n.Type, c.pos)
+			inf.wantTypeName = n.Type != nil && goplsastutil.NodeContains(n.Type, c.pos)
 			break Nodes
 		case *ast.TypeSpec:
-			inf.wantTypeName = source.NodeContains(n.Type, c.pos)
+			inf.wantTypeName = goplsastutil.NodeContains(n.Type, c.pos)
 		default:
 			if breaksExpectedTypeInference(p, c.pos) {
 				return typeNameInference{}

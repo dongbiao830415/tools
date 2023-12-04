@@ -7,28 +7,19 @@ package source
 import (
 	"context"
 	"fmt"
-	"path"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
 	"strings"
 	"unicode"
 
+	"golang.org/x/tools/gopls/internal/lsp/cache"
+	"golang.org/x/tools/gopls/internal/lsp/cache/metadata"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/fuzzy"
 )
-
-// Symbol holds a precomputed symbol value. Note: we avoid using the
-// protocol.SymbolInformation struct here in order to reduce the size of each
-// symbol.
-type Symbol struct {
-	Name  string
-	Kind  protocol.SymbolKind
-	Range protocol.Range
-}
 
 // maxSymbols defines the maximum number of symbol results that should ever be
 // sent in response to a client.
@@ -51,7 +42,7 @@ const maxSymbols = 100
 // with a different configured SymbolMatcher per View. Therefore we assume that
 // Session level configuration will define the SymbolMatcher to be used for the
 // WorkspaceSymbols method.
-func WorkspaceSymbols(ctx context.Context, matcher SymbolMatcher, style SymbolStyle, views []View, query string) ([]protocol.SymbolInformation, error) {
+func WorkspaceSymbols(ctx context.Context, matcher settings.SymbolMatcher, style settings.SymbolStyle, snapshots []*cache.Snapshot, query string) ([]protocol.SymbolInformation, error) {
 	ctx, done := event.Start(ctx, "source.WorkspaceSymbols")
 	defer done()
 	if query == "" {
@@ -60,17 +51,17 @@ func WorkspaceSymbols(ctx context.Context, matcher SymbolMatcher, style SymbolSt
 
 	var s symbolizer
 	switch style {
-	case DynamicSymbols:
+	case settings.DynamicSymbols:
 		s = dynamicSymbolMatch
-	case FullyQualifiedSymbols:
+	case settings.FullyQualifiedSymbols:
 		s = fullyQualifiedSymbolMatch
-	case PackageQualifiedSymbols:
+	case settings.PackageQualifiedSymbols:
 		s = packageSymbolMatch
 	default:
 		panic(fmt.Errorf("unknown symbol style: %v", style))
 	}
 
-	return collectSymbols(ctx, views, matcher, s, query)
+	return collectSymbols(ctx, snapshots, matcher, s, query)
 }
 
 // A matcherFunc returns the index and score of a symbol match.
@@ -87,17 +78,17 @@ type matcherFunc func(chunks []string) (int, float64)
 //
 // The space argument is an empty slice with spare capacity that may be used
 // to allocate the result.
-type symbolizer func(space []string, name string, pkg *Metadata, m matcherFunc) ([]string, float64)
+type symbolizer func(space []string, name string, pkg *metadata.Package, m matcherFunc) ([]string, float64)
 
-func fullyQualifiedSymbolMatch(space []string, name string, pkg *Metadata, matcher matcherFunc) ([]string, float64) {
+func fullyQualifiedSymbolMatch(space []string, name string, pkg *metadata.Package, matcher matcherFunc) ([]string, float64) {
 	if _, score := dynamicSymbolMatch(space, name, pkg, matcher); score > 0 {
 		return append(space, string(pkg.PkgPath), ".", name), score
 	}
 	return nil, 0
 }
 
-func dynamicSymbolMatch(space []string, name string, pkg *Metadata, matcher matcherFunc) ([]string, float64) {
-	if IsCommandLineArguments(pkg.ID) {
+func dynamicSymbolMatch(space []string, name string, pkg *metadata.Package, matcher matcherFunc) ([]string, float64) {
+	if metadata.IsCommandLineArguments(pkg.ID) {
 		// command-line-arguments packages have a non-sensical package path, so
 		// just use their package name.
 		return packageSymbolMatch(space, name, pkg, matcher)
@@ -149,7 +140,7 @@ func dynamicSymbolMatch(space []string, name string, pkg *Metadata, matcher matc
 	return fullyQualified, score * 0.6
 }
 
-func packageSymbolMatch(space []string, name string, pkg *Metadata, matcher matcherFunc) ([]string, float64) {
+func packageSymbolMatch(space []string, name string, pkg *metadata.Package, matcher matcherFunc) ([]string, float64) {
 	qualified := append(space, string(pkg.Name), ".", name)
 	if _, s := matcher(qualified); s > 0 {
 		return qualified, s
@@ -157,17 +148,17 @@ func packageSymbolMatch(space []string, name string, pkg *Metadata, matcher matc
 	return nil, 0
 }
 
-func buildMatcher(matcher SymbolMatcher, query string) matcherFunc {
+func buildMatcher(matcher settings.SymbolMatcher, query string) matcherFunc {
 	switch matcher {
-	case SymbolFuzzy:
+	case settings.SymbolFuzzy:
 		return parseQuery(query, newFuzzyMatcher)
-	case SymbolFastFuzzy:
+	case settings.SymbolFastFuzzy:
 		return parseQuery(query, func(query string) matcherFunc {
 			return fuzzy.NewSymbolMatcher(query).Match
 		})
-	case SymbolCaseSensitive:
+	case settings.SymbolCaseSensitive:
 		return matchExact(query)
-	case SymbolCaseInsensitive:
+	case settings.SymbolCaseInsensitive:
 		q := strings.ToLower(query)
 		exact := matchExact(q)
 		wrapper := []string{""}
@@ -296,29 +287,24 @@ func (c comboMatcher) match(chunks []string) (int, float64) {
 //     of zero indicates no match.
 //   - A symbolizer determines how we extract the symbol for an object. This
 //     enables the 'symbolStyle' configuration option.
-func collectSymbols(ctx context.Context, views []View, matcherType SymbolMatcher, symbolizer symbolizer, query string) ([]protocol.SymbolInformation, error) {
+func collectSymbols(ctx context.Context, snapshots []*cache.Snapshot, matcherType settings.SymbolMatcher, symbolizer symbolizer, query string) ([]protocol.SymbolInformation, error) {
 	// Extract symbols from all files.
 	var work []symbolFile
 	var roots []string
-	seen := make(map[span.URI]bool)
+	seen := make(map[protocol.DocumentURI]bool)
 	// TODO(adonovan): opt: parallelize this loop? How often is len > 1?
-	for _, v := range views {
-		snapshot, release, err := v.Snapshot()
-		if err != nil {
-			continue // view is shut down; continue with others
-		}
-		defer release()
-
+	for _, snapshot := range snapshots {
 		// Use the root view URIs for determining (lexically)
 		// whether a URI is in any open workspace.
-		roots = append(roots, strings.TrimRight(string(v.Folder()), "/"))
+		folderURI := snapshot.Folder()
+		roots = append(roots, strings.TrimRight(string(folderURI), "/"))
 
 		filters := snapshot.Options().DirectoryFilters
-		filterer := NewFilterer(filters)
-		folder := filepath.ToSlash(v.Folder().Filename())
+		filterer := cache.NewFilterer(filters)
+		folder := filepath.ToSlash(folderURI.Path())
 
 		workspaceOnly := true
-		if snapshot.Options().SymbolScope == AllSymbolScope {
+		if snapshot.Options().SymbolScope == settings.AllSymbolScope {
 			workspaceOnly = false
 		}
 		symbols, err := snapshot.Symbols(ctx, workspaceOnly)
@@ -327,7 +313,7 @@ func collectSymbols(ctx context.Context, views []View, matcherType SymbolMatcher
 		}
 
 		for uri, syms := range symbols {
-			norm := filepath.ToSlash(uri.Filename())
+			norm := filepath.ToSlash(uri.Path())
 			nm := strings.TrimPrefix(norm, folder)
 			if filterer.Disallow(nm) {
 				continue
@@ -374,89 +360,18 @@ func collectSymbols(ctx context.Context, views []View, matcherType SymbolMatcher
 	return unified.results(), nil
 }
 
-type Filterer struct {
-	// Whether a filter is excluded depends on the operator (first char of the raw filter).
-	// Slices filters and excluded then should have the same length.
-	filters  []*regexp.Regexp
-	excluded []bool
-}
-
-// NewFilterer computes regular expression form of all raw filters
-func NewFilterer(rawFilters []string) *Filterer {
-	var f Filterer
-	for _, filter := range rawFilters {
-		filter = path.Clean(filepath.ToSlash(filter))
-		// TODO(dungtuanle): fix: validate [+-] prefix.
-		op, prefix := filter[0], filter[1:]
-		// convertFilterToRegexp adds "/" at the end of prefix to handle cases where a filter is a prefix of another filter.
-		// For example, it prevents [+foobar, -foo] from excluding "foobar".
-		f.filters = append(f.filters, convertFilterToRegexp(filepath.ToSlash(prefix)))
-		f.excluded = append(f.excluded, op == '-')
-	}
-
-	return &f
-}
-
-// Disallow return true if the path is excluded from the filterer's filters.
-func (f *Filterer) Disallow(path string) bool {
-	// Ensure trailing but not leading slash.
-	path = strings.TrimPrefix(path, "/")
-	if !strings.HasSuffix(path, "/") {
-		path += "/"
-	}
-
-	// TODO(adonovan): opt: iterate in reverse and break at first match.
-	excluded := false
-	for i, filter := range f.filters {
-		if filter.MatchString(path) {
-			excluded = f.excluded[i] // last match wins
-		}
-	}
-	return excluded
-}
-
-// convertFilterToRegexp replaces glob-like operator substrings in a string file path to their equivalent regex forms.
-// Supporting glob-like operators:
-//   - **: match zero or more complete path segments
-func convertFilterToRegexp(filter string) *regexp.Regexp {
-	if filter == "" {
-		return regexp.MustCompile(".*")
-	}
-	var ret strings.Builder
-	ret.WriteString("^")
-	segs := strings.Split(filter, "/")
-	for _, seg := range segs {
-		// Inv: seg != "" since path is clean.
-		if seg == "**" {
-			ret.WriteString(".*")
-		} else {
-			ret.WriteString(regexp.QuoteMeta(seg))
-		}
-		ret.WriteString("/")
-	}
-	pattern := ret.String()
-
-	// Remove unnecessary "^.*" prefix, which increased
-	// BenchmarkWorkspaceSymbols time by ~20% (even though
-	// filter CPU time increased by only by ~2.5%) when the
-	// default filter was changed to "**/node_modules".
-	pattern = strings.TrimPrefix(pattern, "^.*")
-
-	return regexp.MustCompile(pattern)
-}
-
 // symbolFile holds symbol information for a single file.
 type symbolFile struct {
-	uri  span.URI
-	md   *Metadata
-	syms []Symbol
+	uri  protocol.DocumentURI
+	mp   *metadata.Package
+	syms []cache.Symbol
 }
 
 // matchFile scans a symbol file and adds matching symbols to the store.
 func matchFile(store *symbolStore, symbolizer symbolizer, matcher matcherFunc, roots []string, i symbolFile) {
 	space := make([]string, 0, 3)
 	for _, sym := range i.syms {
-		symbolParts, score := symbolizer(space, sym.Name, i.md, matcher)
+		symbolParts, score := symbolizer(space, sym.Name, i.mp, matcher)
 
 		// Check if the score is too low before applying any downranking.
 		if store.tooLow(score) {
@@ -538,7 +453,7 @@ func matchFile(store *symbolStore, symbolizer symbolizer, matcher matcherFunc, r
 			kind:      sym.Kind,
 			uri:       i.uri,
 			rng:       sym.Range,
-			container: string(i.md.PkgPath),
+			container: string(i.mp.PkgPath),
 		}
 		store.store(si)
 	}
@@ -591,7 +506,7 @@ type symbolInformation struct {
 	symbol    string
 	container string
 	kind      protocol.SymbolKind
-	uri       span.URI
+	uri       protocol.DocumentURI
 	rng       protocol.Range
 }
 
@@ -603,7 +518,7 @@ func (s symbolInformation) asProtocolSymbolInformation() protocol.SymbolInformat
 		Name: s.symbol,
 		Kind: s.kind,
 		Location: protocol.Location{
-			URI:   protocol.URIFromSpanURI(s.uri),
+			URI:   s.uri,
 			Range: s.rng,
 		},
 		ContainerName: s.container,

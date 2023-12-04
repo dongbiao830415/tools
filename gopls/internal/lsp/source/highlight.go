@@ -12,11 +12,14 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/ast/astutil"
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/lsp/cache"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/util/typesutil"
 	"golang.org/x/tools/internal/event"
 )
 
-func Highlight(ctx context.Context, snapshot Snapshot, fh FileHandle, position protocol.Position) ([]protocol.Range, error) {
+func Highlight(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, position protocol.Position) ([]protocol.Range, error) {
 	ctx, done := event.Start(ctx, "source.Highlight")
 	defer done()
 
@@ -77,7 +80,7 @@ func highlightPath(path []ast.Node, file *ast.File, info *types.Info) (map[posRa
 				highlight(imp)
 
 				// ...and all references to it in the file.
-				if pkgname, ok := ImportedPkgName(info, imp); ok {
+				if pkgname, ok := typesutil.ImportedPkgName(info, imp); ok {
 					ast.Inspect(file, func(n ast.Node) bool {
 						if id, ok := n.(*ast.Ident); ok &&
 							info.Uses[id] == pkgname {
@@ -453,7 +456,7 @@ func highlightIdentifier(id *ast.Ident, file *ast.File, info *types.Info, result
 			}
 
 		case *ast.ImportSpec:
-			pkgname, ok := ImportedPkgName(info, n)
+			pkgname, ok := typesutil.ImportedPkgName(info, n)
 			if ok && pkgname == obj {
 				if n.Name != nil {
 					highlight(n.Name)
@@ -464,17 +467,4 @@ func highlightIdentifier(id *ast.Ident, file *ast.File, info *types.Info, result
 		}
 		return true
 	})
-}
-
-// ImportedPkgName returns the PkgName object declared by an ImportSpec.
-// TODO(adonovan): make this a method of types.Info.
-func ImportedPkgName(info *types.Info, imp *ast.ImportSpec) (*types.PkgName, bool) {
-	var obj types.Object
-	if imp.Name != nil {
-		obj = info.Defs[imp.Name]
-	} else {
-		obj = info.Implicits[imp]
-	}
-	pkgname, ok := obj.(*types.PkgName)
-	return pkgname, ok
 }

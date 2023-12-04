@@ -7,15 +7,15 @@ package cache
 import (
 	"context"
 	"fmt"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/tools/gopls/internal/lsp/source"
+	"golang.org/x/tools/gopls/internal/file"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/event/keys"
-	"golang.org/x/tools/internal/gocommand"
 	"golang.org/x/tools/internal/imports"
 )
 
@@ -26,12 +26,12 @@ type importsState struct {
 	processEnv             *imports.ProcessEnv
 	cacheRefreshDuration   time.Duration
 	cacheRefreshTimer      *time.Timer
-	cachedModFileHash      source.Hash
+	cachedModFileHash      file.Hash
 	cachedBuildFlags       []string
 	cachedDirectoryFilters []string
 }
 
-func (s *importsState) runProcessEnvFunc(ctx context.Context, snapshot *snapshot, fn func(context.Context, *imports.Options) error) error {
+func (s *importsState) runProcessEnvFunc(ctx context.Context, snapshot *Snapshot, fn func(context.Context, *imports.Options) error) error {
 	ctx, done := event.Start(ctx, "cache.importsState.runProcessEnvFunc")
 	defer done()
 
@@ -43,24 +43,24 @@ func (s *importsState) runProcessEnvFunc(ctx context.Context, snapshot *snapshot
 	// the mod file shouldn't be changing while people are autocompleting.
 	//
 	// TODO(rfindley): consider instead hashing on-disk modfiles here.
-	var modFileHash source.Hash
-	for m := range snapshot.workspaceModFiles {
+	var modFileHash file.Hash
+	for m := range snapshot.view.workspaceModFiles {
 		fh, err := snapshot.ReadFile(ctx, m)
 		if err != nil {
 			return err
 		}
-		modFileHash.XORWith(fh.FileIdentity().Hash)
+		modFileHash.XORWith(fh.Identity().Hash)
 	}
 
 	// view.goEnv is immutable -- changes make a new view. Options can change.
 	// We can't compare build flags directly because we may add -modfile.
-	localPrefix := snapshot.options.Local
-	currentBuildFlags := snapshot.options.BuildFlags
-	currentDirectoryFilters := snapshot.options.DirectoryFilters
+	localPrefix := snapshot.Options().Local
+	currentBuildFlags := snapshot.Options().BuildFlags
+	currentDirectoryFilters := snapshot.Options().DirectoryFilters
 	changed := !reflect.DeepEqual(currentBuildFlags, s.cachedBuildFlags) ||
-		snapshot.options.VerboseOutput != (s.processEnv.Logf != nil) ||
+		snapshot.Options().VerboseOutput != (s.processEnv.Logf != nil) ||
 		modFileHash != s.cachedModFileHash ||
-		!reflect.DeepEqual(snapshot.options.DirectoryFilters, s.cachedDirectoryFilters)
+		!reflect.DeepEqual(snapshot.Options().DirectoryFilters, s.cachedDirectoryFilters)
 
 	// If anything relevant to imports has changed, clear caches and
 	// update the processEnv. Clearing caches blocks on any background
@@ -114,11 +114,11 @@ func (s *importsState) runProcessEnvFunc(ctx context.Context, snapshot *snapshot
 // populateProcessEnvFromSnapshot sets the dynamically configurable fields for
 // the view's process environment. Assumes that the caller is holding the
 // importsState mutex.
-func populateProcessEnvFromSnapshot(ctx context.Context, pe *imports.ProcessEnv, snapshot *snapshot) error {
+func populateProcessEnvFromSnapshot(ctx context.Context, pe *imports.ProcessEnv, snapshot *Snapshot) error {
 	ctx, done := event.Start(ctx, "cache.populateProcessEnvFromSnapshot")
 	defer done()
 
-	if snapshot.options.VerboseOutput {
+	if snapshot.Options().VerboseOutput {
 		pe.Logf = func(format string, args ...interface{}) {
 			event.Log(ctx, fmt.Sprintf(format, args...))
 		}
@@ -126,33 +126,18 @@ func populateProcessEnvFromSnapshot(ctx context.Context, pe *imports.ProcessEnv,
 		pe.Logf = nil
 	}
 
-	// Extract invocation details from the snapshot to use with goimports.
-	//
-	// TODO(rfindley): refactor to extract the necessary invocation logic into
-	// separate functions. Using goCommandInvocation is unnecessarily indirect,
-	// and has led to memory leaks in the past, when the snapshot was
-	// unintentionally held past its lifetime.
-	_, inv, cleanupInvocation, err := snapshot.goCommandInvocation(ctx, source.LoadWorkspace, &gocommand.Invocation{
-		WorkingDir: snapshot.view.goCommandDir.Filename(),
-	})
-	if err != nil {
-		return err
-	}
-
-	pe.BuildFlags = inv.BuildFlags
+	pe.WorkingDir = snapshot.view.goCommandDir.Path()
 	pe.ModFlag = "readonly" // processEnv operations should not mutate the modfile
 	pe.Env = map[string]string{}
-	for _, kv := range inv.Env {
+	pe.BuildFlags = append([]string{}, snapshot.Options().BuildFlags...)
+	env := append(append(os.Environ(), snapshot.Options().EnvSlice()...), "GO111MODULE="+snapshot.view.GO111MODULE())
+	for _, kv := range env {
 		split := strings.SplitN(kv, "=", 2)
 		if len(split) != 2 {
 			continue
 		}
 		pe.Env[split[0]] = split[1]
 	}
-	// We don't actually use the invocation, so clean it up now.
-	cleanupInvocation()
-	// TODO(rfindley): should this simply be inv.WorkingDir?
-	pe.WorkingDir = snapshot.view.goCommandDir.Filename()
 	return nil
 }
 

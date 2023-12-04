@@ -12,8 +12,8 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/snippet"
 	"golang.org/x/tools/gopls/internal/lsp/source"
+	"golang.org/x/tools/gopls/internal/lsp/source/completion/snippet"
 )
 
 // some function definitions in test files can be completed
@@ -25,7 +25,7 @@ func definition(path []ast.Node, obj types.Object, pgf *source.ParsedGoFile) ([]
 	if _, ok := obj.(*types.Func); !ok {
 		return nil, nil // not a function at all
 	}
-	if !strings.HasSuffix(pgf.URI.Filename(), "_test.go") {
+	if !strings.HasSuffix(pgf.URI.Path(), "_test.go") {
 		return nil, nil // not a test file
 	}
 

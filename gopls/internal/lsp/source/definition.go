@@ -9,17 +9,21 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"go/types"
 
-	"golang.org/x/tools/gopls/internal/bug"
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/lsp/cache"
+	"golang.org/x/tools/gopls/internal/lsp/cache/metadata"
+	"golang.org/x/tools/gopls/internal/lsp/cache/parsego"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/util/bug"
 	"golang.org/x/tools/internal/event"
 )
 
 // Definition handles the textDocument/definition request for Go files.
-func Definition(ctx context.Context, snapshot Snapshot, fh FileHandle, position protocol.Position) ([]protocol.Location, error) {
+func Definition(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, position protocol.Position) ([]protocol.Location, error) {
 	ctx, done := event.Start(ctx, "source.Definition")
 	defer done()
 
@@ -60,7 +64,7 @@ func Definition(ctx context.Context, snapshot Snapshot, fh FileHandle, position 
 	}
 
 	// Handle the case where the cursor is in a linkname directive.
-	locations, err := LinknameDefinition(ctx, snapshot, fh, position)
+	locations, err := LinknameDefinition(ctx, snapshot, pgf.Mapper, position)
 	if !errors.Is(err, ErrNoLinkname) {
 		return locations, err
 	}
@@ -79,51 +83,7 @@ func Definition(ctx context.Context, snapshot Snapshot, fh FileHandle, position 
 
 	// Handle objects with no position: builtin, unsafe.
 	if !obj.Pos().IsValid() {
-		var pgf *ParsedGoFile
-		if obj.Parent() == types.Universe {
-			// pseudo-package "builtin"
-			builtinPGF, err := snapshot.BuiltinFile(ctx)
-			if err != nil {
-				return nil, err
-			}
-			pgf = builtinPGF
-
-		} else if obj.Pkg() == types.Unsafe {
-			// package "unsafe"
-			unsafe := snapshot.Metadata("unsafe")
-			if unsafe == nil {
-				return nil, fmt.Errorf("no metadata for package 'unsafe'")
-			}
-			uri := unsafe.GoFiles[0]
-			fh, err := snapshot.ReadFile(ctx, uri)
-			if err != nil {
-				return nil, err
-			}
-			pgf, err = snapshot.ParseGo(ctx, fh, ParseFull&^SkipObjectResolution)
-			if err != nil {
-				return nil, err
-			}
-
-		} else {
-			return nil, bug.Errorf("internal error: no position for %v", obj.Name())
-		}
-		// Inv: pgf ∈ {builtin,unsafe}.go
-
-		// Use legacy (go/ast) object resolution.
-		astObj := pgf.File.Scope.Lookup(obj.Name())
-		if astObj == nil {
-			// Every built-in should have documentation syntax.
-			return nil, bug.Errorf("internal error: no object for %s", obj.Name())
-		}
-		decl, ok := astObj.Decl.(ast.Node)
-		if !ok {
-			return nil, bug.Errorf("internal error: no declaration for %s", obj.Name())
-		}
-		loc, err := pgf.PosLocation(decl.Pos(), decl.Pos()+token.Pos(len(obj.Name())))
-		if err != nil {
-			return nil, err
-		}
-		return []protocol.Location{loc}, nil
+		return builtinDefinition(ctx, snapshot, obj)
 	}
 
 	// Finally, map the object position.
@@ -132,6 +92,91 @@ func Definition(ctx context.Context, snapshot Snapshot, fh FileHandle, position 
 		return nil, err
 	}
 	return []protocol.Location{loc}, nil
+}
+
+// builtinDefinition returns the location of the fake source
+// declaration of a built-in in {builtin,unsafe}.go.
+func builtinDefinition(ctx context.Context, snapshot *cache.Snapshot, obj types.Object) ([]protocol.Location, error) {
+	pgf, decl, err := builtinDecl(ctx, snapshot, obj)
+	if err != nil {
+		return nil, err
+	}
+
+	loc, err := pgf.PosLocation(decl.Pos(), decl.Pos()+token.Pos(len(obj.Name())))
+	if err != nil {
+		return nil, err
+	}
+	return []protocol.Location{loc}, nil
+}
+
+// builtinDecl returns the parsed Go file and node corresponding to a builtin
+// object, which may be a universe object or part of types.Unsafe.
+func builtinDecl(ctx context.Context, snapshot *cache.Snapshot, obj types.Object) (*parsego.File, ast.Node, error) {
+	// getDecl returns the file-level declaration of name
+	// using legacy (go/ast) object resolution.
+	getDecl := func(file *ast.File, name string) (ast.Node, error) {
+		astObj := file.Scope.Lookup(name)
+		if astObj == nil {
+			// Every built-in should have documentation syntax.
+			return nil, bug.Errorf("internal error: no object for %s", name)
+		}
+		decl, ok := astObj.Decl.(ast.Node)
+		if !ok {
+			return nil, bug.Errorf("internal error: no declaration for %s", obj.Name())
+		}
+		return decl, nil
+	}
+
+	var (
+		pgf  *ParsedGoFile
+		decl ast.Node
+		err  error
+	)
+	if obj.Pkg() == types.Unsafe {
+		// package "unsafe":
+		// parse $GOROOT/src/unsafe/unsafe.go
+		unsafe := snapshot.Metadata("unsafe")
+		if unsafe == nil {
+			// If the type checker somehow resolved 'unsafe', we must have metadata
+			// for it.
+			return nil, nil, bug.Errorf("no metadata for package 'unsafe'")
+		}
+		uri := unsafe.GoFiles[0]
+		fh, err := snapshot.ReadFile(ctx, uri)
+		if err != nil {
+			return nil, nil, err
+		}
+		pgf, err = snapshot.ParseGo(ctx, fh, ParseFull&^parser.SkipObjectResolution)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		decl, err = getDecl(pgf.File, obj.Name())
+	} else {
+		// pseudo-package "builtin":
+		// use parsed $GOROOT/src/builtin/builtin.go
+		pgf, err = snapshot.BuiltinFile(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if obj.Parent() == types.Universe {
+			// built-in function or type
+			decl, err = getDecl(pgf.File, obj.Name())
+
+		} else if obj.Name() == "Error" {
+			// error.Error method
+			decl, err = getDecl(pgf.File, "error")
+			if err != nil {
+				return nil, nil, err
+			}
+			decl = decl.(*ast.TypeSpec).Type.(*ast.InterfaceType).Methods.List[0]
+
+		} else {
+			return nil, nil, bug.Errorf("unknown built-in %v", obj)
+		}
+	}
+	return pgf, decl, nil
 }
 
 // referencedObject returns the identifier and object referenced at the
@@ -151,7 +196,7 @@ func Definition(ctx context.Context, snapshot Snapshot, fh FileHandle, position 
 // TODO(rfindley): this function exists to preserve the pre-existing behavior
 // of source.Identifier. Eliminate this helper in favor of sharing
 // functionality with objectsAt, after choosing suitable primitives.
-func referencedObject(pkg Package, pgf *ParsedGoFile, pos token.Pos) (*ast.Ident, types.Object, types.Type) {
+func referencedObject(pkg *cache.Package, pgf *ParsedGoFile, pos token.Pos) (*ast.Ident, types.Object, types.Type) {
 	path := pathEnclosingObjNode(pgf.File, pos)
 	if len(path) == 0 {
 		return nil, nil, nil
@@ -191,7 +236,7 @@ func referencedObject(pkg Package, pgf *ParsedGoFile, pos token.Pos) (*ast.Ident
 // import spec containing pos.
 //
 // If pos is not inside an import spec, it returns nil, nil.
-func importDefinition(ctx context.Context, s Snapshot, pkg Package, pgf *ParsedGoFile, pos token.Pos) ([]protocol.Location, error) {
+func importDefinition(ctx context.Context, s *cache.Snapshot, pkg *cache.Package, pgf *ParsedGoFile, pos token.Pos) ([]protocol.Location, error) {
 	var imp *ast.ImportSpec
 	for _, spec := range pgf.File.Imports {
 		// We use "<= End" to accept a query immediately after an ImportSpec.
@@ -203,7 +248,7 @@ func importDefinition(ctx context.Context, s Snapshot, pkg Package, pgf *ParsedG
 		return nil, nil
 	}
 
-	importPath := UnquoteImportPath(imp)
+	importPath := metadata.UnquoteImportPath(imp)
 	impID := pkg.Metadata().DepsByImpPath[importPath]
 	if impID == "" {
 		return nil, fmt.Errorf("failed to resolve import %q", importPath)
@@ -245,9 +290,9 @@ func importDefinition(ctx context.Context, s Snapshot, pkg Package, pgf *ParsedG
 
 // TODO(rfindley): avoid the duplicate column mapping here, by associating a
 // column mapper with each file handle.
-func mapPosition(ctx context.Context, fset *token.FileSet, s FileSource, start, end token.Pos) (protocol.Location, error) {
+func mapPosition(ctx context.Context, fset *token.FileSet, s file.Source, start, end token.Pos) (protocol.Location, error) {
 	file := fset.File(start)
-	uri := span.URIFromPath(file.Name())
+	uri := protocol.URIFromPath(file.Name())
 	fh, err := s.ReadFile(ctx, uri)
 	if err != nil {
 		return protocol.Location{}, err

@@ -27,11 +27,10 @@ Package | Description
 [gopls] | the main binary, plugins and integration tests
 [internal/lsp] | the core message handling package
 [internal/lsp/cache] | the cache layer
-[internal/lsp/cmd] | the gopls command line layer
-[internal/lsp/debug] | features to aid in debugging gopls
+[internal/cmd] | the gopls command line layer
+[internal/debug] | features to aid in debugging gopls
 [internal/lsp/protocol] | the types of LSP request and response messages
 [internal/lsp/source] | the core feature implementations
-[internal/span] | a package for dealing with source file locations
 [internal/memoize] | a function invocation cache used to reduce the work done
 [internal/jsonrpc2] | an implementation of the JSON RPC2 specification
 
@@ -39,10 +38,9 @@ Package | Description
 [internal/jsonrpc2]: https://github.com/golang/tools/tree/master/internal/jsonrpc2
 [internal/lsp]: https://github.com/golang/tools/tree/master/gopls/internal/lsp
 [internal/lsp/cache]: https://github.com/golang/tools/tree/master/gopls/internal/lsp/cache
-[internal/lsp/cmd]: https://github.com/golang/tools/tree/master/gopls/internal/lsp/cmd
-[internal/lsp/debug]: https://github.com/golang/tools/tree/master/gopls/internal/lsp/debug
-[internal/lsp/protocol]: https://github.com/golang/tools/tree/master/gopls/internal/lsp/protocol
+[internal/cmd]: https://github.com/golang/tools/tree/master/gopls/internal/cmd
+[internal/debug]: https://github.com/golang/tools/tree/master/gopls/internal/lsp/debug
 [internal/lsp/source]: https://github.com/golang/tools/tree/master/gopls/internal/lsp/source
 [internal/memoize]: https://github.com/golang/tools/tree/master/internal/memoize
-[internal/span]: https://github.com/golang/tools/tree/master/gopls/internal/span
+[internal/lsp/protocol]: https://github.com/golang/tools/tree/master/gopls/internal/lsp/protocol
 [x/tools]: https://github.com/golang/tools

@@ -7,20 +7,26 @@
 package main
 
 import (
+	"bytes"
 	_ "embed"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"go/ast"
 	"go/token"
+	"go/types"
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"runtime/pprof"
 	"sort"
 	"strings"
+	"text/template"
 
+	"golang.org/x/tools/go/callgraph"
 	"golang.org/x/tools/go/callgraph/rta"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/ssa"
@@ -36,8 +42,10 @@ var (
 	tagsFlag = flag.String("tags", "", "comma-separated list of extra build tags (see: go help buildconstraint)")
 
 	filterFlag    = flag.String("filter", "<module>", "report only packages matching this regular expression (default: module of first package)")
-	generatedFlag = flag.Bool("generated", true, "report dead functions in generated Go files")
-	lineFlag      = flag.Bool("line", false, "show output in a line-oriented format")
+	generatedFlag = flag.Bool("generated", false, "include dead functions in generated Go files")
+	whyLiveFlag   = flag.String("whylive", "", "show a path from main to the named function")
+	formatFlag    = flag.String("f", "", "format output records using template")
+	jsonFlag      = flag.Bool("json", false, "output JSON records")
 	cpuProfile    = flag.String("cpuprofile", "", "write CPU profile to this file")
 	memProfile    = flag.String("memprofile", "", "write memory profile to this file")
 )
@@ -91,6 +99,16 @@ func main() {
 		}()
 	}
 
+	// Reject bad output options early.
+	if *formatFlag != "" {
+		if *jsonFlag {
+			log.Fatalf("you cannot specify both -f=template and -json")
+		}
+		if _, err := template.New("deadcode").Parse(*formatFlag); err != nil {
+			log.Fatalf("invalid -f: %v", err)
+		}
+	}
+
 	// Load, parse, and type-check the complete program(s).
 	cfg := &packages.Config{
 		BuildFlags: []string{"-tags=" + *tagsFlag},
@@ -108,17 +126,15 @@ func main() {
 		log.Fatalf("packages contain errors")
 	}
 
-	// (Optionally) gather names of generated files.
+	// Gather names of generated files.
 	generated := make(map[string]bool)
-	if !*generatedFlag {
-		packages.Visit(initial, nil, func(p *packages.Package) {
-			for _, file := range p.Syntax {
-				if isGenerated(file) {
-					generated[p.Fset.File(file.Pos()).Name()] = true
-				}
+	packages.Visit(initial, nil, func(p *packages.Package) {
+		for _, file := range p.Syntax {
+			if isGenerated(file) {
+				generated[p.Fset.File(file.Pos()).Name()] = true
 			}
-		})
-	}
+		}
+	})
 
 	// If -filter is unset, use first module (if available).
 	if *filterFlag == "<module>" {
@@ -148,8 +164,8 @@ func main() {
 	}
 
 	// Compute the reachabilty from main.
-	// (We don't actually build a call graph.)
-	res := rta.Analyze(roots, false)
+	// (Build a call graph only for -whylive.)
+	res := rta.Analyze(roots, *whyLiveFlag != "")
 
 	// Subtle: the -test flag causes us to analyze test variants
 	// such as "package p as compiled for p.test" or even "for q.test".
@@ -164,9 +180,79 @@ func main() {
 	// to packages "p" and "p [p.test]" were parsed only once.)
 	reachablePosn := make(map[token.Position]bool)
 	for fn := range res.Reachable {
-		if fn.Pos().IsValid() {
+		if fn.Pos().IsValid() || fn.Name() == "init" {
 			reachablePosn[prog.Fset.Position(fn.Pos())] = true
 		}
+	}
+
+	// The -whylive=fn flag causes deadcode to explain why a function
+	// is not dead, by showing a path to it from some root.
+	if *whyLiveFlag != "" {
+		targets := make(map[*ssa.Function]bool)
+		for fn := range ssautil.AllFunctions(prog) {
+			if fn.Synthetic != "" || fn.Object() == nil {
+				continue // not a source-level named function
+			}
+			if prettyName(fn, true) == *whyLiveFlag {
+				targets[fn] = true
+			}
+		}
+		if len(targets) == 0 {
+			// Function is not part of the program.
+			//
+			// TODO(adonovan): improve the UX here in case
+			// of spelling or syntax mistakes. Some ideas:
+			// - a cmd/callgraph command to enumerate
+			//   available functions.
+			// - a deadcode -live flag to compute the complement.
+			// - a syntax hint: example.com/pkg.Func or (example.com/pkg.Type).Method
+			// - report the element of AllFunctions with the smallest
+			//   Levenshtein distance from *whyLiveFlag.
+			// - permit -whylive=regexp. But beware of spurious
+			//   matches (e.g. fmt.Print matches fmt.Println)
+			//   and the annoyance of having to quote parens (*T).f.
+			log.Fatalf("function %q not found in program", *whyLiveFlag)
+		}
+
+		// Opt: remove the unreachable ones.
+		for fn := range targets {
+			if !reachablePosn[prog.Fset.Position(fn.Pos())] {
+				delete(targets, fn)
+			}
+		}
+		if len(targets) == 0 {
+			log.Fatalf("function %s is dead code", *whyLiveFlag)
+		}
+
+		res.CallGraph.DeleteSyntheticNodes() // inline synthetic wrappers (except inits)
+		root, path := pathSearch(roots, res, targets)
+		if root == nil {
+			// RTA doesn't add callgraph edges for reflective calls.
+			log.Fatalf("%s is reachable only through reflection", *whyLiveFlag)
+		}
+		if len(path) == 0 {
+			// No edges => one of the targets is a root.
+			// Rather than (confusingly) print nothing, make this an error.
+			log.Fatalf("%s is a root", root.Func)
+		}
+
+		// Build a list of jsonEdge records
+		// to print as -json or -f=template.
+		var edges []any
+		for _, edge := range path {
+			edges = append(edges, jsonEdge{
+				Initial:  cond(len(edges) == 0, prettyName(edge.Caller.Func, true), ""),
+				Kind:     cond(isStaticCall(edge), "static", "dynamic"),
+				Position: toJSONPosition(prog.Fset.Position(edge.Site.Pos())),
+				Callee:   prettyName(edge.Callee.Func, true),
+			})
+		}
+		format := `{{if .Initial}}{{printf "%19s%s\n" "" .Initial}}{{end}}{{printf "%8s@L%.4d --> %s" .Kind .Position.Line .Callee}}`
+		if *formatFlag != "" {
+			format = *formatFlag
+		}
+		printObjects(format, edges)
+		return
 	}
 
 	// Group unreachable functions by package path.
@@ -193,12 +279,6 @@ func main() {
 
 		posn := prog.Fset.Position(fn.Pos())
 
-		// If -generated=false, skip functions declared in generated Go files.
-		// (Functions called by them may still be reported as dead.)
-		if generated[posn.Filename] {
-			continue
-		}
-
 		if !reachablePosn[posn] {
 			reachablePosn[posn] = true // suppress dups with same pos
 
@@ -212,12 +292,9 @@ func main() {
 		}
 	}
 
-	// Report dead functions grouped by packages.
-	// TODO(adonovan): use maps.Keys, twice.
-	pkgpaths := make([]string, 0, len(byPkgPath))
-	for pkgpath := range byPkgPath {
-		pkgpaths = append(pkgpaths, pkgpath)
-	}
+	// Build array of jsonPackage objects.
+	var packages []any
+	pkgpaths := keys(byPkgPath)
 	sort.Strings(pkgpaths)
 	for _, pkgpath := range pkgpaths {
 		if !filter.MatchString(pkgpath) {
@@ -230,10 +307,7 @@ func main() {
 		// declaration order. This tends to keep related
 		// methods such as (T).Marshal and (*T).Unmarshal
 		// together better than sorting.
-		fns := make([]*ssa.Function, 0, len(m))
-		for fn := range m {
-			fns = append(fns, fn)
-		}
+		fns := keys(m)
 		sort.Slice(fns, func(i, j int) bool {
 			xposn := prog.Fset.Position(fns[i].Pos())
 			yposn := prog.Fset.Position(fns[j].Pos())
@@ -243,19 +317,107 @@ func main() {
 			return xposn.Line < yposn.Line
 		})
 
-		if *lineFlag {
-			// line-oriented output
-			for _, fn := range fns {
-				fmt.Println(fn)
+		var functions []jsonFunction
+		for _, fn := range fns {
+			posn := prog.Fset.Position(fn.Pos())
+
+			// Without -generated, skip functions declared in
+			// generated Go files.
+			// (Functions called by them may still be reported.)
+			gen := generated[posn.Filename]
+			if gen && !*generatedFlag {
+				continue
 			}
-		} else {
-			// functions grouped by package
-			fmt.Printf("package %q\n", pkgpath)
-			for _, fn := range fns {
-				fmt.Printf("\tfunc %s\n", fn.RelString(fn.Pkg.Pkg))
-			}
-			fmt.Println()
+
+			functions = append(functions, jsonFunction{
+				Name:      prettyName(fn, false),
+				Position:  toJSONPosition(posn),
+				Generated: gen,
+			})
 		}
+		if len(functions) > 0 {
+			packages = append(packages, jsonPackage{
+				Name:  fns[0].Pkg.Pkg.Name(),
+				Path:  pkgpath,
+				Funcs: functions,
+			})
+		}
+	}
+
+	// Default line-oriented format: "a/b/c.go:1:2: unreachable func: T.f"
+	format := `{{range .Funcs}}{{printf "%s: unreachable func: %s\n" .Position .Name}}{{end}}`
+	if *formatFlag != "" {
+		format = *formatFlag
+	}
+	printObjects(format, packages)
+}
+
+// prettyName is a fork of Function.String designed to reduce
+// go/ssa's fussy punctuation symbols, e.g. "(*pkg.T).F" -> "pkg.T.F".
+//
+// It only works for functions that remain after
+// callgraph.Graph.DeleteSyntheticNodes: source-level named functions
+// and methods, their anonymous functions, and synthetic package
+// initializers.
+func prettyName(fn *ssa.Function, qualified bool) string {
+	var buf strings.Builder
+
+	// optional package qualifier
+	if qualified && fn.Pkg != nil {
+		fmt.Fprintf(&buf, "%s.", fn.Pkg.Pkg.Path())
+	}
+
+	var format func(*ssa.Function)
+	format = func(fn *ssa.Function) {
+		// anonymous?
+		if fn.Parent() != nil {
+			format(fn.Parent())
+			i := index(fn.Parent().AnonFuncs, fn)
+			fmt.Fprintf(&buf, "$%d", i+1)
+			return
+		}
+
+		// method receiver?
+		if recv := fn.Signature.Recv(); recv != nil {
+			t := recv.Type()
+			if ptr, ok := t.(*types.Pointer); ok {
+				t = ptr.Elem()
+			}
+			buf.WriteString(t.(*types.Named).Obj().Name())
+			buf.WriteByte('.')
+		}
+
+		// function/method name
+		buf.WriteString(fn.Name())
+	}
+	format(fn)
+
+	return buf.String()
+}
+
+// printObjects formats an array of objects, either as JSON or using a
+// template, following the manner of 'go list (-json|-f=template)'.
+func printObjects(format string, objects []any) {
+	if *jsonFlag {
+		out, err := json.MarshalIndent(objects, "", "\t")
+		if err != nil {
+			log.Fatalf("internal error: %v", err)
+		}
+		os.Stdout.Write(out)
+		return
+	}
+
+	// -f=template. Parse can't fail: we checked it earlier.
+	tmpl := template.Must(template.New("deadcode").Parse(format))
+	for _, object := range objects {
+		var buf bytes.Buffer
+		if err := tmpl.Execute(&buf, object); err != nil {
+			log.Fatal(err)
+		}
+		if n := buf.Len(); n == 0 || buf.Bytes()[n-1] != '\n' {
+			buf.WriteByte('\n')
+		}
+		os.Stdout.Write(buf.Bytes())
 	}
 }
 
@@ -296,4 +458,196 @@ func generator(file *ast.File) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// pathSearch returns the shortest path from one of the roots to one
+// of the targets (along with the root itself), or zero if no path was found.
+func pathSearch(roots []*ssa.Function, res *rta.Result, targets map[*ssa.Function]bool) (*callgraph.Node, []*callgraph.Edge) {
+	// Search breadth-first (for shortest path) from the root.
+	//
+	// We don't use the virtual CallGraph.Root node as we wish to
+	// choose the order in which we search entrypoints:
+	// non-test packages before test packages,
+	// main functions before init functions.
+
+	// Sort roots into preferred order.
+	importsTesting := func(fn *ssa.Function) bool {
+		isTesting := func(p *types.Package) bool { return p.Path() == "testing" }
+		return containsFunc(fn.Pkg.Pkg.Imports(), isTesting)
+	}
+	sort.Slice(roots, func(i, j int) bool {
+		x, y := roots[i], roots[j]
+		xtest := importsTesting(x)
+		ytest := importsTesting(y)
+		if xtest != ytest {
+			return !xtest // non-tests before tests
+		}
+		xinit := x.Name() == "init"
+		yinit := y.Name() == "init"
+		if xinit != yinit {
+			return !xinit // mains before inits
+		}
+		return false
+	})
+
+	search := func(allowDynamic bool) (*callgraph.Node, []*callgraph.Edge) {
+		// seen maps each encountered node to its predecessor on the
+		// path to a root node, or to nil for root itself.
+		seen := make(map[*callgraph.Node]*callgraph.Edge)
+		bfs := func(root *callgraph.Node) []*callgraph.Edge {
+			queue := []*callgraph.Node{root}
+			seen[root] = nil
+			for len(queue) > 0 {
+				node := queue[0]
+				queue = queue[1:]
+
+				// found a path?
+				if targets[node.Func] {
+					path := []*callgraph.Edge{} // non-nil in case len(path)=0
+					for {
+						edge := seen[node]
+						if edge == nil {
+							reverse(path)
+							return path
+						}
+						path = append(path, edge)
+						node = edge.Caller
+					}
+				}
+
+				for _, edge := range node.Out {
+					if allowDynamic || isStaticCall(edge) {
+						if _, ok := seen[edge.Callee]; !ok {
+							seen[edge.Callee] = edge
+							queue = append(queue, edge.Callee)
+						}
+					}
+				}
+			}
+			return nil
+		}
+		for _, rootFn := range roots {
+			root := res.CallGraph.Nodes[rootFn]
+			if root == nil {
+				// Missing call graph node for root.
+				// TODO(adonovan): seems like a bug in rta.
+				continue
+			}
+			if path := bfs(root); path != nil {
+				return root, path
+			}
+		}
+		return nil, nil
+	}
+
+	for _, allowDynamic := range []bool{false, true} {
+		if root, path := search(allowDynamic); path != nil {
+			return root, path
+		}
+	}
+
+	return nil, nil
+}
+
+// -- utilities --
+
+func isStaticCall(edge *callgraph.Edge) bool {
+	return edge.Site != nil && edge.Site.Common().StaticCallee() != nil
+}
+
+var cwd, _ = os.Getwd()
+
+func toJSONPosition(posn token.Position) jsonPosition {
+	// Use cwd-relative filename if possible.
+	filename := posn.Filename
+	if rel, err := filepath.Rel(cwd, filename); err == nil && !strings.HasPrefix(rel, "..") {
+		filename = rel
+	}
+
+	return jsonPosition{filename, posn.Line, posn.Column}
+}
+
+func cond[T any](cond bool, t, f T) T {
+	if cond {
+		return t
+	} else {
+		return f
+	}
+}
+
+// -- output protocol (for JSON or text/template) --
+
+// Keep in sync with doc comment!
+
+type jsonFunction struct {
+	Name      string       // name (sans package qualifier)
+	Position  jsonPosition // file/line/column of declaration
+	Generated bool         // function is declared in a generated .go file
+}
+
+func (f jsonFunction) String() string { return f.Name }
+
+type jsonPackage struct {
+	Name  string         // declared name
+	Path  string         // full import path
+	Funcs []jsonFunction // non-empty list of package's dead functions
+}
+
+func (p jsonPackage) String() string { return p.Path }
+
+// The Initial and Callee names are package-qualified.
+type jsonEdge struct {
+	Initial  string `json:",omitempty"` // initial entrypoint (main or init); first edge only
+	Kind     string // = static | dynamic
+	Position jsonPosition
+	Callee   string
+}
+
+type jsonPosition struct {
+	File      string
+	Line, Col int
+}
+
+func (p jsonPosition) String() string {
+	return fmt.Sprintf("%s:%d:%d", p.File, p.Line, p.Col)
+}
+
+// -- from the future --
+
+// TODO(adonovan): use go1.22's slices and maps packages.
+
+func containsFunc[S ~[]E, E any](s S, f func(E) bool) bool {
+	return indexFunc(s, f) >= 0
+}
+
+func indexFunc[S ~[]E, E any](s S, f func(E) bool) int {
+	for i := range s {
+		if f(s[i]) {
+			return i
+		}
+	}
+	return -1
+}
+
+func index[S ~[]E, E comparable](s S, v E) int {
+	for i := range s {
+		if v == s[i] {
+			return i
+		}
+	}
+	return -1
+}
+
+func reverse[S ~[]E, E any](s S) {
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		s[i], s[j] = s[j], s[i]
+	}
+}
+
+func keys[M ~map[K]V, K comparable, V any](m M) []K {
+	r := make([]K, 0, len(m))
+	for k := range m {
+		r = append(r, k)
+	}
+	return r
 }

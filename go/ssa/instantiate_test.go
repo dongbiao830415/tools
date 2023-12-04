@@ -16,7 +16,6 @@ import (
 	"testing"
 
 	"golang.org/x/tools/go/loader"
-	"golang.org/x/tools/internal/typeparams"
 )
 
 // loadProgram creates loader.Program out of p.
@@ -53,9 +52,6 @@ func buildPackage(lprog *loader.Program, pkg string, mode BuilderMode) *Package 
 // TestNeedsInstance ensures that new method instances can be created via needsInstance,
 // that TypeArgs are as expected, and can be accessed via _Instances.
 func TestNeedsInstance(t *testing.T) {
-	if !typeparams.Enabled {
-		return
-	}
 	const input = `
 package p
 
@@ -102,7 +98,7 @@ func LoadPointer(addr *unsafe.Pointer) (val unsafe.Pointer)
 
 		var cr creator
 		intSliceTyp := types.NewSlice(types.Typ[types.Int])
-		instance := prog.needsInstance(meth, []types.Type{intSliceTyp}, &cr)
+		instance := meth.instance([]types.Type{intSliceTyp}, &cr)
 		if len(cr) != 1 {
 			t.Errorf("Expected first instance to create a function. got %d created functions", len(cr))
 		}
@@ -112,20 +108,20 @@ func LoadPointer(addr *unsafe.Pointer) (val unsafe.Pointer)
 		if len(instance.TypeArgs()) != 1 || !types.Identical(instance.TypeArgs()[0], intSliceTyp) {
 			t.Errorf("Expected TypeArgs of %s to be %v. got %v", instance, []types.Type{intSliceTyp}, instance.typeargs)
 		}
-		instances := prog._Instances(meth)
+		instances := allInstances(meth)
 		if want := []*Function{instance}; !reflect.DeepEqual(instances, want) {
 			t.Errorf("Expected instances of %s to be %v. got %v", meth, want, instances)
 		}
 
 		// A second request with an identical type returns the same Function.
-		second := prog.needsInstance(meth, []types.Type{types.NewSlice(types.Typ[types.Int])}, &cr)
+		second := meth.instance([]types.Type{types.NewSlice(types.Typ[types.Int])}, &cr)
 		if second != instance || len(cr) != 1 {
 			t.Error("Expected second identical instantiation to not create a function")
 		}
 
 		// Add a second instance.
-		inst2 := prog.needsInstance(meth, []types.Type{types.NewSlice(types.Typ[types.Uint])}, &cr)
-		instances = prog._Instances(meth)
+		inst2 := meth.instance([]types.Type{types.NewSlice(types.Typ[types.Uint])}, &cr)
+		instances = allInstances(meth)
 
 		// Note: instance.Name() < inst2.Name()
 		sort.Slice(instances, func(i, j int) bool {
@@ -134,6 +130,8 @@ func LoadPointer(addr *unsafe.Pointer) (val unsafe.Pointer)
 		if want := []*Function{instance, inst2}; !reflect.DeepEqual(instances, want) {
 			t.Errorf("Expected instances of %s to be %v. got %v", meth, want, instances)
 		}
+
+		// TODO(adonovan): tests should not rely on unexported functions.
 
 		// build and sanity check manually created instance.
 		var b builder
@@ -148,9 +146,6 @@ func LoadPointer(addr *unsafe.Pointer) (val unsafe.Pointer)
 // TestCallsToInstances checks that calles of calls to generic functions,
 // without monomorphization, are wrappers around the origin generic function.
 func TestCallsToInstances(t *testing.T) {
-	if !typeparams.Enabled {
-		return
-	}
 	const input = `
 package p
 
@@ -256,7 +251,7 @@ func entry(i int, a A) int {
 }
 
 func instanceOf(f *Function, name string, prog *Program) *Function {
-	for _, i := range prog._Instances(f) {
+	for _, i := range allInstances(f) {
 		if i.Name() == name {
 			return i
 		}
@@ -292,9 +287,6 @@ func changeTypeInstrs(b *BasicBlock) int {
 }
 
 func TestInstanceUniqueness(t *testing.T) {
-	if !typeparams.Enabled {
-		return
-	}
 	const input = `
 package p
 
@@ -324,7 +316,6 @@ func Foo[T any, S any](t T, s S) {
 	}
 
 	p := buildPackage(lprog, "p", SanityCheckFunctions)
-	prog := p.Prog
 
 	for _, test := range []struct {
 		orig      string
@@ -339,7 +330,7 @@ func Foo[T any, S any](t T, s S) {
 				t.Fatalf("origin function not found")
 			}
 
-			instances := prog._Instances(f)
+			instances := allInstances(f)
 			sort.Slice(instances, func(i, j int) bool { return instances[i].Name() < instances[j].Name() })
 
 			if got := fmt.Sprintf("%v", instances); !reflect.DeepEqual(got, test.instances) {
@@ -349,13 +340,22 @@ func Foo[T any, S any](t T, s S) {
 	}
 }
 
-// instancesStr returns a sorted slice of string
-// representation of instances.
-func instancesStr(instances []*Function) []string {
-	var is []string
-	for _, i := range instances {
-		is = append(is, fmt.Sprintf("%v", i))
+// allInstances returns a new unordered array of all instances of the
+// specified function, if generic, or nil otherwise.
+//
+// Thread-safe.
+//
+// TODO(adonovan): delete this. The tests should be intensional (e.g.
+// "what instances of f are reachable?") not representational (e.g.
+// "what is the history of calls to Function.instance?").
+//
+// Acquires fn.generic.instancesMu.
+func allInstances(fn *Function) []*Function {
+	if fn.generic == nil {
+		return nil
 	}
-	sort.Strings(is)
-	return is
+
+	fn.generic.instancesMu.Lock()
+	defer fn.generic.instancesMu.Unlock()
+	return mapValues(fn.generic.instances)
 }

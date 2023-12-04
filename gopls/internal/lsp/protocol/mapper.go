@@ -29,10 +29,10 @@ package protocol
 //      recovery whose computed positions are out of bounds (EOF+1).
 //    - #41029, whereby the wrong line number is returned for the EOF position.
 //
-// 3. the span package.
+// 3. the cmd package.
 //
-//    span.Point = (line, col8, offset).
-//    span.Span = (uri URI, start, end span.Point)
+//    cmd.point = (line, col8, offset).
+//    cmd.Span = (uri URI, start, end cmd.point)
 //
 //          Line and column are 1-based.
 //          Columns are measured in bytes (UTF-8 codes).
@@ -54,7 +54,7 @@ package protocol
 //          Characters (columns) are measured in UTF-16 codes.
 //
 //    protocol.Mapper holds the (URI, Content) of a file, enabling
-//    efficient mapping between byte offsets, span ranges, and
+//    efficient mapping between byte offsets, cmd ranges, and
 //    protocol ranges.
 //
 //    protocol.MappedRange holds a protocol.Mapper and valid (start,
@@ -66,22 +66,19 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"unicode/utf8"
 
-	"golang.org/x/tools/gopls/internal/bug"
-	"golang.org/x/tools/gopls/internal/lsp/safetoken"
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/util/safetoken"
 )
 
 // A Mapper wraps the content of a file and provides mapping
 // between byte offsets and notations of position such as:
 //
 //   - (line, col8) pairs, where col8 is a 1-based UTF-8 column number
-//     (bytes), as used by the go/token and span packages.
+//     (bytes), as used by the go/token and cmd packages.
 //
 //   - (line, col16) pairs, where col16 is a 1-based UTF-16 column
 //     number, as used by the LSP protocol.
@@ -96,7 +93,7 @@ import (
 //
 // See overview comments at top of this file.
 type Mapper struct {
-	URI     span.URI
+	URI     DocumentURI
 	Content []byte
 
 	// Line-number information is requested only for a tiny
@@ -111,7 +108,7 @@ type Mapper struct {
 }
 
 // NewMapper creates a new mapper for the given URI and content.
-func NewMapper(uri span.URI, content []byte) *Mapper {
+func NewMapper(uri DocumentURI, content []byte) *Mapper {
 	return &Mapper{URI: uri, Content: content}
 }
 
@@ -131,66 +128,28 @@ func (m *Mapper) initLines() {
 	})
 }
 
-// -- conversions from span (UTF-8) domain --
+// LineCol8Position converts a valid line and UTF-8 column number,
+// both 1-based, to a protocol (UTF-16) position.
+func (m *Mapper) LineCol8Position(line, col8 int) (Position, error) {
+	m.initLines()
+	line0 := line - 1 // 0-based
+	if !(0 <= line0 && line0 < len(m.lineStart)) {
+		return Position{}, fmt.Errorf("line number %d out of range (max %d)", line, len(m.lineStart))
+	}
 
-// SpanLocation converts a (UTF-8) span to a protocol (UTF-16) range.
-// Precondition: the URIs of SpanLocation and Mapper match.
-func (m *Mapper) SpanLocation(s span.Span) (Location, error) {
-	rng, err := m.SpanRange(s)
-	if err != nil {
-		return Location{}, err
-	}
-	return m.RangeLocation(rng), nil
-}
+	// content[start:end] is the preceding partial line.
+	start := m.lineStart[line0]
+	end := start + col8 - 1
 
-// SpanRange converts a (UTF-8) span to a protocol (UTF-16) range.
-// Precondition: the URIs of Span and Mapper match.
-func (m *Mapper) SpanRange(s span.Span) (Range, error) {
-	// Assert that we aren't using the wrong mapper.
-	// We check only the base name, and case insensitively,
-	// because we can't assume clean paths, no symbolic links,
-	// case-sensitive directories. The authoritative answer
-	// requires querying the file system, and we don't want
-	// to do that.
-	if !strings.EqualFold(filepath.Base(string(m.URI)), filepath.Base(string(s.URI()))) {
-		return Range{}, bug.Errorf("mapper is for file %q instead of %q", m.URI, s.URI())
+	// Validate column.
+	if end > len(m.Content) {
+		return Position{}, fmt.Errorf("column is beyond end of file")
+	} else if line0+1 < len(m.lineStart) && end >= m.lineStart[line0+1] {
+		return Position{}, fmt.Errorf("column is beyond end of line")
 	}
-	start, err := m.PointPosition(s.Start())
-	if err != nil {
-		return Range{}, fmt.Errorf("start: %w", err)
-	}
-	end, err := m.PointPosition(s.End())
-	if err != nil {
-		return Range{}, fmt.Errorf("end: %w", err)
-	}
-	return Range{Start: start, End: end}, nil
-}
 
-// PointPosition converts a valid span (UTF-8) point to a protocol (UTF-16) position.
-func (m *Mapper) PointPosition(p span.Point) (Position, error) {
-	if p.HasPosition() {
-		line, col8 := p.Line()-1, p.Column()-1 // both 0-based
-		m.initLines()
-		if line >= len(m.lineStart) {
-			return Position{}, fmt.Errorf("line number %d out of range (max %d)", line, len(m.lineStart))
-		}
-		offset := m.lineStart[line]
-		end := offset + col8
-
-		// Validate column.
-		if end > len(m.Content) {
-			return Position{}, fmt.Errorf("column is beyond end of file")
-		} else if line+1 < len(m.lineStart) && end >= m.lineStart[line+1] {
-			return Position{}, fmt.Errorf("column is beyond end of line")
-		}
-
-		char := UTF16Len(m.Content[offset:end])
-		return Position{Line: uint32(line), Character: uint32(char)}, nil
-	}
-	if p.HasOffset() {
-		return m.OffsetPosition(p.Offset())
-	}
-	return Position{}, fmt.Errorf("point has neither offset nor line/column")
+	char := UTF16Len(m.Content[start:end])
+	return Position{Line: uint32(line0), Character: uint32(char)}, nil
 }
 
 // -- conversions from byte offsets --
@@ -218,23 +177,6 @@ func (m *Mapper) OffsetRange(start, end int) (Range, error) {
 		return Range{}, fmt.Errorf("end: %v", err)
 	}
 	return Range{Start: startPosition, End: endPosition}, nil
-}
-
-// OffsetSpan converts a byte-offset interval to a (UTF-8) span.
-// The resulting span contains line, column, and offset information.
-func (m *Mapper) OffsetSpan(start, end int) (span.Span, error) {
-	if start > end {
-		return span.Span{}, fmt.Errorf("start offset (%d) > end (%d)", start, end)
-	}
-	startPoint, err := m.OffsetPoint(start)
-	if err != nil {
-		return span.Span{}, fmt.Errorf("start: %v", err)
-	}
-	endPoint, err := m.OffsetPoint(end)
-	if err != nil {
-		return span.Span{}, fmt.Errorf("end: %v", err)
-	}
-	return span.New(m.URI, startPoint, endPoint), nil
 }
 
 // OffsetPosition converts a byte offset to a protocol (UTF-16) position.
@@ -265,14 +207,14 @@ func (m *Mapper) lineCol16(offset int) (int, int) {
 	return line, col16
 }
 
-// lineCol8 converts a valid byte offset to line and UTF-8 column numbers, both 0-based.
-func (m *Mapper) lineCol8(offset int) (int, int) {
+// OffsetLineCol8 converts a valid byte offset to line and UTF-8 column numbers, both 1-based.
+func (m *Mapper) OffsetLineCol8(offset int) (int, int) {
 	line, start, cr := m.line(offset)
 	col8 := offset - start
 	if cr {
 		col8-- // retreat from \r at line end
 	}
-	return line, col8
+	return line + 1, col8 + 1
 }
 
 // line returns:
@@ -300,16 +242,6 @@ func (m *Mapper) line(offset int) (int, int, bool) {
 	return line, m.lineStart[line], cr
 }
 
-// OffsetPoint converts a byte offset to a span (UTF-8) point.
-// The resulting point contains line, column, and offset information.
-func (m *Mapper) OffsetPoint(offset int) (span.Point, error) {
-	if !(0 <= offset && offset <= len(m.Content)) {
-		return span.Point{}, fmt.Errorf("invalid offset %d (want 0-%d)", offset, len(m.Content))
-	}
-	line, col8 := m.lineCol8(offset)
-	return span.NewPoint(line+1, col8+1, offset), nil
-}
-
 // OffsetMappedRange returns a MappedRange for the given byte offsets.
 // A MappedRange can be converted to any other form.
 func (m *Mapper) OffsetMappedRange(start, end int) (MappedRange, error) {
@@ -320,23 +252,6 @@ func (m *Mapper) OffsetMappedRange(start, end int) (MappedRange, error) {
 }
 
 // -- conversions from protocol (UTF-16) domain --
-
-// LocationSpan converts a protocol (UTF-16) Location to a (UTF-8) span.
-// Precondition: the URIs of Location and Mapper match.
-func (m *Mapper) LocationSpan(l Location) (span.Span, error) {
-	// TODO(adonovan): check that l.URI matches m.URI.
-	return m.RangeSpan(l.Range)
-}
-
-// RangeSpan converts a protocol (UTF-16) range to a (UTF-8) span.
-// The resulting span has valid Positions and Offsets.
-func (m *Mapper) RangeSpan(r Range) (span.Span, error) {
-	start, end, err := m.RangeOffsets(r)
-	if err != nil {
-		return span.Span{}, err
-	}
-	return m.OffsetSpan(start, end)
-}
 
 // RangeOffsets converts a protocol (UTF-16) range to start/end byte offsets.
 func (m *Mapper) RangeOffsets(r Range) (int, int, error) {
@@ -395,18 +310,6 @@ func (m *Mapper) PositionOffset(p Position) (int, error) {
 	return offset + col8, nil
 }
 
-// PositionPoint converts a protocol (UTF-16) position to a span (UTF-8) point.
-// The resulting point has a valid Position and Offset.
-func (m *Mapper) PositionPoint(p Position) (span.Point, error) {
-	offset, err := m.PositionOffset(p)
-	if err != nil {
-		return span.Point{}, err
-	}
-	line, col8 := m.lineCol8(offset)
-
-	return span.NewPoint(line+1, col8+1, offset), nil
-}
-
 // -- go/token domain convenience methods --
 
 // PosPosition converts a token pos to a protocol (UTF-16) position.
@@ -447,7 +350,7 @@ func (m *Mapper) NodeRange(tf *token.File, node ast.Node) (Range, error) {
 
 // RangeLocation pairs a protocol Range with its URI, in a Location.
 func (m *Mapper) RangeLocation(rng Range) Location {
-	return Location{URI: URIFromSpanURI(m.URI), Range: rng}
+	return Location{URI: m.URI, Range: rng}
 }
 
 // PosMappedRange returns a MappedRange for the given token.Pos range.
@@ -468,7 +371,7 @@ func (m *Mapper) NodeMappedRange(tf *token.File, node ast.Node) (MappedRange, er
 
 // A MappedRange represents a valid byte-offset range of a file.
 // Through its Mapper it can be converted into other forms such
-// as protocol.Range or span.Span.
+// as protocol.Range or UTF-8.
 //
 // Construct one by calling Mapper.OffsetMappedRange with start/end offsets.
 // From the go/token domain, call safetoken.Offsets first,
@@ -488,7 +391,7 @@ func (mr MappedRange) Offsets() (start, end int) { return mr.start, mr.end }
 // -- convenience functions --
 
 // URI returns the URI of the range's file.
-func (mr MappedRange) URI() span.URI {
+func (mr MappedRange) URI() DocumentURI {
 	return mr.Mapper.URI
 }
 
@@ -506,18 +409,20 @@ func (mr MappedRange) Location() Location {
 	return mr.Mapper.RangeLocation(mr.Range())
 }
 
-// Span returns the range in span (UTF-8) form.
-func (mr MappedRange) Span() span.Span {
-	spn, err := mr.Mapper.OffsetSpan(mr.start, mr.end)
-	if err != nil {
-		panic(err) // can't happen
-	}
-	return spn
-}
-
-// String formats the range in span (UTF-8) notation.
+// String formats the range in UTF-8 notation.
 func (mr MappedRange) String() string {
-	return fmt.Sprint(mr.Span())
+	var s strings.Builder
+	startLine, startCol8 := mr.Mapper.OffsetLineCol8(mr.start)
+	fmt.Fprintf(&s, "%d:%d", startLine, startCol8)
+	if mr.end != mr.start {
+		endLine, endCol8 := mr.Mapper.OffsetLineCol8(mr.end)
+		if endLine == startLine {
+			fmt.Fprintf(&s, "-%d", endCol8)
+		} else {
+			fmt.Fprintf(&s, "-%d:%d", endLine, endCol8)
+		}
+	}
+	return s.String()
 }
 
 // LocationTextDocumentPositionParams converts its argument to its result.

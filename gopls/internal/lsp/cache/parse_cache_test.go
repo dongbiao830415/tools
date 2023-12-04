@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/tools/gopls/internal/lsp/source"
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/lsp/protocol"
 )
 
 func skipIfNoParseCache(t *testing.T) {
@@ -26,17 +26,17 @@ func TestParseCache(t *testing.T) {
 	skipIfNoParseCache(t)
 
 	ctx := context.Background()
-	uri := span.URI("file:///myfile")
+	uri := protocol.DocumentURI("file:///myfile")
 	fh := makeFakeFileHandle(uri, []byte("package p\n\nconst _ = \"foo\""))
 	fset := token.NewFileSet()
 
 	cache := newParseCache(0)
-	pgfs1, err := cache.parseFiles(ctx, fset, source.ParseFull, false, fh)
+	pgfs1, err := cache.parseFiles(ctx, fset, ParseFull, false, fh)
 	if err != nil {
 		t.Fatal(err)
 	}
 	pgf1 := pgfs1[0]
-	pgfs2, err := cache.parseFiles(ctx, fset, source.ParseFull, false, fh)
+	pgfs2, err := cache.parseFiles(ctx, fset, ParseFull, false, fh)
 	pgf2 := pgfs2[0]
 	if err != nil {
 		t.Fatal(err)
@@ -47,10 +47,10 @@ func TestParseCache(t *testing.T) {
 
 	// Fill up the cache with other files, but don't evict the file above.
 	cache.gcOnce()
-	files := []source.FileHandle{fh}
+	files := []file.Handle{fh}
 	files = append(files, dummyFileHandles(parseCacheMinFiles-1)...)
 
-	pgfs3, err := cache.parseFiles(ctx, fset, source.ParseFull, false, files...)
+	pgfs3, err := cache.parseFiles(ctx, fset, ParseFull, false, files...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,13 +68,13 @@ func TestParseCache(t *testing.T) {
 	// Now overwrite the cache, after which we should get new results.
 	cache.gcOnce()
 	files = dummyFileHandles(parseCacheMinFiles)
-	_, err = cache.parseFiles(ctx, fset, source.ParseFull, false, files...)
+	_, err = cache.parseFiles(ctx, fset, ParseFull, false, files...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// force a GC, which should collect the recently parsed files
 	cache.gcOnce()
-	pgfs4, err := cache.parseFiles(ctx, fset, source.ParseFull, false, fh)
+	pgfs4, err := cache.parseFiles(ctx, fset, ParseFull, false, fh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestParseCache_Reparsing(t *testing.T) {
 
 	// Parsing should succeed even though we overflow the padding.
 	cache := newParseCache(0)
-	_, err := cache.parseFiles(context.Background(), token.NewFileSet(), source.ParseFull, false, files...)
+	_, err := cache.parseFiles(context.Background(), token.NewFileSet(), ParseFull, false, files...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,11 +114,11 @@ func TestParseCache_Issue59097(t *testing.T) {
 	parsePadding = 0
 
 	danglingSelector := []byte("package p\nfunc _() {\n\tx.\n}")
-	files := []source.FileHandle{makeFakeFileHandle("file:///bad", danglingSelector)}
+	files := []file.Handle{makeFakeFileHandle("file:///bad", danglingSelector)}
 
 	// Parsing should succeed even though we overflow the padding.
 	cache := newParseCache(0)
-	_, err := cache.parseFiles(context.Background(), token.NewFileSet(), source.ParseFull, false, files...)
+	_, err := cache.parseFiles(context.Background(), token.NewFileSet(), ParseFull, false, files...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,26 +129,26 @@ func TestParseCache_TimeEviction(t *testing.T) {
 
 	ctx := context.Background()
 	fset := token.NewFileSet()
-	uri := span.URI("file:///myfile")
+	uri := protocol.DocumentURI("file:///myfile")
 	fh := makeFakeFileHandle(uri, []byte("package p\n\nconst _ = \"foo\""))
 
 	const gcDuration = 10 * time.Millisecond
 	cache := newParseCache(gcDuration)
 	cache.stop() // we'll manage GC manually, for testing.
 
-	pgfs0, err := cache.parseFiles(ctx, fset, source.ParseFull, false, fh, fh)
+	pgfs0, err := cache.parseFiles(ctx, fset, ParseFull, false, fh, fh)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	files := dummyFileHandles(parseCacheMinFiles)
-	_, err = cache.parseFiles(ctx, fset, source.ParseFull, false, files...)
+	_, err = cache.parseFiles(ctx, fset, ParseFull, false, files...)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Even after filling up the 'min' files, we get a cache hit for our original file.
-	pgfs1, err := cache.parseFiles(ctx, fset, source.ParseFull, false, fh, fh)
+	pgfs1, err := cache.parseFiles(ctx, fset, ParseFull, false, fh, fh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,14 +158,14 @@ func TestParseCache_TimeEviction(t *testing.T) {
 	}
 
 	// But after GC, we get a cache miss.
-	_, err = cache.parseFiles(ctx, fset, source.ParseFull, false, files...) // mark dummy files as newer
+	_, err = cache.parseFiles(ctx, fset, ParseFull, false, files...) // mark dummy files as newer
 	if err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(gcDuration)
 	cache.gcOnce()
 
-	pgfs2, err := cache.parseFiles(ctx, fset, source.ParseFull, false, fh, fh)
+	pgfs2, err := cache.parseFiles(ctx, fset, ParseFull, false, fh, fh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,11 +179,11 @@ func TestParseCache_Duplicates(t *testing.T) {
 	skipIfNoParseCache(t)
 
 	ctx := context.Background()
-	uri := span.URI("file:///myfile")
+	uri := protocol.DocumentURI("file:///myfile")
 	fh := makeFakeFileHandle(uri, []byte("package p\n\nconst _ = \"foo\""))
 
 	cache := newParseCache(0)
-	pgfs, err := cache.parseFiles(ctx, token.NewFileSet(), source.ParseFull, false, fh, fh)
+	pgfs, err := cache.parseFiles(ctx, token.NewFileSet(), ParseFull, false, fh, fh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,32 +192,32 @@ func TestParseCache_Duplicates(t *testing.T) {
 	}
 }
 
-func dummyFileHandles(n int) []source.FileHandle {
-	var fhs []source.FileHandle
+func dummyFileHandles(n int) []file.Handle {
+	var fhs []file.Handle
 	for i := 0; i < n; i++ {
-		uri := span.URI(fmt.Sprintf("file:///_%d", i))
+		uri := protocol.DocumentURI(fmt.Sprintf("file:///_%d", i))
 		src := []byte(fmt.Sprintf("package p\nvar _ = %d", i))
 		fhs = append(fhs, makeFakeFileHandle(uri, src))
 	}
 	return fhs
 }
 
-func makeFakeFileHandle(uri span.URI, src []byte) fakeFileHandle {
+func makeFakeFileHandle(uri protocol.DocumentURI, src []byte) fakeFileHandle {
 	return fakeFileHandle{
 		uri:  uri,
 		data: src,
-		hash: source.HashOf(src),
+		hash: file.HashOf(src),
 	}
 }
 
 type fakeFileHandle struct {
-	source.FileHandle
-	uri  span.URI
+	file.Handle
+	uri  protocol.DocumentURI
 	data []byte
-	hash source.Hash
+	hash file.Hash
 }
 
-func (h fakeFileHandle) URI() span.URI {
+func (h fakeFileHandle) URI() protocol.DocumentURI {
 	return h.uri
 }
 
@@ -225,8 +225,8 @@ func (h fakeFileHandle) Content() ([]byte, error) {
 	return h.data, nil
 }
 
-func (h fakeFileHandle) FileIdentity() source.FileIdentity {
-	return source.FileIdentity{
+func (h fakeFileHandle) Identity() file.Identity {
+	return file.Identity{
 		URI:  h.uri,
 		Hash: h.hash,
 	}

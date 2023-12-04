@@ -13,6 +13,9 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/lsp/cache"
+	"golang.org/x/tools/gopls/internal/lsp/cache/metadata"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/imports"
 )
@@ -23,7 +26,7 @@ import (
 // all dot-free paths (standard packages) appear before dotful ones.
 //
 // It is part of the gopls.list_known_packages command.
-func KnownPackagePaths(ctx context.Context, snapshot Snapshot, fh FileHandle) ([]PackagePath, error) {
+func KnownPackagePaths(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle) ([]PackagePath, error) {
 	// This algorithm is expressed in terms of Metadata, not Packages,
 	// so it doesn't cause or wait for type checking.
 
@@ -38,15 +41,15 @@ func KnownPackagePaths(ctx context.Context, snapshot Snapshot, fh FileHandle) ([
 	if err != nil {
 		return nil, err
 	}
-	file, err := parser.ParseFile(token.NewFileSet(), fh.URI().Filename(), src, parser.ImportsOnly)
+	file, err := parser.ParseFile(token.NewFileSet(), fh.URI().Path(), src, parser.ImportsOnly)
 	if err != nil {
 		return nil, err
 	}
 	imported := make(map[PackagePath]bool)
 	for _, imp := range file.Imports {
-		if id := current.DepsByImpPath[UnquoteImportPath(imp)]; id != "" {
-			if m := snapshot.Metadata(id); m != nil {
-				imported[m.PkgPath] = true
+		if id := current.DepsByImpPath[metadata.UnquoteImportPath(imp)]; id != "" {
+			if mp := snapshot.Metadata(id); mp != nil {
+				imported[mp.PkgPath] = true
 			}
 		}
 	}
@@ -73,7 +76,7 @@ func KnownPackagePaths(ctx context.Context, snapshot Snapshot, fh FileHandle) ([
 			continue
 		}
 		// make sure internal packages are importable by the file
-		if !IsValidImport(current.PkgPath, knownPkg.PkgPath) {
+		if !metadata.IsValidImport(current.PkgPath, knownPkg.PkgPath) {
 			continue
 		}
 		// naive check on cyclical imports
@@ -95,7 +98,7 @@ func KnownPackagePaths(ctx context.Context, snapshot Snapshot, fh FileHandle) ([
 			// TODO(adonovan): what if the actual package path has a vendor/ prefix?
 			seen[PackagePath(ifix.StmtInfo.ImportPath)] = true
 		}
-		return imports.GetAllCandidates(ctx, wrapped, "", fh.URI().Filename(), string(current.Name), o.Env)
+		return imports.GetAllCandidates(ctx, wrapped, "", fh.URI().Path(), string(current.Name), o.Env)
 	}); err != nil {
 		// If goimports failed, proceed with just the candidates from the metadata.
 		event.Error(ctx, "imports.GetAllCandidates", err)
@@ -128,7 +131,7 @@ func KnownPackagePaths(ctx context.Context, snapshot Snapshot, fh FileHandle) ([
 // TODO(adonovan): ensure that metadata graph is always cyclic!
 // Many algorithms will get confused or even stuck in the
 // presence of cycles. Then replace this function by 'false'.
-func isDirectlyCyclical(pkg, imported *Metadata) bool {
+func isDirectlyCyclical(pkg, imported *metadata.Package) bool {
 	_, ok := imported.DepsByPkgPath[pkg.PkgPath]
 	return ok
 }

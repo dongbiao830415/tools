@@ -59,10 +59,12 @@ import (
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/types/objectpath"
 	"golang.org/x/tools/go/types/typeutil"
-	"golang.org/x/tools/gopls/internal/bug"
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/lsp/cache"
+	"golang.org/x/tools/gopls/internal/lsp/cache/metadata"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/safetoken"
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/util/bug"
+	"golang.org/x/tools/gopls/internal/util/safetoken"
 	"golang.org/x/tools/internal/diff"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/typeparams"
@@ -73,7 +75,7 @@ import (
 // an object (or several coupled objects) within a single type-checked
 // syntax package.
 type renamer struct {
-	pkg                Package               // the syntax package in which the renaming is applied
+	pkg                *cache.Package        // the syntax package in which the renaming is applied
 	objsToUpdate       map[types.Object]bool // records progress of calls to check
 	hadConflicts       bool
 	conflicts          []string
@@ -95,7 +97,7 @@ type PrepareItem struct {
 // The returned usererr is intended to be displayed to the user to explain why
 // the prepare fails. Probably we could eliminate the redundancy in returning
 // two errors, but for now this is done defensively.
-func PrepareRename(ctx context.Context, snapshot Snapshot, f FileHandle, pp protocol.Position) (_ *PrepareItem, usererr, err error) {
+func PrepareRename(ctx context.Context, snapshot *cache.Snapshot, f file.Handle, pp protocol.Position) (_ *PrepareItem, usererr, err error) {
 	ctx, done := event.Start(ctx, "source.PrepareRename")
 	defer done()
 
@@ -149,7 +151,7 @@ func PrepareRename(ctx context.Context, snapshot Snapshot, f FileHandle, pp prot
 	}, nil, nil
 }
 
-func prepareRenamePackageName(ctx context.Context, snapshot Snapshot, pgf *ParsedGoFile) (*PrepareItem, error) {
+func prepareRenamePackageName(ctx context.Context, snapshot *cache.Snapshot, pgf *ParsedGoFile) (*PrepareItem, error) {
 	// Does the client support file renaming?
 	fileRenameSupported := false
 	for _, op := range snapshot.Options().SupportedResourceOperations {
@@ -213,7 +215,7 @@ func checkRenamable(obj types.Object) error {
 // Rename returns a map of TextEdits for each file modified when renaming a
 // given identifier within a package and a boolean value of true for renaming
 // package and false otherwise.
-func Rename(ctx context.Context, snapshot Snapshot, f FileHandle, pp protocol.Position, newName string) (map[span.URI][]protocol.TextEdit, bool, error) {
+func Rename(ctx context.Context, snapshot *cache.Snapshot, f file.Handle, pp protocol.Position, newName string) (map[protocol.DocumentURI][]protocol.TextEdit, bool, error) {
 	ctx, done := event.Start(ctx, "source.Rename")
 	defer done()
 
@@ -227,7 +229,7 @@ func Rename(ctx context.Context, snapshot Snapshot, f FileHandle, pp protocol.Po
 		return nil, false, err
 	}
 
-	var editMap map[span.URI][]diff.Edit
+	var editMap map[protocol.DocumentURI][]diff.Edit
 	if inPackageName {
 		editMap, err = renamePackageName(ctx, snapshot, f, PackageName(newName))
 	} else {
@@ -238,7 +240,7 @@ func Rename(ctx context.Context, snapshot Snapshot, f FileHandle, pp protocol.Po
 	}
 
 	// Convert edits to protocol form.
-	result := make(map[span.URI][]protocol.TextEdit)
+	result := make(map[protocol.DocumentURI][]protocol.TextEdit)
 	for uri, edits := range editMap {
 		// Sort and de-duplicate edits.
 		//
@@ -276,7 +278,7 @@ func Rename(ctx context.Context, snapshot Snapshot, f FileHandle, pp protocol.Po
 			return nil, false, err
 		}
 		m := protocol.NewMapper(uri, data)
-		protocolEdits, err := ToProtocolEdits(m, edits)
+		protocolEdits, err := protocol.EditsFromDiffEdits(m, edits)
 		if err != nil {
 			return nil, false, err
 		}
@@ -287,7 +289,7 @@ func Rename(ctx context.Context, snapshot Snapshot, f FileHandle, pp protocol.Po
 }
 
 // renameOrdinary renames an ordinary (non-package) name throughout the workspace.
-func renameOrdinary(ctx context.Context, snapshot Snapshot, f FileHandle, pp protocol.Position, newName string) (map[span.URI][]diff.Edit, error) {
+func renameOrdinary(ctx context.Context, snapshot *cache.Snapshot, f file.Handle, pp protocol.Position, newName string) (map[protocol.DocumentURI][]diff.Edit, error) {
 	// Type-check the referring package and locate the object(s).
 	//
 	// Unlike NarrowestPackageForFile, this operation prefers the
@@ -296,17 +298,17 @@ func renameOrdinary(ctx context.Context, snapshot Snapshot, f FileHandle, pp pro
 	// 'references' doesn't also want the widest variant: it
 	// computes the union across all variants.)
 	var targets map[types.Object]ast.Node
-	var pkg Package
+	var pkg *cache.Package
 	{
-		metas, err := snapshot.MetadataForFile(ctx, f.URI())
+		mps, err := snapshot.MetadataForFile(ctx, f.URI())
 		if err != nil {
 			return nil, err
 		}
-		RemoveIntermediateTestVariants(&metas)
-		if len(metas) == 0 {
+		metadata.RemoveIntermediateTestVariants(&mps)
+		if len(mps) == 0 {
 			return nil, fmt.Errorf("no package metadata for file %s", f.URI())
 		}
-		widest := metas[len(metas)-1] // widest variant may include _test.go files
+		widest := mps[len(mps)-1] // widest variant may include _test.go files
 		pkgs, err := snapshot.TypeCheck(ctx, widest.ID)
 		if err != nil {
 			return nil, err
@@ -387,7 +389,7 @@ func renameOrdinary(ctx context.Context, snapshot Snapshot, f FileHandle, pp pro
 		for obj := range targets {
 			objects = append(objects, obj)
 		}
-		editMap, _, err := renameObjects(ctx, snapshot, newName, pkg, objects...)
+		editMap, _, err := renameObjects(newName, pkg, objects...)
 		return editMap, err
 	}
 
@@ -437,7 +439,7 @@ func renameOrdinary(ctx context.Context, snapshot Snapshot, f FileHandle, pp pro
 	}
 
 	// Type-check all the packages to inspect.
-	declURI := span.URIFromPath(pkg.FileSet().File(obj.Pos()).Name())
+	declURI := protocol.URIFromPath(pkg.FileSet().File(obj.Pos()).Name())
 	pkgs, err := typeCheckReverseDependencies(ctx, snapshot, declURI, transitive)
 	if err != nil {
 		return nil, err
@@ -445,7 +447,7 @@ func renameOrdinary(ctx context.Context, snapshot Snapshot, f FileHandle, pp pro
 
 	// Apply the renaming to the (initial) object.
 	declPkgPath := PackagePath(obj.Pkg().Path())
-	return renameExported(ctx, snapshot, pkgs, declPkgPath, declObjPath, newName)
+	return renameExported(pkgs, declPkgPath, declObjPath, newName)
 }
 
 // funcOrigin is a go1.18-portable implementation of (*types.Func).Origin.
@@ -476,14 +478,14 @@ func funcOrigin(fn *types.Func) *types.Func {
 // (This neglects obscure edge cases where a _test.go file changes the
 // selectors used only in an ITV, but life is short. Also sin must be
 // punished.)
-func typeCheckReverseDependencies(ctx context.Context, snapshot Snapshot, declURI span.URI, transitive bool) ([]Package, error) {
+func typeCheckReverseDependencies(ctx context.Context, snapshot *cache.Snapshot, declURI protocol.DocumentURI, transitive bool) ([]*cache.Package, error) {
 	variants, err := snapshot.MetadataForFile(ctx, declURI)
 	if err != nil {
 		return nil, err
 	}
 	// variants must include ITVs for the reverse dependency
 	// computation, but they are filtered out before we typecheck.
-	allRdeps := make(map[PackageID]*Metadata)
+	allRdeps := make(map[PackageID]*metadata.Package)
 	for _, variant := range variants {
 		rdeps, err := snapshot.ReverseDependencies(ctx, variant.ID, transitive)
 		if err != nil {
@@ -504,7 +506,7 @@ func typeCheckReverseDependencies(ctx context.Context, snapshot Snapshot, declUR
 
 	// Sort the packages into some topological order of the
 	// (unfiltered) metadata graph.
-	SortPostOrder(snapshot, ids)
+	metadata.SortPostOrder(snapshot, ids)
 
 	// Dependencies must be visited first since they can expand
 	// the search set. Ideally we would process the (filtered) set
@@ -520,36 +522,11 @@ func typeCheckReverseDependencies(ctx context.Context, snapshot Snapshot, declUR
 	return snapshot.TypeCheck(ctx, ids...)
 }
 
-// SortPostOrder sorts the IDs so that if x depends on y, then y appears before x.
-func SortPostOrder(meta MetadataSource, ids []PackageID) {
-	postorder := make(map[PackageID]int)
-	order := 0
-	var visit func(PackageID)
-	visit = func(id PackageID) {
-		if _, ok := postorder[id]; !ok {
-			postorder[id] = -1 // break recursion
-			if m := meta.Metadata(id); m != nil {
-				for _, depID := range m.DepsByPkgPath {
-					visit(depID)
-				}
-			}
-			order++
-			postorder[id] = order
-		}
-	}
-	for _, id := range ids {
-		visit(id)
-	}
-	sort.Slice(ids, func(i, j int) bool {
-		return postorder[ids[i]] < postorder[ids[j]]
-	})
-}
-
 // renameExported renames the object denoted by (pkgPath, objPath)
 // within the specified packages, along with any other objects that
 // must be renamed as a consequence. The slice of packages must be
 // topologically ordered.
-func renameExported(ctx context.Context, snapshot Snapshot, pkgs []Package, declPkgPath PackagePath, declObjPath objectpath.Path, newName string) (map[span.URI][]diff.Edit, error) {
+func renameExported(pkgs []*cache.Package, declPkgPath PackagePath, declObjPath objectpath.Path, newName string) (map[protocol.DocumentURI][]diff.Edit, error) {
 
 	// A target is a name for an object that is stable across types.Packages.
 	type target struct {
@@ -575,7 +552,7 @@ func renameExported(ctx context.Context, snapshot Snapshot, pkgs []Package, decl
 	targets := map[target]bool{{declPkgPath, declObjPath}: true}
 
 	// Apply the renaming operation to each package.
-	allEdits := make(map[span.URI][]diff.Edit)
+	allEdits := make(map[protocol.DocumentURI][]diff.Edit)
 	for _, pkg := range pkgs {
 
 		// Resolved target objects within package pkg.
@@ -605,7 +582,7 @@ func renameExported(ctx context.Context, snapshot Snapshot, pkgs []Package, decl
 		}
 
 		// Apply the renaming.
-		editMap, moreObjects, err := renameObjects(ctx, snapshot, newName, pkg, objects...)
+		editMap, moreObjects, err := renameObjects(newName, pkg, objects...)
 		if err != nil {
 			return nil, err
 		}
@@ -638,7 +615,7 @@ func renameExported(ctx context.Context, snapshot Snapshot, pkgs []Package, decl
 }
 
 // renamePackageName renames package declarations, imports, and go.mod files.
-func renamePackageName(ctx context.Context, s Snapshot, f FileHandle, newName PackageName) (map[span.URI][]diff.Edit, error) {
+func renamePackageName(ctx context.Context, s *cache.Snapshot, f file.Handle, newName PackageName) (map[protocol.DocumentURI][]diff.Edit, error) {
 	// Rename the package decl and all imports.
 	renamingEdits, err := renamePackage(ctx, s, f, newName)
 	if err != nil {
@@ -646,7 +623,7 @@ func renamePackageName(ctx context.Context, s Snapshot, f FileHandle, newName Pa
 	}
 
 	// Update the last component of the file's enclosing directory.
-	oldBase := filepath.Dir(f.URI().Filename())
+	oldBase := filepath.Dir(f.URI().Path())
 	newPkgDir := filepath.Join(filepath.Dir(oldBase), string(newName))
 
 	// Update any affected replace directives in go.mod files.
@@ -666,7 +643,7 @@ func renamePackageName(ctx context.Context, s Snapshot, f FileHandle, newName Pa
 			return nil, err
 		}
 
-		modFileDir := filepath.Dir(pm.URI.Filename())
+		modFileDir := filepath.Dir(pm.URI.Path())
 		affectedReplaces := []*modfile.Replace{}
 
 		// Check if any replace directives need to be fixed
@@ -702,7 +679,7 @@ func renamePackageName(ctx context.Context, s Snapshot, f FileHandle, newName Pa
 				replacedPath = filepath.Join(modFileDir, r.New.Path)
 			}
 
-			suffix := strings.TrimPrefix(replacedPath, string(oldBase))
+			suffix := strings.TrimPrefix(replacedPath, oldBase)
 
 			newReplacedPath, err := filepath.Rel(modFileDir, newPkgDir+suffix)
 			if err != nil {
@@ -741,7 +718,7 @@ func renamePackageName(ctx context.Context, s Snapshot, f FileHandle, newName Pa
 // It updates package clauses and import paths for the renamed package as well
 // as any other packages affected by the directory renaming among all packages
 // known to the snapshot.
-func renamePackage(ctx context.Context, s Snapshot, f FileHandle, newName PackageName) (map[span.URI][]diff.Edit, error) {
+func renamePackage(ctx context.Context, s *cache.Snapshot, f file.Handle, newName PackageName) (map[protocol.DocumentURI][]diff.Edit, error) {
 	if strings.HasSuffix(string(newName), "_test") {
 		return nil, fmt.Errorf("cannot rename to _test package")
 	}
@@ -774,13 +751,13 @@ func renamePackage(ctx context.Context, s Snapshot, f FileHandle, newName Packag
 	}
 
 	// Rename package and import declarations in all relevant packages.
-	edits := make(map[span.URI][]diff.Edit)
-	for _, m := range allMetadata {
+	edits := make(map[protocol.DocumentURI][]diff.Edit)
+	for _, mp := range allMetadata {
 		// Special case: x_test packages for the renamed package will not have the
 		// package path as a dir prefix, but still need their package clauses
 		// renamed.
-		if m.PkgPath == oldPkgPath+"_test" {
-			if err := renamePackageClause(ctx, m, s, newName+"_test", edits); err != nil {
+		if mp.PkgPath == oldPkgPath+"_test" {
+			if err := renamePackageClause(ctx, mp, s, newName+"_test", edits); err != nil {
 				return nil, err
 			}
 			continue
@@ -789,34 +766,34 @@ func renamePackage(ctx context.Context, s Snapshot, f FileHandle, newName Packag
 		// Subtle: check this condition before checking for valid module info
 		// below, because we should not fail this operation if unrelated packages
 		// lack module info.
-		if !strings.HasPrefix(string(m.PkgPath)+"/", string(oldPkgPath)+"/") {
+		if !strings.HasPrefix(string(mp.PkgPath)+"/", string(oldPkgPath)+"/") {
 			continue // not affected by the package renaming
 		}
 
-		if m.Module == nil {
+		if mp.Module == nil {
 			// This check will always fail under Bazel.
-			return nil, fmt.Errorf("cannot rename package: missing module information for package %q", m.PkgPath)
+			return nil, fmt.Errorf("cannot rename package: missing module information for package %q", mp.PkgPath)
 		}
 
-		if modulePath != PackagePath(m.Module.Path) {
+		if modulePath != PackagePath(mp.Module.Path) {
 			continue // don't edit imports if nested package and renaming package have different module paths
 		}
 
 		// Renaming a package consists of changing its import path and package name.
-		suffix := strings.TrimPrefix(string(m.PkgPath), string(oldPkgPath))
+		suffix := strings.TrimPrefix(string(mp.PkgPath), string(oldPkgPath))
 		newPath := newPathPrefix + suffix
 
-		pkgName := m.Name
-		if m.PkgPath == oldPkgPath {
-			pkgName = PackageName(newName)
+		pkgName := mp.Name
+		if mp.PkgPath == oldPkgPath {
+			pkgName = newName
 
-			if err := renamePackageClause(ctx, m, s, newName, edits); err != nil {
+			if err := renamePackageClause(ctx, mp, s, newName, edits); err != nil {
 				return nil, err
 			}
 		}
 
 		imp := ImportPath(newPath) // TODO(adonovan): what if newPath has vendor/ prefix?
-		if err := renameImports(ctx, s, m, imp, pkgName, edits); err != nil {
+		if err := renameImports(ctx, s, mp, imp, pkgName, edits); err != nil {
 			return nil, err
 		}
 	}
@@ -828,9 +805,9 @@ func renamePackage(ctx context.Context, s Snapshot, f FileHandle, newName Packag
 // the package described by the given metadata, to newName.
 //
 // Edits are written into the edits map.
-func renamePackageClause(ctx context.Context, m *Metadata, snapshot Snapshot, newName PackageName, edits map[span.URI][]diff.Edit) error {
+func renamePackageClause(ctx context.Context, mp *metadata.Package, snapshot *cache.Snapshot, newName PackageName, edits map[protocol.DocumentURI][]diff.Edit) error {
 	// Rename internal references to the package in the renaming package.
-	for _, uri := range m.CompiledGoFiles {
+	for _, uri := range mp.CompiledGoFiles {
 		fh, err := snapshot.ReadFile(ctx, uri)
 		if err != nil {
 			return err
@@ -858,14 +835,14 @@ func renamePackageClause(ctx context.Context, m *Metadata, snapshot Snapshot, ne
 // newPath and name newName.
 //
 // Edits are written into the edits map.
-func renameImports(ctx context.Context, snapshot Snapshot, m *Metadata, newPath ImportPath, newName PackageName, allEdits map[span.URI][]diff.Edit) error {
-	rdeps, err := snapshot.ReverseDependencies(ctx, m.ID, false) // find direct importers
+func renameImports(ctx context.Context, snapshot *cache.Snapshot, mp *metadata.Package, newPath ImportPath, newName PackageName, allEdits map[protocol.DocumentURI][]diff.Edit) error {
+	rdeps, err := snapshot.ReverseDependencies(ctx, mp.ID, false) // find direct importers
 	if err != nil {
 		return err
 	}
 
 	// Pass 1: rename import paths in import declarations.
-	needsTypeCheck := make(map[PackageID][]span.URI)
+	needsTypeCheck := make(map[PackageID][]protocol.DocumentURI)
 	for _, rdep := range rdeps {
 		if rdep.IsIntermediateTestVariant() {
 			continue // for renaming, these variants are redundant
@@ -884,7 +861,7 @@ func renameImports(ctx context.Context, snapshot Snapshot, m *Metadata, newPath 
 				continue // no package declaration
 			}
 			for _, imp := range f.File.Imports {
-				if rdep.DepsByImpPath[UnquoteImportPath(imp)] != m.ID {
+				if rdep.DepsByImpPath[metadata.UnquoteImportPath(imp)] != mp.ID {
 					continue // not the import we're looking for
 				}
 
@@ -912,7 +889,7 @@ func renameImports(ctx context.Context, snapshot Snapshot, m *Metadata, newPath 
 
 	// If the imported package's name hasn't changed,
 	// we don't need to rename references within each file.
-	if newName == m.Name {
+	if newName == mp.Name {
 		return nil
 	}
 
@@ -937,7 +914,7 @@ func renameImports(ctx context.Context, snapshot Snapshot, m *Metadata, newPath 
 				if imp.Name != nil {
 					continue // has explicit local name
 				}
-				if rdeps[id].DepsByImpPath[UnquoteImportPath(imp)] != m.ID {
+				if rdeps[id].DepsByImpPath[metadata.UnquoteImportPath(imp)] != mp.ID {
 					continue // not the import we're looking for
 				}
 
@@ -970,7 +947,7 @@ func renameImports(ctx context.Context, snapshot Snapshot, m *Metadata, newPath 
 				//   become shadowed by an intervening declaration that
 				//   uses the new name.
 				// It returns the edits if no conflict was detected.
-				editMap, _, err := renameObjects(ctx, snapshot, localName, pkg, pkgname)
+				editMap, _, err := renameObjects(localName, pkg, pkgname)
 				if err != nil {
 					return err
 				}
@@ -1004,7 +981,7 @@ func renameImports(ctx context.Context, snapshot Snapshot, m *Metadata, newPath 
 // consequence of the requested renamings.
 //
 // It returns an error if the renaming would cause a conflict.
-func renameObjects(ctx context.Context, snapshot Snapshot, newName string, pkg Package, targets ...types.Object) (map[span.URI][]diff.Edit, map[types.Object]bool, error) {
+func renameObjects(newName string, pkg *cache.Package, targets ...types.Object) (map[protocol.DocumentURI][]diff.Edit, map[types.Object]bool, error) {
 	r := renamer{
 		pkg:          pkg,
 		objsToUpdate: make(map[types.Object]bool),
@@ -1048,8 +1025,8 @@ func renameObjects(ctx context.Context, snapshot Snapshot, newName string, pkg P
 }
 
 // Rename all references to the target objects.
-func (r *renamer) update() (map[span.URI][]diff.Edit, error) {
-	result := make(map[span.URI][]diff.Edit)
+func (r *renamer) update() (map[protocol.DocumentURI][]diff.Edit, error) {
+	result := make(map[protocol.DocumentURI][]diff.Edit)
 
 	// shouldUpdate reports whether obj is one of (or an
 	// instantiation of one of) the target objects.
@@ -1147,7 +1124,7 @@ func (r *renamer) update() (map[span.URI][]diff.Edit, error) {
 			lines := strings.Split(comment.Text, "\n")
 			tokFile := pgf.Tok
 			commentLine := safetoken.Line(tokFile, comment.Pos())
-			uri := span.URIFromPath(tokFile.Name())
+			uri := protocol.URIFromPath(tokFile.Name())
 			for i, line := range lines {
 				lineStart := comment.Pos()
 				if i > 0 {
@@ -1246,7 +1223,7 @@ func (r *renamer) updatePkgName(pgf *ParsedGoFile, pkgName *types.PkgName) (diff
 // whether the position ppos lies within it.
 //
 // Note: also used by references.
-func parsePackageNameDecl(ctx context.Context, snapshot Snapshot, fh FileHandle, ppos protocol.Position) (*ParsedGoFile, bool, error) {
+func parsePackageNameDecl(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, ppos protocol.Position) (*ParsedGoFile, bool, error) {
 	pgf, err := snapshot.ParseGo(ctx, fh, ParseHeader)
 	if err != nil {
 		return nil, false, err
@@ -1258,7 +1235,7 @@ func parsePackageNameDecl(ctx context.Context, snapshot Snapshot, fh FileHandle,
 }
 
 // enclosingFile returns the CompiledGoFile of pkg that contains the specified position.
-func enclosingFile(pkg Package, pos token.Pos) (*ParsedGoFile, bool) {
+func enclosingFile(pkg *cache.Package, pos token.Pos) (*ParsedGoFile, bool) {
 	for _, pgf := range pkg.CompiledGoFiles() {
 		if pgf.File.Pos() <= pos && pos <= pgf.File.End() {
 			return pgf, true

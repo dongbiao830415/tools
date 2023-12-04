@@ -10,17 +10,17 @@ import (
 	"context"
 	"fmt"
 	"go/ast"
-	"go/token"
 	"go/types"
 	"runtime/debug"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/types/typeutil"
-	"golang.org/x/tools/gopls/internal/bug"
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/lsp/cache"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/safetoken"
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/util/bug"
+	"golang.org/x/tools/gopls/internal/util/safetoken"
 	"golang.org/x/tools/internal/diff"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/refactor/inline"
@@ -28,7 +28,7 @@ import (
 
 // EnclosingStaticCall returns the innermost function call enclosing
 // the selected range, along with the callee.
-func EnclosingStaticCall(pkg Package, pgf *ParsedGoFile, rng protocol.Range) (*ast.CallExpr, *types.Func, error) {
+func EnclosingStaticCall(pkg *cache.Package, pgf *ParsedGoFile, rng protocol.Range) (*ast.CallExpr, *types.Func, error) {
 	start, end, err := pgf.RangePos(rng)
 	if err != nil {
 		return nil, nil, err
@@ -59,22 +59,22 @@ loop:
 	return call, fn, nil
 }
 
-func inlineCall(ctx context.Context, snapshot Snapshot, fh FileHandle, rng protocol.Range) (_ *token.FileSet, _ *analysis.SuggestedFix, err error) {
+func inlineCall(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, rng protocol.Range) (_ []protocol.TextDocumentEdit, err error) {
 	// Find enclosing static call.
 	callerPkg, callerPGF, err := NarrowestPackageForFile(ctx, snapshot, fh.URI())
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	call, fn, err := EnclosingStaticCall(callerPkg, callerPGF, rng)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	// Locate callee by file/line and analyze it.
 	calleePosn := safetoken.StartPosition(callerPkg.FileSet(), fn.Pos())
-	calleePkg, calleePGF, err := NarrowestPackageForFile(ctx, snapshot, span.URIFromPath(calleePosn.Filename))
+	calleePkg, calleePGF, err := NarrowestPackageForFile(ctx, snapshot, protocol.URIFromPath(calleePosn.Filename))
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	var calleeDecl *ast.FuncDecl
 	for _, decl := range calleePGF.File.Decls {
@@ -87,14 +87,14 @@ func inlineCall(ctx context.Context, snapshot Snapshot, fh FileHandle, rng proto
 		}
 	}
 	if calleeDecl == nil {
-		return nil, nil, fmt.Errorf("can't find callee")
+		return nil, fmt.Errorf("can't find callee")
 	}
 
 	// The inliner assumes that input is well-typed,
 	// but that is frequently not the case within gopls.
 	// Until we are able to harden the inliner,
 	// report panics as errors to avoid crashing the server.
-	bad := func(p Package) bool { return len(p.GetParseErrors())+len(p.GetTypeErrors()) > 0 }
+	bad := func(p *cache.Package) bool { return len(p.GetParseErrors())+len(p.GetTypeErrors()) > 0 }
 	if bad(calleePkg) || bad(callerPkg) {
 		defer func() {
 			if x := recover(); x != nil {
@@ -106,13 +106,11 @@ func inlineCall(ctx context.Context, snapshot Snapshot, fh FileHandle, rng proto
 
 	// Users can consult the gopls event log to see
 	// why a particular inlining strategy was chosen.
-	logf := func(format string, args ...any) {
-		event.Log(ctx, "inliner: "+fmt.Sprintf(format, args...))
-	}
+	logf := logger(ctx, "inliner", snapshot.Options().VerboseOutput)
 
 	callee, err := inline.AnalyzeCallee(logf, calleePkg.FileSet(), calleePkg.GetTypes(), calleePkg.GetTypesInfo(), calleeDecl, calleePGF.Src)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	// Inline the call.
@@ -127,12 +125,22 @@ func inlineCall(ctx context.Context, snapshot Snapshot, fh FileHandle, rng proto
 
 	got, err := inline.Inline(logf, caller, callee)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	// Suggest the fix.
-	return callerPkg.FileSet(), &analysis.SuggestedFix{
+	return suggestedFixToEdits(ctx, snapshot, callerPkg.FileSet(), &analysis.SuggestedFix{
 		Message:   fmt.Sprintf("inline call of %v", callee),
 		TextEdits: diffToTextEdits(callerPGF.Tok, diff.Bytes(callerPGF.Src, got)),
-	}, nil
+	})
+}
+
+// TODO(adonovan): change the inliner to instead accept an io.Writer.
+func logger(ctx context.Context, name string, verbose bool) func(format string, args ...any) {
+	if verbose {
+		return func(format string, args ...any) {
+			event.Log(ctx, name+": "+fmt.Sprintf(format, args...))
+		}
+	} else {
+		return func(string, ...any) {}
+	}
 }

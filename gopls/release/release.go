@@ -17,11 +17,10 @@ import (
 	"go/types"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-
-	exec "golang.org/x/sys/execabs"
 
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
@@ -69,7 +68,7 @@ func main() {
 // binary is equivalent to the version being published. It reports an error if
 // not.
 func validateHardcodedVersion(version string) error {
-	const debugPkg = "golang.org/x/tools/gopls/internal/lsp/debug"
+	const debugPkg = "golang.org/x/tools/gopls/internal/debug"
 	pkgs, err := packages.Load(&packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles |
 			packages.NeedCompiledGoFiles | packages.NeedImports |

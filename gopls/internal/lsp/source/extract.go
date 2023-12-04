@@ -18,8 +18,8 @@ import (
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/ast/astutil"
-	"golang.org/x/tools/gopls/internal/bug"
-	"golang.org/x/tools/gopls/internal/lsp/safetoken"
+	"golang.org/x/tools/gopls/internal/util/bug"
+	"golang.org/x/tools/gopls/internal/util/safetoken"
 	"golang.org/x/tools/internal/analysisinternal"
 )
 
@@ -36,14 +36,14 @@ func extractVariable(fset *token.FileSet, start, end token.Pos, src []byte, file
 	// TODO: stricter rules for selectorExpr.
 	case *ast.BasicLit, *ast.CompositeLit, *ast.IndexExpr, *ast.SliceExpr,
 		*ast.UnaryExpr, *ast.BinaryExpr, *ast.SelectorExpr:
-		lhsName, _ := generateAvailableIdentifier(expr.Pos(), file, path, pkg, info, "x", 0)
+		lhsName, _ := generateAvailableIdentifier(expr.Pos(), path, pkg, info, "x", 0)
 		lhsNames = append(lhsNames, lhsName)
 	case *ast.CallExpr:
 		tup, ok := info.TypeOf(expr).(*types.Tuple)
 		if !ok {
 			// If the call expression only has one return value, we can treat it the
 			// same as our standard extract variable case.
-			lhsName, _ := generateAvailableIdentifier(expr.Pos(), file, path, pkg, info, "x", 0)
+			lhsName, _ := generateAvailableIdentifier(expr.Pos(), path, pkg, info, "x", 0)
 			lhsNames = append(lhsNames, lhsName)
 			break
 		}
@@ -51,7 +51,7 @@ func extractVariable(fset *token.FileSet, start, end token.Pos, src []byte, file
 		for i := 0; i < tup.Len(); i++ {
 			// Generate a unique variable for each return value.
 			var lhsName string
-			lhsName, idx = generateAvailableIdentifier(expr.Pos(), file, path, pkg, info, "x", idx)
+			lhsName, idx = generateAvailableIdentifier(expr.Pos(), path, pkg, info, "x", idx)
 			lhsNames = append(lhsNames, lhsName)
 		}
 	default:
@@ -142,7 +142,7 @@ func calculateIndentation(content []byte, tok *token.File, insertBeforeStmt ast.
 
 // generateAvailableIdentifier adjusts the new function name until there are no collisions in scope.
 // Possible collisions include other function and variable names. Returns the next index to check for prefix.
-func generateAvailableIdentifier(pos token.Pos, file *ast.File, path []ast.Node, pkg *types.Package, info *types.Info, prefix string, idx int) (string, int) {
+func generateAvailableIdentifier(pos token.Pos, path []ast.Node, pkg *types.Package, info *types.Info, prefix string, idx int) (string, int) {
 	scopes := CollectScopes(info, path, pos)
 	scopes = append(scopes, pkg.Scope())
 	return generateIdentifier(idx, prefix, func(name string) bool {
@@ -333,17 +333,27 @@ func extractFunctionMethod(fset *token.FileSet, start, end token.Pos, src []byte
 		// the selection (isAssigned), (2) it must be used at least once after the
 		// selection (isUsed), and (3) its first use after the selection
 		// cannot be its own reassignment or redefinition (objOverriden).
-		if v.obj.Parent() == nil {
+		vscope := v.obj.Parent()
+		if vscope == nil {
 			return nil, fmt.Errorf("parent nil")
 		}
-		isUsed, firstUseAfter := objUsed(info, end, v.obj.Parent().End(), v.obj)
+		isUsed, firstUseAfter := objUsed(info, end, vscope.End(), v.obj)
 		if v.assigned && isUsed && !varOverridden(info, firstUseAfter, v.obj, v.free, outer) {
 			returnTypes = append(returnTypes, &ast.Field{Type: typ})
 			returns = append(returns, identifier)
 			if !v.free {
 				uninitialized = append(uninitialized, v.obj)
-			} else if v.obj.Parent().Pos() == startParent.Pos() {
-				canRedefineCount++
+
+			} else {
+				// In go1.22, Scope.Pos for function scopes changed (#60752):
+				// it used to start at the body ('{'), now it starts at "func".
+				//
+				// The second condition below handles the case when
+				// v's block is the FuncDecl.Body itself.
+				if vscope.Pos() == startParent.Pos() ||
+					startParent == outer.Body && vscope == info.Scopes[outer.Type] {
+					canRedefineCount++
+				}
 			}
 		}
 		// An identifier must meet two conditions to become a parameter of the
@@ -485,8 +495,7 @@ func extractFunctionMethod(fset *token.FileSet, start, end token.Pos, src []byte
 			// signature of the extracted function as described above. Adjust all of
 			// the return statements in the extracted function to reflect this change in
 			// signature.
-			if err := adjustReturnStatements(returnTypes, seenVars, fset, file,
-				pkg, extractedBlock); err != nil {
+			if err := adjustReturnStatements(returnTypes, seenVars, file, pkg, extractedBlock); err != nil {
 				return nil, err
 			}
 		}
@@ -494,7 +503,7 @@ func extractFunctionMethod(fset *token.FileSet, start, end token.Pos, src []byte
 		// statements in the selection. Update the type signature of the extracted
 		// function and construct the if statement that will be inserted in the enclosing
 		// function.
-		retVars, ifReturn, err = generateReturnInfo(enclosing, pkg, path, file, info, fset, start, hasNonNestedReturn)
+		retVars, ifReturn, err = generateReturnInfo(enclosing, pkg, path, file, info, start, hasNonNestedReturn)
 		if err != nil {
 			return nil, err
 		}
@@ -529,7 +538,7 @@ func extractFunctionMethod(fset *token.FileSet, start, end token.Pos, src []byte
 		funName = name
 	} else {
 		name = "newFunction"
-		funName, _ = generateAvailableIdentifier(start, file, path, pkg, info, name, 0)
+		funName, _ = generateAvailableIdentifier(start, path, pkg, info, name, 0)
 	}
 	extractedFunCall := generateFuncCall(hasNonNestedReturn, hasReturnValues, params,
 		append(returns, getNames(retVars)...), funName, sym, receiverName)
@@ -1154,12 +1163,12 @@ func parseBlockStmt(fset *token.FileSet, src []byte) (*ast.BlockStmt, error) {
 // signature of the extracted function. We prepare names, signatures, and "zero values" that
 // represent the new variables. We also use this information to construct the if statement that
 // is inserted below the call to the extracted function.
-func generateReturnInfo(enclosing *ast.FuncType, pkg *types.Package, path []ast.Node, file *ast.File, info *types.Info, fset *token.FileSet, pos token.Pos, hasNonNestedReturns bool) ([]*returnVariable, *ast.IfStmt, error) {
+func generateReturnInfo(enclosing *ast.FuncType, pkg *types.Package, path []ast.Node, file *ast.File, info *types.Info, pos token.Pos, hasNonNestedReturns bool) ([]*returnVariable, *ast.IfStmt, error) {
 	var retVars []*returnVariable
 	var cond *ast.Ident
 	if !hasNonNestedReturns {
 		// Generate information for the added bool value.
-		name, _ := generateAvailableIdentifier(pos, file, path, pkg, info, "shouldReturn", 0)
+		name, _ := generateAvailableIdentifier(pos, path, pkg, info, "shouldReturn", 0)
 		cond = &ast.Ident{Name: name}
 		retVars = append(retVars, &returnVariable{
 			name:    cond,
@@ -1181,7 +1190,7 @@ func generateReturnInfo(enclosing *ast.FuncType, pkg *types.Package, path []ast.
 				return nil, nil, fmt.Errorf("nil AST expression")
 			}
 			var name string
-			name, idx = generateAvailableIdentifier(pos, file, path, pkg, info, "returnValue", idx)
+			name, idx = generateAvailableIdentifier(pos, path, pkg, info, "returnValue", idx)
 			retVars = append(retVars, &returnVariable{
 				name:    ast.NewIdent(name),
 				decl:    &ast.Field{Type: expr},
@@ -1205,7 +1214,7 @@ func generateReturnInfo(enclosing *ast.FuncType, pkg *types.Package, path []ast.
 
 // adjustReturnStatements adds "zero values" of the given types to each return statement
 // in the given AST node.
-func adjustReturnStatements(returnTypes []*ast.Field, seenVars map[types.Object]ast.Expr, fset *token.FileSet, file *ast.File, pkg *types.Package, extractedBlock *ast.BlockStmt) error {
+func adjustReturnStatements(returnTypes []*ast.Field, seenVars map[types.Object]ast.Expr, file *ast.File, pkg *types.Package, extractedBlock *ast.BlockStmt) error {
 	var zeroVals []ast.Expr
 	// Create "zero values" for each type.
 	for _, returnType := range returnTypes {

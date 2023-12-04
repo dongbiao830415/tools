@@ -13,11 +13,15 @@ import (
 	"strings"
 
 	"golang.org/x/tools/go/ast/astutil"
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/lsp/cache"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/settings"
+	"golang.org/x/tools/gopls/internal/util/bug"
 	"golang.org/x/tools/internal/event"
 )
 
-func SignatureHelp(ctx context.Context, snapshot Snapshot, fh FileHandle, position protocol.Position) (*protocol.SignatureInformation, int, error) {
+func SignatureHelp(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, position protocol.Position) (*protocol.SignatureInformation, int, error) {
 	ctx, done := event.Start(ctx, "source.SignatureHelp")
 	defer done()
 
@@ -61,7 +65,20 @@ FindCall:
 		return nil, 0, fmt.Errorf("cannot find an enclosing function")
 	}
 
-	qf := Qualifier(pgf.File, pkg.GetTypes(), pkg.GetTypesInfo())
+	info := pkg.GetTypesInfo()
+
+	// Get the type information for the function being called.
+	var sig *types.Signature
+	if tv, ok := info.Types[callExpr.Fun]; !ok {
+		return nil, 0, fmt.Errorf("cannot get type for Fun %[1]T (%[1]v)", callExpr.Fun)
+	} else if tv.IsType() {
+		return nil, 0, fmt.Errorf("this is a conversion to %s, not a call", tv.Type)
+	} else if sig, ok = tv.Type.Underlying().(*types.Signature); !ok {
+		return nil, 0, fmt.Errorf("cannot find signature for Fun %[1]T (%[1]v)", callExpr.Fun)
+	}
+	// Inv: sig != nil
+
+	qf := Qualifier(pgf.File, pkg.GetTypes(), info)
 
 	// Get the object representing the function, if available.
 	// There is no object in certain cases such as calling a function returned by
@@ -69,25 +86,27 @@ FindCall:
 	var obj types.Object
 	switch t := callExpr.Fun.(type) {
 	case *ast.Ident:
-		obj = pkg.GetTypesInfo().ObjectOf(t)
+		obj = info.ObjectOf(t)
 	case *ast.SelectorExpr:
-		obj = pkg.GetTypesInfo().ObjectOf(t.Sel)
+		obj = info.ObjectOf(t.Sel)
 	}
 
-	// Handle builtin functions separately.
-	if obj, ok := obj.(*types.Builtin); ok {
-		return builtinSignature(ctx, snapshot, callExpr, obj.Name(), pos)
-	}
+	// Call to built-in?
+	if obj != nil && !obj.Pos().IsValid() {
+		// function?
+		if obj, ok := obj.(*types.Builtin); ok {
+			return builtinSignature(ctx, snapshot, callExpr, obj.Name(), pos)
+		}
 
-	// Get the type information for the function being called.
-	sigType := pkg.GetTypesInfo().TypeOf(callExpr.Fun)
-	if sigType == nil {
-		return nil, 0, fmt.Errorf("cannot get type for Fun %[1]T (%[1]v)", callExpr.Fun)
-	}
+		// method (only error.Error)?
+		if fn, ok := obj.(*types.Func); ok && fn.Name() == "Error" {
+			return &protocol.SignatureInformation{
+				Label:         "Error()",
+				Documentation: stringToSigInfoDocumentation("Error returns the error message.", snapshot.Options()),
+			}, 0, nil
+		}
 
-	sig, _ := sigType.Underlying().(*types.Signature)
-	if sig == nil {
-		return nil, 0, fmt.Errorf("cannot find signature for Fun %[1]T (%[1]v)", callExpr.Fun)
+		return nil, 0, bug.Errorf("call to unexpected built-in %v (%T)", obj, obj)
 	}
 
 	activeParam := activeParameter(callExpr, sig.Params().Len(), sig.Variadic(), pos)
@@ -122,7 +141,7 @@ FindCall:
 	}, activeParam, nil
 }
 
-func builtinSignature(ctx context.Context, snapshot Snapshot, callExpr *ast.CallExpr, name string, pos token.Pos) (*protocol.SignatureInformation, int, error) {
+func builtinSignature(ctx context.Context, snapshot *cache.Snapshot, callExpr *ast.CallExpr, name string, pos token.Pos) (*protocol.SignatureInformation, int, error) {
 	sig, err := NewBuiltinSignature(ctx, snapshot, name)
 	if err != nil {
 		return nil, 0, err
@@ -137,7 +156,6 @@ func builtinSignature(ctx context.Context, snapshot Snapshot, callExpr *ast.Call
 		Documentation: stringToSigInfoDocumentation(sig.doc, snapshot.Options()),
 		Parameters:    paramInfo,
 	}, activeParam, nil
-
 }
 
 func activeParameter(callExpr *ast.CallExpr, numParams int, variadic bool, pos token.Pos) (activeParam int) {
@@ -166,7 +184,7 @@ func activeParameter(callExpr *ast.CallExpr, numParams int, variadic bool, pos t
 	return activeParam
 }
 
-func stringToSigInfoDocumentation(s string, options *Options) *protocol.Or_SignatureInformation_documentation {
+func stringToSigInfoDocumentation(s string, options *settings.Options) *protocol.Or_SignatureInformation_documentation {
 	v := s
 	k := protocol.PlainText
 	if options.PreferredContentFormat == protocol.Markdown {

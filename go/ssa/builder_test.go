@@ -22,10 +22,12 @@ import (
 
 	"golang.org/x/tools/go/buildutil"
 	"golang.org/x/tools/go/loader"
+	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
 	"golang.org/x/tools/internal/testenv"
 	"golang.org/x/tools/internal/typeparams"
+	"golang.org/x/tools/txtar"
 )
 
 func isEmpty(f *ssa.Function) bool { return f.Blocks == nil }
@@ -59,7 +61,7 @@ func main() {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "input.go", input, 0)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 		return
 	}
 
@@ -69,7 +71,7 @@ func main() {
 	mainPkg, _, err := ssautil.BuildPackage(&types.Config{Importer: importer.Default()}, fset,
 		types.NewPackage("main", ""), []*ast.File{f}, mode)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 		return
 	}
 
@@ -165,16 +167,129 @@ func main() {
 	}
 }
 
+// Tests that methods from indirect dependencies not subject to
+// CreatePackage are created as needed.
+func TestNoIndirectCreatePackage(t *testing.T) {
+	testenv.NeedsGoBuild(t) // for go/packages
+
+	src := `
+-- go.mod --
+module testdata
+go 1.18
+
+-- a/a.go --
+package a
+
+import "testdata/b"
+
+func A() {
+	var x b.B
+	x.F()
+}
+
+-- b/b.go --
+package b
+
+import "testdata/c"
+
+type B struct { c.C }
+
+-- c/c.go --
+package c
+
+type C int
+func (C) F() {}
+`
+	dir := t.TempDir()
+	if err := extractArchive(dir, src); err != nil {
+		t.Fatal(err)
+	}
+	pkgs, err := loadPackages(dir, "testdata/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := pkgs[0]
+
+	// Create a from syntax, its direct deps b from types, but not indirect deps c.
+	prog := ssa.NewProgram(a.Fset, ssa.SanityCheckFunctions|ssa.PrintFunctions)
+	aSSA := prog.CreatePackage(a.Types, a.Syntax, a.TypesInfo, false)
+	for _, p := range a.Types.Imports() {
+		prog.CreatePackage(p, nil, nil, true)
+	}
+
+	// Build SSA for package a.
+	aSSA.Build()
+
+	// Find the function in the sole call in the sole block of function a.A.
+	var got string
+	for _, instr := range aSSA.Members["A"].(*ssa.Function).Blocks[0].Instrs {
+		if call, ok := instr.(*ssa.Call); ok {
+			f := call.Call.Value.(*ssa.Function)
+			got = fmt.Sprintf("%v # %s", f, f.Synthetic)
+			break
+		}
+	}
+	want := "(testdata/c.C).F # from type information (on demand)"
+	if got != want {
+		t.Errorf("for sole call in a.A, got: <<%s>>, want <<%s>>", got, want)
+	}
+}
+
+// extractArchive extracts the txtar archive into the specified directory.
+func extractArchive(dir, arch string) error {
+	// TODO(adonovan): publish this a helper (#61386).
+	extractTxtar := func(ar *txtar.Archive, dir string) error {
+		for _, file := range ar.Files {
+			name := filepath.Join(dir, file.Name)
+			if err := os.MkdirAll(filepath.Dir(name), 0777); err != nil {
+				return err
+			}
+			if err := os.WriteFile(name, file.Data, 0666); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Extract archive to temporary tree.
+	ar := txtar.Parse([]byte(arch))
+	return extractTxtar(ar, dir)
+}
+
+// loadPackages loads packages from the specified directory, using LoadSyntax.
+func loadPackages(dir string, patterns ...string) ([]*packages.Package, error) {
+	cfg := &packages.Config{
+		Dir:  dir,
+		Mode: packages.LoadSyntax,
+		Env: append(os.Environ(),
+			"GO111MODULES=on",
+			"GOPATH=",
+			"GOWORK=off",
+			"GOPROXY=off"),
+	}
+	pkgs, err := packages.Load(cfg, patterns...)
+	if err != nil {
+		return nil, err
+	}
+	if packages.PrintErrors(pkgs) > 0 {
+		return nil, fmt.Errorf("there were errors")
+	}
+	return pkgs, nil
+}
+
 // TestRuntimeTypes tests that (*Program).RuntimeTypes() includes all necessary types.
 func TestRuntimeTypes(t *testing.T) {
 	testenv.NeedsGoBuild(t) // for importer.Default()
+
+	// TODO(adonovan): these test cases don't really make logical
+	// sense any more. Rethink.
 
 	tests := []struct {
 		input string
 		want  []string
 	}{
-		// An exported package-level type is needed.
-		{`package A; type T struct{}; func (T) f() {}`,
+		// An package-level type is needed.
+		{`package A; type T struct{}; func (T) f() {}; var x any = T{}`,
 			[]string{"*p.T", "p.T"},
 		},
 		// An unexported package-level type is not needed.
@@ -182,20 +297,20 @@ func TestRuntimeTypes(t *testing.T) {
 			nil,
 		},
 		// Subcomponents of type of exported package-level var are needed.
-		{`package C; import "bytes"; var V struct {*bytes.Buffer}`,
+		{`package C; import "bytes"; var V struct {*bytes.Buffer}; var x any = &V`,
 			[]string{"*bytes.Buffer", "*struct{*bytes.Buffer}", "struct{*bytes.Buffer}"},
 		},
 		// Subcomponents of type of unexported package-level var are not needed.
-		{`package D; import "bytes"; var v struct {*bytes.Buffer}`,
-			nil,
+		{`package D; import "bytes"; var v struct {*bytes.Buffer}; var x any = v`,
+			[]string{"*bytes.Buffer", "struct{*bytes.Buffer}"},
 		},
 		// Subcomponents of type of exported package-level function are needed.
-		{`package E; import "bytes"; func F(struct {*bytes.Buffer}) {}`,
+		{`package E; import "bytes"; func F(struct {*bytes.Buffer}) {}; var v any = F`,
 			[]string{"*bytes.Buffer", "struct{*bytes.Buffer}"},
 		},
 		// Subcomponents of type of unexported package-level function are not needed.
-		{`package F; import "bytes"; func f(struct {*bytes.Buffer}) {}`,
-			nil,
+		{`package F; import "bytes"; func f(struct {*bytes.Buffer}) {}; var v any = f`,
+			[]string{"*bytes.Buffer", "struct{*bytes.Buffer}"},
 		},
 		// Subcomponents of type of exported method of uninstantiated unexported type are not needed.
 		{`package G; import "bytes"; type x struct{}; func (x) G(struct {*bytes.Buffer}) {}; var v x`,
@@ -206,7 +321,7 @@ func TestRuntimeTypes(t *testing.T) {
 			[]string{"*bytes.Buffer", "*p.x", "p.x", "struct{*bytes.Buffer}"},
 		},
 		// Subcomponents of type of unexported method are not needed.
-		{`package I; import "bytes"; type X struct{}; func (X) G(struct {*bytes.Buffer}) {}`,
+		{`package I; import "bytes"; type X struct{}; func (X) G(struct {*bytes.Buffer}) {}; var x any = X{}`,
 			[]string{"*bytes.Buffer", "*p.X", "p.X", "struct{*bytes.Buffer}"},
 		},
 		// Local types aren't needed.
@@ -225,18 +340,10 @@ func TestRuntimeTypes(t *testing.T) {
 		{`package M; import "bytes"; var _ interface{} = struct{*bytes.Buffer}{}`,
 			nil,
 		},
-	}
-
-	if typeparams.Enabled {
-		tests = append(tests, []struct {
-			input string
-			want  []string
-		}{
-			// MakeInterface does not create runtime type for parameterized types.
-			{`package N; var g interface{}; func f[S any]() { var v []S; g = v }; `,
-				nil,
-			},
-		}...)
+		// MakeInterface does not create runtime type for parameterized types.
+		{`package N; var g interface{}; func f[S any]() { var v []S; g = v }; `,
+			nil,
+		},
 	}
 	for _, test := range tests {
 		// Parse the file.
@@ -259,6 +366,9 @@ func TestRuntimeTypes(t *testing.T) {
 
 		var typstrs []string
 		for _, T := range ssapkg.Prog.RuntimeTypes() {
+			if types.IsInterface(T) || types.NewMethodSet(T).Len() == 0 {
+				continue // skip interfaces and types without methods
+			}
 			typstrs = append(typstrs, T.String())
 		}
 		sort.Strings(typstrs)
@@ -422,6 +532,7 @@ var (
 
 		"P.init": "package initializer",
 	}
+	var seen []string // may contain dups
 	for fn := range ssautil.AllFunctions(prog) {
 		if fn.Synthetic == "" {
 			continue
@@ -432,11 +543,15 @@ var (
 			t.Errorf("got unexpected/duplicate func: %q: %q", name, fn.Synthetic)
 			continue
 		}
-		delete(want, name)
+		seen = append(seen, name)
 
 		if wantDescr != fn.Synthetic {
 			t.Errorf("(%s).Synthetic = %q, want %q", name, fn.Synthetic, wantDescr)
 		}
+	}
+
+	for _, name := range seen {
+		delete(want, name)
 	}
 	for fn, descr := range want {
 		t.Errorf("want func: %q: %q", fn, descr)
@@ -529,9 +644,6 @@ func h(error)
 // TODO(taking): Add calls from non-generic functions to instantiations of generic functions.
 // TODO(taking): Add globals with types that are instantiations of generic functions.
 func TestGenericDecls(t *testing.T) {
-	if !typeparams.Enabled {
-		t.Skip("TestGenericDecls only works with type parameters enabled.")
-	}
 	const input = `
 package p
 
@@ -586,9 +698,6 @@ func LoadPointer(addr *unsafe.Pointer) (val unsafe.Pointer)
 }
 
 func TestGenericWrappers(t *testing.T) {
-	if !typeparams.Enabled {
-		t.Skip("TestGenericWrappers only works with type parameters enabled.")
-	}
 	const input = `
 package p
 
@@ -842,10 +951,6 @@ func sliceMax(s []int) []int { return s[a():b():c()] }
 
 // TestGenericFunctionSelector ensures generic functions from other packages can be selected.
 func TestGenericFunctionSelector(t *testing.T) {
-	if !typeparams.Enabled {
-		t.Skip("TestGenericFunctionSelector uses type parameters.")
-	}
-
 	pkgs := map[string]map[string]string{
 		"main": {"m.go": `package main; import "a"; func main() { a.F[int](); a.G[int,string](); a.H(0) }`},
 		"a":    {"a.go": `package a; func F[T any](){}; func G[S, T any](){}; func H[T any](a T){} `},
@@ -920,7 +1025,7 @@ func TestIssue58491(t *testing.T) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "p.go", src, 0)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 	files := []*ast.File{f}
 
@@ -973,7 +1078,7 @@ func TestIssue58491Rec(t *testing.T) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "p.go", src, 0)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 	files := []*ast.File{f}
 
@@ -1004,13 +1109,8 @@ func TestIssue58491Rec(t *testing.T) {
 	}
 }
 
-// TestSyntax ensures that a function's Syntax is available when
-// debug info is enabled.
+// TestSyntax ensures that a function's Syntax is available.
 func TestSyntax(t *testing.T) {
-	if !typeparams.Enabled {
-		t.Skip("TestSyntax uses type parameters.")
-	}
-
 	const input = `package p
 
 	type P int
@@ -1031,7 +1131,8 @@ func TestSyntax(t *testing.T) {
 		}
 		return (*T)(f3())
 	}
-	var _ = F[int]
+	var g = F[int]
+	var _ = F[P] // unreferenced => not instantiated
 	`
 
 	// Parse
@@ -1049,7 +1150,7 @@ func TestSyntax(t *testing.T) {
 	}
 
 	// Create and build SSA
-	prog := ssautil.CreateProgram(lprog, ssa.GlobalDebug|ssa.InstantiateGenerics)
+	prog := ssautil.CreateProgram(lprog, ssa.InstantiateGenerics)
 	prog.Build()
 
 	// Collect syntax information for all of the functions.
@@ -1059,6 +1160,9 @@ func TestSyntax(t *testing.T) {
 			continue
 		}
 		syntax := fn.Syntax()
+		if got[fn.Name()] != "" {
+			t.Error("dup")
+		}
 		got[fn.Name()] = fmt.Sprintf("%T : %s @ %d", syntax, fn.Signature, prog.Fset.Position(syntax.Pos()).Line)
 	}
 
@@ -1072,8 +1176,41 @@ func TestSyntax(t *testing.T) {
 		"F[int]$1":   "*ast.FuncLit : func() p.S1 @ 10",
 		"F[int]$1$1": "*ast.FuncLit : func() p.S2 @ 11",
 		"F[int]$2":   "*ast.FuncLit : func() p.S3 @ 16",
+		// ...but no F[P] etc as they are unreferenced.
+		// (NB: GlobalDebug mode would cause them to be referenced.)
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Expected the functions with signature to be:\n\t%#v.\n Got:\n\t%#v", want, got)
+	}
+}
+
+func TestGo117Builtins(t *testing.T) {
+	tests := []struct {
+		name     string
+		src      string
+		importer types.Importer
+	}{
+		{"slice to array pointer", "package p; var s []byte; var _ = (*[4]byte)(s)", nil},
+		{"unsafe slice", `package p; import "unsafe"; var _ = unsafe.Add(nil, 0)`, importer.Default()},
+		{"unsafe add", `package p; import "unsafe"; var _ = unsafe.Slice((*int)(nil), 0)`, importer.Default()},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, "p.go", tc.src, parser.ParseComments)
+			if err != nil {
+				t.Error(err)
+			}
+			files := []*ast.File{f}
+
+			pkg := types.NewPackage("p", "")
+			conf := &types.Config{Importer: tc.importer}
+			if _, _, err := ssautil.BuildPackage(conf, fset, pkg, files, ssa.SanityCheckFunctions); err != nil {
+				t.Error(err)
+			}
+		})
 	}
 }

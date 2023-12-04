@@ -6,22 +6,26 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 
-	"golang.org/x/tools/gopls/internal/bug"
-	"golang.org/x/tools/gopls/internal/lsp/source"
-	"golang.org/x/tools/gopls/internal/lsp/source/typerefs"
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/lsp/cache/metadata"
+	"golang.org/x/tools/gopls/internal/lsp/cache/typerefs"
+	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/util/bug"
+	"golang.org/x/tools/gopls/internal/util/persistent"
 	"golang.org/x/tools/gopls/internal/vulncheck"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/gocommand"
 	"golang.org/x/tools/internal/imports"
 	"golang.org/x/tools/internal/memoize"
-	"golang.org/x/tools/internal/persistent"
 	"golang.org/x/tools/internal/xcontext"
 )
 
@@ -35,7 +39,7 @@ type Session struct {
 
 	viewMu  sync.Mutex
 	views   []*View
-	viewMap map[span.URI]*View // file->best view
+	viewMap map[protocol.DocumentURI]*View // file->best view
 
 	parseCache *parseCache
 
@@ -71,103 +75,138 @@ func (s *Session) Cache() *Cache {
 	return s.cache
 }
 
+// TODO(rfindley): is the logic surrounding this error actually necessary?
+var ErrViewExists = errors.New("view already exists for session")
+
 // NewView creates a new View, returning it and its first snapshot. If a
 // non-empty tempWorkspace directory is provided, the View will record a copy
 // of its gopls workspace module in that directory, so that client tooling
 // can execute in the same main module.  On success it also returns a release
 // function that must be called when the Snapshot is no longer needed.
-func (s *Session) NewView(ctx context.Context, name string, folder span.URI, options *source.Options) (*View, source.Snapshot, func(), error) {
+func (s *Session) NewView(ctx context.Context, folder *Folder) (*View, *Snapshot, func(), error) {
 	s.viewMu.Lock()
 	defer s.viewMu.Unlock()
-	for _, view := range s.views {
-		if span.SameExistingFile(view.folder, folder) {
-			return nil, nil, nil, source.ErrViewExists
+
+	// Querying the file system to check whether
+	// two folders denote the same existing directory.
+	if inode1, err := os.Stat(filepath.FromSlash(folder.Dir.Path())); err == nil {
+		for _, view := range s.views {
+			inode2, err := os.Stat(filepath.FromSlash(view.folder.Dir.Path()))
+			if err == nil && os.SameFile(inode1, inode2) {
+				return nil, nil, nil, ErrViewExists
+			}
 		}
 	}
-	view, snapshot, release, err := s.createView(ctx, name, folder, options, 0)
+
+	def, err := getViewDefinition(ctx, s.gocmdRunner, s, folder)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	view, snapshot, release, err := s.createView(ctx, def, folder, 0)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	s.views = append(s.views, view)
 	// we always need to drop the view map
-	s.viewMap = make(map[span.URI]*View)
+	s.viewMap = make(map[protocol.DocumentURI]*View)
 	return view, snapshot, release, nil
 }
 
 // TODO(rfindley): clarify that createView can never be cancelled (with the
 // possible exception of server shutdown).
 // On success, the caller becomes responsible for calling the release function once.
-func (s *Session) createView(ctx context.Context, name string, folder span.URI, options *source.Options, seqID uint64) (*View, *snapshot, func(), error) {
+func (s *Session) createView(ctx context.Context, def *viewDefinition, folder *Folder, seqID uint64) (*View, *Snapshot, func(), error) {
 	index := atomic.AddInt64(&viewIndex, 1)
-
-	// Get immutable workspace information.
-	info, err := s.getWorkspaceInformation(ctx, folder, options)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	gowork, _ := info.GOWORK()
-	wsModFiles, wsModFilesErr := computeWorkspaceModFiles(ctx, info.gomod, gowork, info.effectiveGO111MODULE(), s)
 
 	// We want a true background context and not a detached context here
 	// the spans need to be unrelated and no tag values should pollute it.
 	baseCtx := event.Detach(xcontext.Detach(ctx))
 	backgroundCtx, cancel := context.WithCancel(baseCtx)
 
+	// Compute a skip function to use for module cache scanning.
+	//
+	// Note that unlike other filtering operations, we definitely don't want to
+	// exclude the gomodcache here, even if it is contained in the workspace
+	// folder.
+	//
+	// TODO(rfindley): consolidate with relPathExcludedByFilter(Func), Filterer,
+	// View.filterFunc.
+	var skipPath func(string) bool
+	{
+		// Compute a prefix match, respecting segment boundaries, by ensuring
+		// the pattern (dir) has a trailing slash.
+		dirPrefix := strings.TrimSuffix(string(folder.Dir), "/") + "/"
+		filterer := NewFilterer(folder.Options.DirectoryFilters)
+		skipPath = func(dir string) bool {
+			uri := strings.TrimSuffix(string(protocol.URIFromPath(dir)), "/")
+			// Note that the logic below doesn't handle the case where uri ==
+			// v.folder.Dir, because there is no point in excluding the entire
+			// workspace folder!
+			if rel := strings.TrimPrefix(uri, dirPrefix); rel != uri {
+				return filterer.Disallow(rel)
+			}
+			return false
+		}
+	}
+
+	var ignoreFilter *ignoreFilter
+	{
+		var dirs []string
+		if len(def.workspaceModFiles) == 0 {
+			for _, entry := range filepath.SplitList(def.gopath) {
+				dirs = append(dirs, filepath.Join(entry, "src"))
+			}
+		} else {
+			dirs = append(dirs, def.gomodcache)
+			for m := range def.workspaceModFiles {
+				dirs = append(dirs, filepath.Dir(m.Path()))
+			}
+		}
+		ignoreFilter = newIgnoreFilter(dirs)
+	}
+
 	v := &View{
 		id:                   strconv.FormatInt(index, 10),
 		gocmdRunner:          s.gocmdRunner,
-		lastOptions:          options,
+		folder:               folder,
 		initialWorkspaceLoad: make(chan struct{}),
 		initializationSema:   make(chan struct{}, 1),
 		baseCtx:              baseCtx,
-		name:                 name,
-		moduleUpgrades:       map[span.URI]map[string]string{},
-		vulns:                map[span.URI]*vulncheck.Result{},
 		parseCache:           s.parseCache,
+		ignoreFilter:         ignoreFilter,
 		fs:                   s.overlayFS,
-		workspaceInformation: info,
-	}
-	v.importsState = &importsState{
-		ctx: backgroundCtx,
-		processEnv: &imports.ProcessEnv{
-			GocmdRunner: s.gocmdRunner,
-			SkipPathInScan: func(dir string) bool {
-				prefix := strings.TrimSuffix(string(v.folder), "/") + "/"
-				uri := strings.TrimSuffix(string(span.URIFromPath(dir)), "/")
-				if !strings.HasPrefix(uri+"/", prefix) {
-					return false
-				}
-				filterer := source.NewFilterer(options.DirectoryFilters)
-				rel := strings.TrimPrefix(uri, prefix)
-				disallow := filterer.Disallow(rel)
-				return disallow
+		viewDefinition:       def,
+		importsState: &importsState{
+			ctx: backgroundCtx,
+			processEnv: &imports.ProcessEnv{
+				GocmdRunner:    s.gocmdRunner,
+				SkipPathInScan: skipPath,
 			},
 		},
 	}
-	v.snapshot = &snapshot{
-		sequenceID:           seqID,
-		globalID:             nextSnapshotID(),
-		view:                 v,
-		backgroundCtx:        backgroundCtx,
-		cancel:               cancel,
-		store:                s.cache.store,
-		packages:             new(persistent.Map[PackageID, *packageHandle]),
-		meta:                 new(metadataGraph),
-		files:                newFileMap(),
-		activePackages:       new(persistent.Map[PackageID, *Package]),
-		symbolizeHandles:     new(persistent.Map[span.URI, *memoize.Promise]),
-		workspacePackages:    make(map[PackageID]PackagePath),
-		unloadableFiles:      new(persistent.Set[span.URI]),
-		parseModHandles:      new(persistent.Map[span.URI, *memoize.Promise]),
-		parseWorkHandles:     new(persistent.Map[span.URI, *memoize.Promise]),
-		modTidyHandles:       new(persistent.Map[span.URI, *memoize.Promise]),
-		modVulnHandles:       new(persistent.Map[span.URI, *memoize.Promise]),
-		modWhyHandles:        new(persistent.Map[span.URI, *memoize.Promise]),
-		workspaceModFiles:    wsModFiles,
-		workspaceModFilesErr: wsModFilesErr,
-		pkgIndex:             typerefs.NewPackageIndex(),
-		options:              options,
+
+	v.snapshot = &Snapshot{
+		sequenceID:       seqID,
+		globalID:         nextSnapshotID(),
+		view:             v,
+		backgroundCtx:    backgroundCtx,
+		cancel:           cancel,
+		store:            s.cache.store,
+		packages:         new(persistent.Map[PackageID, *packageHandle]),
+		meta:             new(metadata.Graph),
+		files:            newFileMap(),
+		activePackages:   new(persistent.Map[PackageID, *Package]),
+		symbolizeHandles: new(persistent.Map[protocol.DocumentURI, *memoize.Promise]),
+		shouldLoad:       new(persistent.Map[PackageID, []PackagePath]),
+		unloadableFiles:  new(persistent.Set[protocol.DocumentURI]),
+		parseModHandles:  new(persistent.Map[protocol.DocumentURI, *memoize.Promise]),
+		parseWorkHandles: new(persistent.Map[protocol.DocumentURI, *memoize.Promise]),
+		modTidyHandles:   new(persistent.Map[protocol.DocumentURI, *memoize.Promise]),
+		modVulnHandles:   new(persistent.Map[protocol.DocumentURI, *memoize.Promise]),
+		modWhyHandles:    new(persistent.Map[protocol.DocumentURI, *memoize.Promise]),
+		pkgIndex:         typerefs.NewPackageIndex(),
+		moduleUpgrades:   new(persistent.Map[protocol.DocumentURI, map[string]string]),
+		vulns:            new(persistent.Map[protocol.DocumentURI, *vulncheck.Result]),
 	}
 	// Save one reference in the view.
 	v.releaseSnapshot = v.snapshot.Acquire()
@@ -191,16 +230,24 @@ func (s *Session) createView(ctx context.Context, name string, folder span.URI, 
 	return v, snapshot, snapshot.Acquire(), nil
 }
 
-// ViewByName returns a view with a matching name, if the session has one.
-func (s *Session) ViewByName(name string) *View {
+// RemoveView removes from the session the view rooted at the specified directory.
+// It reports whether a view of that directory was removed.
+func (s *Session) RemoveView(dir protocol.DocumentURI) bool {
 	s.viewMu.Lock()
 	defer s.viewMu.Unlock()
 	for _, view := range s.views {
-		if view.Name() == name {
-			return view
+		if view.folder.Dir == dir {
+			i := s.dropView(view)
+			if i == -1 {
+				return false // can't happen
+			}
+			// delete this view... we don't care about order but we do want to make
+			// sure we can garbage collect the view
+			s.views = removeElement(s.views, i)
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 // View returns the view with a matching id, if present.
@@ -217,14 +264,14 @@ func (s *Session) View(id string) (*View, error) {
 
 // ViewOf returns a view corresponding to the given URI.
 // If the file is not already associated with a view, pick one using some heuristics.
-func (s *Session) ViewOf(uri span.URI) (*View, error) {
+func (s *Session) ViewOf(uri protocol.DocumentURI) (*View, error) {
 	s.viewMu.Lock()
 	defer s.viewMu.Unlock()
 	return s.viewOfLocked(uri)
 }
 
 // Precondition: caller holds s.viewMu lock.
-func (s *Session) viewOfLocked(uri span.URI) (*View, error) {
+func (s *Session) viewOfLocked(uri protocol.DocumentURI) (*View, error) {
 	// Check if we already know this file.
 	if v, found := s.viewMap[uri]; found {
 		return v, nil
@@ -247,24 +294,18 @@ func (s *Session) Views() []*View {
 
 // bestViewForURI returns the most closely matching view for the given URI
 // out of the given set of views.
-func bestViewForURI(uri span.URI, views []*View) *View {
+func bestViewForURI(uri protocol.DocumentURI, views []*View) *View {
 	// we need to find the best view for this file
 	var longest *View
 	for _, view := range views {
-		if longest != nil && len(longest.Folder()) > len(view.Folder()) {
+		if longest != nil && len(longest.folder.Dir) > len(view.folder.Dir) {
 			continue
 		}
 		// TODO(rfindley): this should consider the workspace layout (i.e.
 		// go.work).
-		snapshot, release, err := view.getSnapshot()
-		if err != nil {
-			// view is shutdown
-			continue
-		}
-		if snapshot.contains(uri) {
+		if view.contains(uri) {
 			longest = view
 		}
-		release()
 	}
 	if longest != nil {
 		return longest
@@ -279,46 +320,38 @@ func bestViewForURI(uri span.URI, views []*View) *View {
 	return views[0]
 }
 
-// RemoveView removes the view v from the session
-func (s *Session) RemoveView(view *View) {
-	s.viewMu.Lock()
-	defer s.viewMu.Unlock()
-
-	i := s.dropView(view)
-	if i == -1 { // error reported elsewhere
-		return
-	}
-	// delete this view... we don't care about order but we do want to make
-	// sure we can garbage collect the view
-	s.views = removeElement(s.views, i)
-}
-
 // updateViewLocked recreates the view with the given options.
 //
 // If the resulting error is non-nil, the view may or may not have already been
 // dropped from the session.
-func (s *Session) updateViewLocked(ctx context.Context, view *View, options *source.Options) error {
+func (s *Session) updateViewLocked(ctx context.Context, view *View, def *viewDefinition, folder *Folder) (*View, error) {
 	// Preserve the snapshot ID if we are recreating the view.
 	view.snapshotMu.Lock()
 	if view.snapshot == nil {
 		view.snapshotMu.Unlock()
 		panic("updateView called after View was already shut down")
 	}
+	// TODO(rfindley): we should probably increment the sequence ID here.
 	seqID := view.snapshot.sequenceID // Preserve sequence IDs when updating a view in place.
 	view.snapshotMu.Unlock()
 
 	i := s.dropView(view)
 	if i == -1 {
-		return fmt.Errorf("view %q not found", view.id)
+		return nil, fmt.Errorf("view %q not found", view.id)
 	}
 
-	v, snapshot, release, err := s.createView(ctx, view.name, view.folder, options, seqID)
+	var (
+		snapshot *Snapshot
+		release  func()
+		err      error
+	)
+	view, snapshot, release, err = s.createView(ctx, def, folder, seqID)
 	if err != nil {
 		// we have dropped the old view, but could not create the new one
 		// this should not happen and is very bad, but we still need to clean
 		// up the view array if it happens
 		s.views = removeElement(s.views, i)
-		return err
+		return nil, err
 	}
 	defer release()
 
@@ -328,13 +361,13 @@ func (s *Session) updateViewLocked(ctx context.Context, view *View, options *sou
 	// behavior when configuration is changed mid-session.
 	//
 	// Ensure the new snapshot observes all open files.
-	for _, o := range v.fs.Overlays() {
+	for _, o := range view.fs.Overlays() {
 		_, _ = snapshot.ReadFile(ctx, o.URI())
 	}
 
 	// substitute the new view into the array where the old view was
-	s.views[i] = v
-	return nil
+	s.views[i] = view
+	return view, nil
 }
 
 // removeElement removes the ith element from the slice replacing it with the last element.
@@ -351,7 +384,7 @@ func removeElement(slice []*View, index int) []*View {
 // not found. s.viewMu must be held while calling this function.
 func (s *Session) dropView(v *View) int {
 	// we always need to drop the view map
-	s.viewMap = make(map[span.URI]*View)
+	s.viewMap = make(map[protocol.DocumentURI]*View)
 	for i := range s.views {
 		if v == s.views[i] {
 			// we found the view, drop it and return the index it was found at
@@ -366,10 +399,12 @@ func (s *Session) dropView(v *View) int {
 	return -1
 }
 
-func (s *Session) ModifyFiles(ctx context.Context, changes []source.FileModification) error {
-	_, release, err := s.DidModifyFiles(ctx, changes)
-	release()
-	return err
+// ResetView resets the best view for the given URI.
+func (s *Session) ResetView(ctx context.Context, uri protocol.DocumentURI) (*View, error) {
+	s.viewMu.Lock()
+	defer s.viewMu.Unlock()
+	v := bestViewForURI(uri, s.views)
+	return s.updateViewLocked(ctx, v, v.viewDefinition, v.folder)
 }
 
 // DidModifyFiles reports a file modification to the session. It returns
@@ -381,7 +416,7 @@ func (s *Session) ModifyFiles(ctx context.Context, changes []source.FileModifica
 // TODO(rfindley): what happens if this function fails? It must leave us in a
 // broken state, which we should surface to the user, probably as a request to
 // restart gopls.
-func (s *Session) DidModifyFiles(ctx context.Context, changes []source.FileModification) (map[source.Snapshot][]span.URI, func(), error) {
+func (s *Session) DidModifyFiles(ctx context.Context, changes []file.Modification) (map[*Snapshot][]protocol.DocumentURI, func(), error) {
 	s.viewMu.Lock()
 	defer s.viewMu.Unlock()
 
@@ -405,19 +440,21 @@ func (s *Session) DidModifyFiles(ctx context.Context, changes []source.FileModif
 	checkViews := false
 
 	for _, c := range changes {
+		// Any on-disk change to a go.work file causes a re-diagnosis.
+		//
 		// TODO(rfindley): go.work files need not be named "go.work" -- we need to
-		// check each view's source.
-		if isGoMod(c.URI) || isGoWork(c.URI) {
-			// Change, InvalidateMetadata, and UnknownFileAction actions do not cause
-			// us to re-evaluate views.
-			redoViews := (c.Action != source.Change &&
-				c.Action != source.InvalidateMetadata &&
-				c.Action != source.UnknownFileAction)
-
-			if redoViews {
-				checkViews = true
-				break
-			}
+		// check each view's source to handle the case of an explicit GOWORK value.
+		// Write a test that fails, and fix this.
+		if isGoWork(c.URI) && (c.Action == file.Save || c.OnDisk) {
+			checkViews = true
+			break
+		}
+		// Opening/Close/Create/Delete of go.mod files all trigger
+		// re-evaluation of Views. Changes do not as they can't affect the set of
+		// Views.
+		if isGoMod(c.URI) && c.Action != file.Change && c.Action != file.Save {
+			checkViews = true
+			break
 		}
 	}
 
@@ -427,7 +464,7 @@ func (s *Session) DidModifyFiles(ctx context.Context, changes []source.FileModif
 			// synchronously to change processing? Can we assume that the env did not
 			// change, and derive go.work using a combination of the configured
 			// GOWORK value and filesystem?
-			info, err := s.getWorkspaceInformation(ctx, view.folder, view.lastOptions)
+			info, err := getViewDefinition(ctx, s.gocmdRunner, s, view.folder)
 			if err != nil {
 				// Catastrophic failure, equivalent to a failure of session
 				// initialization and therefore should almost never happen. One
@@ -438,10 +475,8 @@ func (s *Session) DidModifyFiles(ctx context.Context, changes []source.FileModif
 				// TODO(rfindley): consider surfacing this error more loudly. We
 				// could report a bug, but it's not really a bug.
 				event.Error(ctx, "fetching workspace information", err)
-			}
-
-			if info != view.workspaceInformation {
-				if err := s.updateViewLocked(ctx, view, view.lastOptions); err != nil {
+			} else if !viewDefinitionsEqual(view.viewDefinition, info) {
+				if _, err := s.updateViewLocked(ctx, view, info, view.folder); err != nil {
 					// More catastrophic failure. The view may or may not still exist.
 					// The best we can do is log and move on.
 					event.Error(ctx, "recreating view", err)
@@ -451,15 +486,9 @@ func (s *Session) DidModifyFiles(ctx context.Context, changes []source.FileModif
 	}
 
 	// Collect information about views affected by these changes.
-	views := make(map[*View]map[span.URI]source.FileHandle)
-	affectedViews := map[span.URI][]*View{}
-	// forceReloadMetadata records whether any change is the magic
-	// source.InvalidateMetadata action.
-	forceReloadMetadata := false
+	views := make(map[*View]map[protocol.DocumentURI]file.Handle)
+	affectedViews := map[protocol.DocumentURI][]*View{}
 	for _, c := range changes {
-		if c.Action == source.InvalidateMetadata {
-			forceReloadMetadata = true
-		}
 		// Build the list of affected views.
 		var changedViews []*View
 		for _, view := range s.views {
@@ -490,16 +519,16 @@ func (s *Session) DidModifyFiles(ctx context.Context, changes []source.FileModif
 			// Make sure that the file is added to the view's seenFiles set.
 			view.markKnown(c.URI)
 			if _, ok := views[view]; !ok {
-				views[view] = make(map[span.URI]source.FileHandle)
+				views[view] = make(map[protocol.DocumentURI]file.Handle)
 			}
 			views[view][c.URI] = fh
 		}
 	}
 
 	var releases []func()
-	viewToSnapshot := map[*View]*snapshot{}
+	viewToSnapshot := make(map[*View]*Snapshot)
 	for view, changed := range views {
-		snapshot, release := view.invalidateContent(ctx, changed, nil, forceReloadMetadata)
+		snapshot, release := view.Invalidate(ctx, StateChange{Files: changed})
 		releases = append(releases, release)
 		viewToSnapshot[view] = snapshot
 	}
@@ -516,7 +545,7 @@ func (s *Session) DidModifyFiles(ctx context.Context, changes []source.FileModif
 	// it "most" belongs. We do this by picking the best view for each URI,
 	// and then aggregating the set of snapshots and their URIs (to avoid
 	// diagnosing the same snapshot multiple times).
-	snapshotURIs := map[source.Snapshot][]span.URI{}
+	snapshotURIs := map[*Snapshot][]protocol.DocumentURI{}
 	for _, mod := range changes {
 		viewSlice, ok := affectedViews[mod.URI]
 		if !ok || len(viewSlice) == 0 {
@@ -525,7 +554,7 @@ func (s *Session) DidModifyFiles(ctx context.Context, changes []source.FileModif
 		view := bestViewForURI(mod.URI, viewSlice)
 		snapshot, ok := viewToSnapshot[view]
 		if !ok {
-			panic(fmt.Sprintf("no snapshot for view %s", view.Folder()))
+			panic(fmt.Sprintf("no snapshot for view %s", view.folder.Dir))
 		}
 		snapshotURIs[snapshot] = append(snapshotURIs[snapshot], mod.URI)
 	}
@@ -536,11 +565,11 @@ func (s *Session) DidModifyFiles(ctx context.Context, changes []source.FileModif
 // ExpandModificationsToDirectories returns the set of changes with the
 // directory changes removed and expanded to include all of the files in
 // the directory.
-func (s *Session) ExpandModificationsToDirectories(ctx context.Context, changes []source.FileModification) []source.FileModification {
-	var snapshots []*snapshot
+func (s *Session) ExpandModificationsToDirectories(ctx context.Context, changes []file.Modification) []file.Modification {
+	var snapshots []*Snapshot
 	s.viewMu.Lock()
 	for _, v := range s.views {
-		snapshot, release, err := v.getSnapshot()
+		snapshot, release, err := v.Snapshot()
 		if err != nil {
 			continue // view is shut down; continue with others
 		}
@@ -554,9 +583,9 @@ func (s *Session) ExpandModificationsToDirectories(ctx context.Context, changes 
 	//
 	// There may be other files in the directory, but if we haven't read them yet
 	// we don't need to invalidate them.
-	var result []source.FileModification
+	var result []file.Modification
 	for _, c := range changes {
-		expanded := make(map[span.URI]bool)
+		expanded := make(map[protocol.DocumentURI]bool)
 		for _, snapshot := range snapshots {
 			for _, uri := range snapshot.filesInDir(c.URI) {
 				expanded[uri] = true
@@ -566,7 +595,7 @@ func (s *Session) ExpandModificationsToDirectories(ctx context.Context, changes 
 			result = append(result, c)
 		} else {
 			for uri := range expanded {
-				result = append(result, source.FileModification{
+				result = append(result, file.Modification{
 					URI:        uri,
 					Action:     c.Action,
 					LanguageID: "",
@@ -581,16 +610,11 @@ func (s *Session) ExpandModificationsToDirectories(ctx context.Context, changes 
 
 // Precondition: caller holds s.viewMu lock.
 // TODO(rfindley): move this to fs_overlay.go.
-func (fs *overlayFS) updateOverlays(ctx context.Context, changes []source.FileModification) error {
+func (fs *overlayFS) updateOverlays(ctx context.Context, changes []file.Modification) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
 	for _, c := range changes {
-		// Don't update overlays for metadata invalidations.
-		if c.Action == source.InvalidateMetadata {
-			continue
-		}
-
 		o, ok := fs.overlays[c.URI]
 
 		// If the file is not opened in an overlay and the change is on disk,
@@ -601,10 +625,10 @@ func (fs *overlayFS) updateOverlays(ctx context.Context, changes []source.FileMo
 		}
 
 		// Determine the file kind on open, otherwise, assume it has been cached.
-		var kind source.FileKind
+		var kind file.Kind
 		switch c.Action {
-		case source.Open:
-			kind = source.FileKindForLang(c.LanguageID)
+		case file.Open:
+			kind = file.KindForLang(c.LanguageID)
 		default:
 			if !ok {
 				return fmt.Errorf("updateOverlays: modifying unopened overlay %v", c.URI)
@@ -613,7 +637,7 @@ func (fs *overlayFS) updateOverlays(ctx context.Context, changes []source.FileMo
 		}
 
 		// Closing a file just deletes its overlay.
-		if c.Action == source.Close {
+		if c.Action == file.Close {
 			delete(fs.overlays, c.URI)
 			continue
 		}
@@ -622,7 +646,7 @@ func (fs *overlayFS) updateOverlays(ctx context.Context, changes []source.FileMo
 		// overlay. Saves and on-disk file changes don't come with the file's
 		// content.
 		text := c.Text
-		if text == nil && (c.Action == source.Save || c.OnDisk) {
+		if text == nil && (c.Action == file.Save || c.OnDisk) {
 			if !ok {
 				return fmt.Errorf("no known content for overlay for %s", c.Action)
 			}
@@ -630,15 +654,15 @@ func (fs *overlayFS) updateOverlays(ctx context.Context, changes []source.FileMo
 		}
 		// On-disk changes don't come with versions.
 		version := c.Version
-		if c.OnDisk || c.Action == source.Save {
+		if c.OnDisk || c.Action == file.Save {
 			version = o.version
 		}
-		hash := source.HashOf(text)
+		hash := file.HashOf(text)
 		var sameContentOnDisk bool
 		switch c.Action {
-		case source.Delete:
+		case file.Delete:
 			// Do nothing. sameContentOnDisk should be false.
-		case source.Save:
+		case file.Save:
 			// Make sure the version and content (if present) is the same.
 			if false && o.version != version { // Client no longer sends the version
 				return fmt.Errorf("updateOverlays: saving %s at version %v, currently at %v", c.URI, c.Version, o.version)
@@ -650,7 +674,7 @@ func (fs *overlayFS) updateOverlays(ctx context.Context, changes []source.FileMo
 		default:
 			fh := mustReadFile(ctx, fs.delegate, c.URI)
 			_, readErr := fh.Content()
-			sameContentOnDisk = (readErr == nil && fh.FileIdentity().Hash == hash)
+			sameContentOnDisk = (readErr == nil && fh.Identity().Hash == hash)
 		}
 		o = &Overlay{
 			uri:     c.URI,
@@ -670,7 +694,7 @@ func (fs *overlayFS) updateOverlays(ctx context.Context, changes []source.FileMo
 	return nil
 }
 
-func mustReadFile(ctx context.Context, fs source.FileSource, uri span.URI) source.FileHandle {
+func mustReadFile(ctx context.Context, fs file.Source, uri protocol.DocumentURI) file.Handle {
 	ctx = xcontext.Detach(ctx)
 	fh, err := fs.ReadFile(ctx, uri)
 	if err != nil {
@@ -683,15 +707,15 @@ func mustReadFile(ctx context.Context, fs source.FileSource, uri span.URI) sourc
 
 // A brokenFile represents an unexpected failure to read a file.
 type brokenFile struct {
-	uri span.URI
+	uri protocol.DocumentURI
 	err error
 }
 
-func (b brokenFile) URI() span.URI                     { return b.uri }
-func (b brokenFile) FileIdentity() source.FileIdentity { return source.FileIdentity{URI: b.uri} }
-func (b brokenFile) SameContentsOnDisk() bool          { return false }
-func (b brokenFile) Version() int32                    { return 0 }
-func (b brokenFile) Content() ([]byte, error)          { return nil, b.err }
+func (b brokenFile) URI() protocol.DocumentURI { return b.uri }
+func (b brokenFile) Identity() file.Identity   { return file.Identity{URI: b.uri} }
+func (b brokenFile) SameContentsOnDisk() bool  { return false }
+func (b brokenFile) Version() int32            { return 0 }
+func (b brokenFile) Content() ([]byte, error)  { return nil, b.err }
 
 // FileWatchingGlobPatterns returns a new set of glob patterns to
 // watch every directory known by the view. For views within a module,
@@ -702,7 +726,7 @@ func (s *Session) FileWatchingGlobPatterns(ctx context.Context) map[string]struc
 	defer s.viewMu.Unlock()
 	patterns := map[string]struct{}{}
 	for _, view := range s.views {
-		snapshot, release, err := view.getSnapshot()
+		snapshot, release, err := view.Snapshot()
 		if err != nil {
 			continue // view is shut down; continue with others
 		}

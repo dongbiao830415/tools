@@ -2,13 +2,15 @@
 
  deadcode -filter= example.com
 
- want "func (T).Goodbye"
-!want "func (T).Hello"
- want "func unreferenced"
+ want "T.Goodbye"
+ want "T.Goodbye2"
+ want "T.Goodbye3"
+!want "T.Hello"
+ want "unreferenced"
 
- want "func Scanf"
- want "func Printf"
-!want "func Println"
+ want "Scanf"
+ want "Printf"
+!want "Println"
 
 -- go.mod --
 module example.com
@@ -28,5 +30,9 @@ func main() {
 
 func (T) Hello() { fmt.Println("hello") }
 func (T) Goodbye() { fmt.Println("goodbye") }
+func (*T) Goodbye2() { fmt.Println("goodbye2") }
+func (*A) Goodbye3() { fmt.Println("goodbye3") }
+
+type A = T
 
 func unreferenced() {}

@@ -16,8 +16,10 @@ import (
 	"strings"
 	"text/scanner"
 
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/lsp/cache"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/safetoken"
+	"golang.org/x/tools/gopls/internal/util/safetoken"
 	"golang.org/x/tools/internal/diff"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/imports"
@@ -25,13 +27,13 @@ import (
 )
 
 // Format formats a file with a given range.
-func Format(ctx context.Context, snapshot Snapshot, fh FileHandle) ([]protocol.TextEdit, error) {
+func Format(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle) ([]protocol.TextEdit, error) {
 	ctx, done := event.Start(ctx, "source.Format")
 	defer done()
 
 	// Generated files shouldn't be edited. So, don't format them
 	if IsGenerated(ctx, snapshot, fh.URI()) {
-		return nil, fmt.Errorf("can't format %q: file is generated", fh.URI().Filename())
+		return nil, fmt.Errorf("can't format %q: file is generated", fh.URI().Path())
 	}
 
 	pgf, err := snapshot.ParseGo(ctx, fh, ParseFull)
@@ -88,7 +90,7 @@ func Format(ctx context.Context, snapshot Snapshot, fh FileHandle) ([]protocol.T
 	return computeTextEdits(ctx, snapshot, pgf, formatted)
 }
 
-func formatSource(ctx context.Context, fh FileHandle) ([]byte, error) {
+func formatSource(ctx context.Context, fh file.Handle) ([]byte, error) {
 	_, done := event.Start(ctx, "source.formatSource")
 	defer done()
 
@@ -108,7 +110,7 @@ type ImportFix struct {
 // In addition to returning the result of applying all edits,
 // it returns a list of fixes that could be applied to the file, with the
 // corresponding TextEdits that would be needed to apply that fix.
-func AllImportsFixes(ctx context.Context, snapshot Snapshot, pgf *ParsedGoFile) (allFixEdits []protocol.TextEdit, editsPerFix []*ImportFix, err error) {
+func AllImportsFixes(ctx context.Context, snapshot *cache.Snapshot, pgf *ParsedGoFile) (allFixEdits []protocol.TextEdit, editsPerFix []*ImportFix, err error) {
 	ctx, done := event.Start(ctx, "source.AllImportsFixes")
 	defer done()
 
@@ -123,8 +125,8 @@ func AllImportsFixes(ctx context.Context, snapshot Snapshot, pgf *ParsedGoFile) 
 
 // computeImportEdits computes a set of edits that perform one or all of the
 // necessary import fixes.
-func computeImportEdits(ctx context.Context, snapshot Snapshot, pgf *ParsedGoFile, options *imports.Options) (allFixEdits []protocol.TextEdit, editsPerFix []*ImportFix, err error) {
-	filename := pgf.URI.Filename()
+func computeImportEdits(ctx context.Context, snapshot *cache.Snapshot, pgf *ParsedGoFile, options *imports.Options) (allFixEdits []protocol.TextEdit, editsPerFix []*ImportFix, err error) {
+	filename := pgf.URI.Path()
 
 	// Build up basic information about the original file.
 	allFixes, err := imports.FixImports(ctx, filename, pgf.Src, options)
@@ -153,7 +155,7 @@ func computeImportEdits(ctx context.Context, snapshot Snapshot, pgf *ParsedGoFil
 }
 
 // ComputeOneImportFixEdits returns text edits for a single import fix.
-func ComputeOneImportFixEdits(snapshot Snapshot, pgf *ParsedGoFile, fix *imports.ImportFix) ([]protocol.TextEdit, error) {
+func ComputeOneImportFixEdits(snapshot *cache.Snapshot, pgf *ParsedGoFile, fix *imports.ImportFix) ([]protocol.TextEdit, error) {
 	options := &imports.Options{
 		LocalPrefix: snapshot.Options().Local,
 		// Defaults.
@@ -167,7 +169,7 @@ func ComputeOneImportFixEdits(snapshot Snapshot, pgf *ParsedGoFile, fix *imports
 	return computeFixEdits(snapshot, pgf, options, []*imports.ImportFix{fix})
 }
 
-func computeFixEdits(snapshot Snapshot, pgf *ParsedGoFile, options *imports.Options, fixes []*imports.ImportFix) ([]protocol.TextEdit, error) {
+func computeFixEdits(snapshot *cache.Snapshot, pgf *ParsedGoFile, options *imports.Options, fixes []*imports.ImportFix) ([]protocol.TextEdit, error) {
 	// trim the original data to match fixedData
 	left, err := importPrefix(pgf.Src)
 	if err != nil {
@@ -300,12 +302,12 @@ func scanForCommentEnd(src []byte) int {
 	return 0
 }
 
-func computeTextEdits(ctx context.Context, snapshot Snapshot, pgf *ParsedGoFile, formatted string) ([]protocol.TextEdit, error) {
+func computeTextEdits(ctx context.Context, snapshot *cache.Snapshot, pgf *ParsedGoFile, formatted string) ([]protocol.TextEdit, error) {
 	_, done := event.Start(ctx, "source.computeTextEdits")
 	defer done()
 
 	edits := snapshot.Options().ComputeEdits(string(pgf.Src), formatted)
-	return ToProtocolEdits(pgf.Mapper, edits)
+	return protocol.EditsFromDiffEdits(pgf.Mapper, edits)
 }
 
 // protocolEditsFromSource converts text edits to LSP edits using the original
@@ -330,59 +332,4 @@ func protocolEditsFromSource(src []byte, edits []diff.Edit) ([]protocol.TextEdit
 		})
 	}
 	return result, nil
-}
-
-// ToProtocolEdits converts diff.Edits to a non-nil slice of LSP TextEdits.
-// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textEditArray
-func ToProtocolEdits(m *protocol.Mapper, edits []diff.Edit) ([]protocol.TextEdit, error) {
-	// LSP doesn't require TextEditArray to be sorted:
-	// this is the receiver's concern. But govim, and perhaps
-	// other clients have historically relied on the order.
-	edits = append([]diff.Edit(nil), edits...)
-	diff.SortEdits(edits)
-
-	result := make([]protocol.TextEdit, len(edits))
-	for i, edit := range edits {
-		rng, err := m.OffsetRange(edit.Start, edit.End)
-		if err != nil {
-			return nil, err
-		}
-		result[i] = protocol.TextEdit{
-			Range:   rng,
-			NewText: edit.New,
-		}
-	}
-	return result, nil
-}
-
-// FromProtocolEdits converts LSP TextEdits to diff.Edits.
-// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textEditArray
-func FromProtocolEdits(m *protocol.Mapper, edits []protocol.TextEdit) ([]diff.Edit, error) {
-	if edits == nil {
-		return nil, nil
-	}
-	result := make([]diff.Edit, len(edits))
-	for i, edit := range edits {
-		start, end, err := m.RangeOffsets(edit.Range)
-		if err != nil {
-			return nil, err
-		}
-		result[i] = diff.Edit{
-			Start: start,
-			End:   end,
-			New:   edit.NewText,
-		}
-	}
-	return result, nil
-}
-
-// ApplyProtocolEdits applies the patch (edits) to m.Content and returns the result.
-// It also returns the edits converted to diff-package form.
-func ApplyProtocolEdits(m *protocol.Mapper, edits []protocol.TextEdit) ([]byte, []diff.Edit, error) {
-	diffEdits, err := FromProtocolEdits(m, edits)
-	if err != nil {
-		return nil, nil, err
-	}
-	out, err := diff.ApplyBytes(m.Content, diffEdits)
-	return out, diffEdits, err
 }

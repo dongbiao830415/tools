@@ -14,16 +14,17 @@ import (
 	"path/filepath"
 
 	"golang.org/x/tools/go/ast/astutil"
-	"golang.org/x/tools/gopls/internal/bug"
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/lsp/cache"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/safetoken"
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/util/bug"
+	"golang.org/x/tools/gopls/internal/util/safetoken"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/event/tag"
 )
 
 // PrepareCallHierarchy returns an array of CallHierarchyItem for a file and the position within the file.
-func PrepareCallHierarchy(ctx context.Context, snapshot Snapshot, fh FileHandle, pp protocol.Position) ([]protocol.CallHierarchyItem, error) {
+func PrepareCallHierarchy(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, pp protocol.Position) ([]protocol.CallHierarchyItem, error) {
 	ctx, done := event.Start(ctx, "source.PrepareCallHierarchy")
 	defer done()
 
@@ -55,7 +56,7 @@ func PrepareCallHierarchy(ctx context.Context, snapshot Snapshot, fh FileHandle,
 		Name:           obj.Name(),
 		Kind:           protocol.Function,
 		Tags:           []protocol.SymbolTag{},
-		Detail:         fmt.Sprintf("%s • %s", obj.Pkg().Path(), filepath.Base(declLoc.URI.SpanURI().Filename())),
+		Detail:         fmt.Sprintf("%s • %s", obj.Pkg().Path(), filepath.Base(declLoc.URI.Path())),
 		URI:            declLoc.URI,
 		Range:          rng,
 		SelectionRange: rng,
@@ -64,7 +65,7 @@ func PrepareCallHierarchy(ctx context.Context, snapshot Snapshot, fh FileHandle,
 }
 
 // IncomingCalls returns an array of CallHierarchyIncomingCall for a file and the position within the file.
-func IncomingCalls(ctx context.Context, snapshot Snapshot, fh FileHandle, pos protocol.Position) ([]protocol.CallHierarchyIncomingCall, error) {
+func IncomingCalls(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, pos protocol.Position) ([]protocol.CallHierarchyIncomingCall, error) {
 	ctx, done := event.Start(ctx, "source.IncomingCalls")
 	defer done()
 
@@ -105,9 +106,9 @@ func IncomingCalls(ctx context.Context, snapshot Snapshot, fh FileHandle, pos pr
 }
 
 // enclosingNodeCallItem creates a CallHierarchyItem representing the function call at loc.
-func enclosingNodeCallItem(ctx context.Context, snapshot Snapshot, pkgPath PackagePath, loc protocol.Location) (protocol.CallHierarchyItem, error) {
+func enclosingNodeCallItem(ctx context.Context, snapshot *cache.Snapshot, pkgPath PackagePath, loc protocol.Location) (protocol.CallHierarchyItem, error) {
 	// Parse the file containing the reference.
-	fh, err := snapshot.ReadFile(ctx, loc.URI.SpanURI())
+	fh, err := snapshot.ReadFile(ctx, loc.URI)
 	if err != nil {
 		return protocol.CallHierarchyItem{}, err
 	}
@@ -170,7 +171,7 @@ outer:
 		Name:           name,
 		Kind:           kind,
 		Tags:           []protocol.SymbolTag{},
-		Detail:         fmt.Sprintf("%s • %s", pkgPath, filepath.Base(fh.URI().Filename())),
+		Detail:         fmt.Sprintf("%s • %s", pkgPath, filepath.Base(fh.URI().Path())),
 		URI:            loc.URI,
 		Range:          rng,
 		SelectionRange: rng,
@@ -178,7 +179,7 @@ outer:
 }
 
 // OutgoingCalls returns an array of CallHierarchyOutgoingCall for a file and the position within the file.
-func OutgoingCalls(ctx context.Context, snapshot Snapshot, fh FileHandle, pp protocol.Position) ([]protocol.CallHierarchyOutgoingCall, error) {
+func OutgoingCalls(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, pp protocol.Position) ([]protocol.CallHierarchyOutgoingCall, error) {
 	ctx, done := event.Start(ctx, "source.OutgoingCalls")
 	defer done()
 
@@ -214,7 +215,7 @@ func OutgoingCalls(ctx context.Context, snapshot Snapshot, fh FileHandle, pp pro
 		return nil, bug.Errorf("file not found for %d", obj.Pos())
 	}
 
-	uri := span.URIFromPath(declFile.Name())
+	uri := protocol.URIFromPath(declFile.Name())
 	offset, err := safetoken.Offset(declFile, obj.Pos())
 	if err != nil {
 		return nil, err
@@ -287,7 +288,7 @@ func OutgoingCalls(ctx context.Context, snapshot Snapshot, fh FileHandle, pp pro
 					Name:           obj.Name(),
 					Kind:           protocol.Function,
 					Tags:           []protocol.SymbolTag{},
-					Detail:         fmt.Sprintf("%s • %s", obj.Pkg().Path(), filepath.Base(loc.URI.SpanURI().Filename())),
+					Detail:         fmt.Sprintf("%s • %s", obj.Pkg().Path(), filepath.Base(loc.URI.Path())),
 					URI:            loc.URI,
 					Range:          loc.Range,
 					SelectionRange: loc.Range,

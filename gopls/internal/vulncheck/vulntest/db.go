@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/lsp/protocol"
 	"golang.org/x/tools/gopls/internal/vulncheck/osv"
 	"golang.org/x/tools/txtar"
 )
@@ -62,7 +62,7 @@ type DB struct {
 // URI returns the file URI that can be used for VULNDB environment
 // variable.
 func (db *DB) URI() string {
-	u := span.URIFromPath(filepath.Join(db.disk, "ID"))
+	u := protocol.URIFromPath(filepath.Join(db.disk, "ID"))
 	return string(u)
 }
 
@@ -118,13 +118,6 @@ func generateEntries(_ context.Context, archive *txtar.Archive) ([]osv.Entry, er
 		entries = append(entries, entry)
 	}
 	return entries, nil
-}
-
-func writeVulns(outPath string, vulns []osv.Entry, indent bool) error {
-	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
-		return fmt.Errorf("failed to create directory %q: %s", filepath.Dir(outPath), err)
-	}
-	return writeJSON(outPath+".json", vulns, indent)
 }
 
 func writeEntriesByID(idDir string, entries []osv.Entry, indent bool) error {

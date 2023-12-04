@@ -5,17 +5,12 @@ package cache
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
-	"github.com/google/go-cmp/cmp"
-	"golang.org/x/tools/gopls/internal/lsp/fake"
-	"golang.org/x/tools/gopls/internal/lsp/source"
-	"golang.org/x/tools/gopls/internal/span"
-	"golang.org/x/tools/gopls/internal/vulncheck"
+	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/test/integration/fake"
 )
 
 func TestCaseInsensitiveFilesystem(t *testing.T) {
@@ -42,9 +37,9 @@ func TestCaseInsensitiveFilesystem(t *testing.T) {
 		{filepath.Join(base, "a/b/c/defgh/f.go"), true},
 	}
 	for _, tt := range tests {
-		err := checkPathCase(tt.path)
+		err := checkPathValid(tt.path)
 		if err != nil != tt.err {
-			t.Errorf("checkPathCase(%q) = %v, wanted error: %v", tt.path, err, tt.err)
+			t.Errorf("checkPathValid(%q) = %v, wanted error: %v", tt.path, err, tt.err)
 		}
 	}
 }
@@ -90,15 +85,15 @@ module fg
 	for _, test := range tests {
 		ctx := context.Background()
 		rel := fake.RelativeTo(dir)
-		folderURI := span.URIFromPath(rel.AbsPath(test.folder))
+		folderURI := protocol.URIFromPath(rel.AbsPath(test.folder))
 		excludeNothing := func(string) bool { return false }
 		got, err := findWorkspaceModFile(ctx, folderURI, New(nil), excludeNothing)
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := span.URI("")
+		want := protocol.DocumentURI("")
 		if test.want != "" {
-			want = span.URIFromPath(rel.AbsPath(test.want))
+			want = protocol.URIFromPath(rel.AbsPath(test.want))
 		}
 		if got != want {
 			t.Errorf("findWorkspaceModFile(%q) = %q, want %q", test.folder, got, want)
@@ -117,7 +112,7 @@ func TestInVendor(t *testing.T) {
 		{"foo/vendor/foo.txt", false},
 		{"foo/vendor/modules.txt", false},
 	} {
-		if got := inVendor(span.URIFromPath(tt.path)); got != tt.inVendor {
+		if got := inVendor(protocol.URIFromPath(tt.path)); got != tt.inVendor {
 			t.Errorf("expected %s inVendor %v, got %v", tt.path, tt.inVendor, got)
 		}
 	}
@@ -154,14 +149,14 @@ func TestFilters(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		filterer := source.NewFilterer(tt.filters)
+		filterer := NewFilterer(tt.filters)
 		for _, inc := range tt.included {
-			if pathExcludedByFilter(inc, filterer) {
+			if relPathExcludedByFilter(inc, filterer) {
 				t.Errorf("filters %q excluded %v, wanted included", tt.filters, inc)
 			}
 		}
 		for _, exc := range tt.excluded {
-			if !pathExcludedByFilter(exc, filterer) {
+			if !relPathExcludedByFilter(exc, filterer) {
 				t.Errorf("filters %q included %v, wanted excluded", tt.filters, exc)
 			}
 		}
@@ -207,70 +202,6 @@ func TestSuffixes(t *testing.T) {
 			}
 		}
 	}
-}
-
-func TestView_Vulnerabilities(t *testing.T) {
-	// TODO(hyangah): use t.Cleanup when we get rid of go1.13 legacy CI.
-	defer func() { timeNow = time.Now }()
-
-	now := time.Now()
-
-	view := &View{
-		vulns: make(map[span.URI]*vulncheck.Result),
-	}
-	file1, file2 := span.URIFromPath("f1/go.mod"), span.URIFromPath("f2/go.mod")
-
-	vuln1 := &vulncheck.Result{AsOf: now.Add(-(maxGovulncheckResultAge * 3) / 4)} // already ~3/4*maxGovulncheckResultAge old
-	view.SetVulnerabilities(file1, vuln1)
-
-	vuln2 := &vulncheck.Result{AsOf: now} // fresh.
-	view.SetVulnerabilities(file2, vuln2)
-
-	t.Run("fresh", func(t *testing.T) {
-		got := view.Vulnerabilities()
-		want := map[span.URI]*vulncheck.Result{
-			file1: vuln1,
-			file2: vuln2,
-		}
-
-		if diff := cmp.Diff(toJSON(want), toJSON(got)); diff != "" {
-			t.Errorf("view.Vulnerabilities() mismatch (-want +got):\n%s", diff)
-		}
-	})
-
-	// maxGovulncheckResultAge/2 later
-	timeNow = func() time.Time { return now.Add(maxGovulncheckResultAge / 2) }
-	t.Run("after30min", func(t *testing.T) {
-		got := view.Vulnerabilities()
-		want := map[span.URI]*vulncheck.Result{
-			file1: nil, // expired.
-			file2: vuln2,
-		}
-
-		if diff := cmp.Diff(toJSON(want), toJSON(got)); diff != "" {
-			t.Errorf("view.Vulnerabilities() mismatch (-want +got):\n%s", diff)
-		}
-	})
-
-	// maxGovulncheckResultAge later
-	timeNow = func() time.Time { return now.Add(maxGovulncheckResultAge + time.Minute) }
-
-	t.Run("after1hr", func(t *testing.T) {
-		got := view.Vulnerabilities()
-		want := map[span.URI]*vulncheck.Result{
-			file1: nil,
-			file2: nil,
-		}
-
-		if diff := cmp.Diff(toJSON(want), toJSON(got)); diff != "" {
-			t.Errorf("view.Vulnerabilities() mismatch (-want +got):\n%s", diff)
-		}
-	})
-}
-
-func toJSON(x interface{}) string {
-	b, _ := json.MarshalIndent(x, "", " ")
-	return string(b)
 }
 
 func TestIgnoreFilter(t *testing.T) {

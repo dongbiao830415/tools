@@ -37,6 +37,7 @@ import (
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/interp"
 	"golang.org/x/tools/go/ssa/ssautil"
+	"golang.org/x/tools/internal/testenv"
 	"golang.org/x/tools/internal/typeparams"
 )
 
@@ -121,6 +122,7 @@ var testdataTests = []string{
 	"deepequal.go",
 	"defer.go",
 	"fieldprom.go",
+	"forvarlifetime_old.go",
 	"ifaceconv.go",
 	"ifaceprom.go",
 	"initorder.go",
@@ -132,6 +134,7 @@ var testdataTests = []string{
 	"slice2arrayptr.go",
 	"static.go",
 	"width32.go",
+	"rangevarlifetime_old.go",
 
 	"fixedbugs/issue52342.go",
 	"fixedbugs/issue55115.go",
@@ -170,7 +173,12 @@ func run(t *testing.T, input string, goroot string) {
 		t.Skipf("skipping: width32.go checks behavior for a 32-bit int")
 	}
 
-	conf := loader.Config{Build: &ctx}
+	gover := ""
+	if p := testenv.Go1Point(); p > 0 {
+		gover = fmt.Sprintf("go1.%d", p)
+	}
+
+	conf := loader.Config{Build: &ctx, TypeChecker: types.Config{GoVersion: gover}}
 	if _, err := conf.FromArgs([]string{input}, true); err != nil {
 		t.Fatalf("FromArgs(%s) failed: %s", input, err)
 	}

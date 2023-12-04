@@ -11,21 +11,29 @@ import (
 	"go/types"
 	"strings"
 
-	"golang.org/x/tools/gopls/internal/astutil"
+	"golang.org/x/tools/gopls/internal/file"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/source"
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/util/astutil"
 )
 
+// Symbol holds a precomputed symbol value. Note: we avoid using the
+// protocol.SymbolInformation struct here in order to reduce the size of each
+// symbol.
+type Symbol struct {
+	Name  string
+	Kind  protocol.SymbolKind
+	Range protocol.Range
+}
+
 // symbolize returns the result of symbolizing the file identified by uri, using a cache.
-func (s *snapshot) symbolize(ctx context.Context, uri span.URI) ([]source.Symbol, error) {
+func (s *Snapshot) symbolize(ctx context.Context, uri protocol.DocumentURI) ([]Symbol, error) {
 
 	s.mu.Lock()
 	entry, hit := s.symbolizeHandles.Get(uri)
 	s.mu.Unlock()
 
 	type symbolizeResult struct {
-		symbols []source.Symbol
+		symbols []Symbol
 		err     error
 	}
 
@@ -35,10 +43,10 @@ func (s *snapshot) symbolize(ctx context.Context, uri span.URI) ([]source.Symbol
 		if err != nil {
 			return nil, err
 		}
-		type symbolHandleKey source.Hash
-		key := symbolHandleKey(fh.FileIdentity().Hash)
+		type symbolHandleKey file.Hash
+		key := symbolHandleKey(fh.Identity().Hash)
 		promise, release := s.store.Promise(key, func(ctx context.Context, arg interface{}) interface{} {
-			symbols, err := symbolizeImpl(ctx, arg.(*snapshot), fh)
+			symbols, err := symbolizeImpl(ctx, arg.(*Snapshot), fh)
 			return symbolizeResult{symbols, err}
 		})
 
@@ -59,8 +67,8 @@ func (s *snapshot) symbolize(ctx context.Context, uri span.URI) ([]source.Symbol
 }
 
 // symbolizeImpl reads and parses a file and extracts symbols from it.
-func symbolizeImpl(ctx context.Context, snapshot *snapshot, fh source.FileHandle) ([]source.Symbol, error) {
-	pgfs, err := snapshot.view.parseCache.parseFiles(ctx, token.NewFileSet(), source.ParseFull, false, fh)
+func symbolizeImpl(ctx context.Context, snapshot *Snapshot, fh file.Handle) ([]Symbol, error) {
+	pgfs, err := snapshot.view.parseCache.parseFiles(ctx, token.NewFileSet(), ParseFull, false, fh)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +87,7 @@ type symbolWalker struct {
 	tokFile *token.File
 	mapper  *protocol.Mapper
 
-	symbols    []source.Symbol
+	symbols    []Symbol
 	firstError error
 }
 
@@ -98,7 +106,7 @@ func (w *symbolWalker) atNode(node ast.Node, name string, kind protocol.SymbolKi
 		w.error(err)
 		return
 	}
-	sym := source.Symbol{
+	sym := Symbol{
 		Name:  b.String(),
 		Kind:  kind,
 		Range: rng,

@@ -16,10 +16,12 @@ import (
 	"time"
 
 	"golang.org/x/tools/go/packages"
-	"golang.org/x/tools/gopls/internal/bug"
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/lsp/cache/metadata"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/source"
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/util/bug"
+	"golang.org/x/tools/gopls/internal/util/immutable"
+	"golang.org/x/tools/gopls/internal/util/pathutil"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/event/tag"
 	"golang.org/x/tools/internal/gocommand"
@@ -38,7 +40,7 @@ var errNoPackages = errors.New("no packages returned")
 // errors associated with specific modules.
 //
 // If scopes contains a file scope there must be exactly one scope.
-func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...loadScope) (err error) {
+func (s *Snapshot) load(ctx context.Context, allowNetwork bool, scopes ...loadScope) (err error) {
 	id := atomic.AddUint64(&loadID, 1)
 	eventName := fmt.Sprintf("go/packages.Load #%d", id) // unique name for logging
 
@@ -62,12 +64,12 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...loadSc
 			// information. For example go/packages returns at most one command-line
 			// arguments package, and does not handle a combination of standalone
 			// files and packages.
-			uri := span.URI(scope)
+			uri := protocol.DocumentURI(scope)
 			if len(scopes) > 1 {
 				panic(fmt.Sprintf("internal error: load called with multiple scopes when a file scope is present (file: %s)", uri))
 			}
 			fh := s.FindFile(uri)
-			if fh == nil || s.FileKind(fh) != source.Go {
+			if fh == nil || s.FileKind(fh) != file.Go {
 				// Don't try to load a file that doesn't exist, or isn't a go file.
 				continue
 			}
@@ -75,17 +77,17 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...loadSc
 			if err != nil {
 				continue
 			}
-			if isStandaloneFile(contents, s.options.StandaloneTags) {
+			if isStandaloneFile(contents, s.Options().StandaloneTags) {
 				standalone = true
-				query = append(query, uri.Filename())
+				query = append(query, uri.Path())
 			} else {
-				query = append(query, fmt.Sprintf("file=%s", uri.Filename()))
+				query = append(query, fmt.Sprintf("file=%s", uri.Path()))
 			}
 
 		case moduleLoadScope:
 			modQuery := fmt.Sprintf("%s%c...", scope.dir, filepath.Separator)
 			query = append(query, modQuery)
-			moduleQueries[modQuery] = string(scope.modulePath)
+			moduleQueries[modQuery] = scope.modulePath
 
 		case viewLoadScope:
 			// If we are outside of GOPATH, a module, or some other known
@@ -112,12 +114,12 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...loadSc
 	ctx, done := event.Start(ctx, "cache.snapshot.load", tag.Query.Of(query))
 	defer done()
 
-	flags := source.LoadWorkspace
+	flags := LoadWorkspace
 	if allowNetwork {
-		flags |= source.AllowNetwork
+		flags |= AllowNetwork
 	}
 	_, inv, cleanup, err := s.goCommandInvocation(ctx, flags, &gocommand.Invocation{
-		WorkingDir: s.view.goCommandDir.Filename(),
+		WorkingDir: s.view.goCommandDir.Path(),
 	})
 	if err != nil {
 		return err
@@ -141,7 +143,7 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...loadSc
 	}
 
 	// This log message is sought for by TestReloadOnlyOnce.
-	labels := append(source.SnapshotLabels(s), tag.Query.Of(query), tag.PackageCount.Of(len(pkgs)))
+	labels := append(s.Labels(), tag.Query.Of(query), tag.PackageCount.Of(len(pkgs)))
 	if err != nil {
 		event.Error(ctx, eventName, err, labels...)
 	} else {
@@ -160,8 +162,8 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...loadSc
 	}
 
 	moduleErrs := make(map[string][]packages.Error) // module path -> errors
-	filterFunc := s.filterFunc()
-	newMetadata := make(map[PackageID]*source.Metadata)
+	filterFunc := s.view.filterFunc()
+	newMetadata := make(map[PackageID]*metadata.Package)
 	for _, pkg := range pkgs {
 		// The Go command returns synthetic list results for module queries that
 		// encountered module errors.
@@ -178,9 +180,9 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...loadSc
 			continue
 		}
 
-		if !containsDir || s.options.VerboseOutput {
+		if !containsDir || s.Options().VerboseOutput {
 			event.Log(ctx, eventName, append(
-				source.SnapshotLabels(s),
+				s.Labels(),
 				tag.Package.Of(pkg.ID),
 				tag.Files.Of(pkg.CompiledGoFiles))...)
 		}
@@ -218,40 +220,34 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...loadSc
 
 	// Assert the invariant s.packages.Get(id).m == s.meta.metadata[id].
 	s.packages.Range(func(id PackageID, ph *packageHandle) {
-		if s.meta.metadata[id] != ph.m {
+		if s.meta.Packages[id] != ph.mp {
 			panic("inconsistent metadata")
 		}
 	})
 
 	// Compute the minimal metadata updates (for Clone)
 	// required to preserve the above invariant.
-	var files []span.URI // files to preload
-	seenFiles := make(map[span.URI]bool)
-	updates := make(map[PackageID]*source.Metadata)
-	for _, m := range newMetadata {
-		if existing := s.meta.metadata[m.ID]; existing == nil {
+	var files []protocol.DocumentURI // files to preload
+	seenFiles := make(map[protocol.DocumentURI]bool)
+	updates := make(map[PackageID]*metadata.Package)
+	for _, mp := range newMetadata {
+		if existing := s.meta.Packages[mp.ID]; existing == nil {
 			// Record any new files we should pre-load.
-			for _, uri := range m.CompiledGoFiles {
+			for _, uri := range mp.CompiledGoFiles {
 				if !seenFiles[uri] {
 					seenFiles[uri] = true
 					files = append(files, uri)
 				}
 			}
-			updates[m.ID] = m
-			delete(s.shouldLoad, m.ID)
+			updates[mp.ID] = mp
+			s.shouldLoad.Delete(mp.ID)
 		}
 	}
 
 	event.Log(ctx, fmt.Sprintf("%s: updating metadata for %d packages", eventName, len(updates)))
 
-	// Before mutating the snapshot, ensure that we compute load diagnostics
-	// successfully. This could fail if the context is cancelled, and we don't
-	// want to leave the snapshot metadata in a partial state.
-	meta := s.meta.Clone(updates)
+	meta := s.meta.Update(updates)
 	workspacePackages := computeWorkspacePackagesLocked(s, meta)
-	for _, update := range updates {
-		computeLoadDiagnostics(ctx, update, meta, lockedSnapshot{s}, workspacePackages)
-	}
 	s.meta = meta
 	s.workspacePackages = workspacePackages
 	s.resetActivePackagesLocked()
@@ -310,7 +306,7 @@ func (m *moduleErrorMap) Error() string {
 //
 // TODO(rfindley): separate workspace diagnostics from critical workspace
 // errors.
-func (s *snapshot) workspaceLayoutError(ctx context.Context) (error, []*source.Diagnostic) {
+func (s *Snapshot) workspaceLayoutError(ctx context.Context) (error, []*Diagnostic) {
 	// TODO(rfindley): both of the checks below should be delegated to the workspace.
 
 	if s.view.effectiveGO111MODULE() == off {
@@ -354,31 +350,31 @@ https://github.com/golang/tools/blob/master/gopls/doc/workspace.md.`
 	return nil, nil
 }
 
-func (s *snapshot) applyCriticalErrorToFiles(ctx context.Context, msg string, files []*Overlay) []*source.Diagnostic {
-	var srcDiags []*source.Diagnostic
+func (s *Snapshot) applyCriticalErrorToFiles(ctx context.Context, msg string, files []*Overlay) []*Diagnostic {
+	var srcDiags []*Diagnostic
 	for _, fh := range files {
 		// Place the diagnostics on the package or module declarations.
 		var rng protocol.Range
 		switch s.FileKind(fh) {
-		case source.Go:
-			if pgf, err := s.ParseGo(ctx, fh, source.ParseHeader); err == nil {
+		case file.Go:
+			if pgf, err := s.ParseGo(ctx, fh, ParseHeader); err == nil {
 				// Check that we have a valid `package foo` range to use for positioning the error.
 				if pgf.File.Package.IsValid() && pgf.File.Name != nil && pgf.File.Name.End().IsValid() {
 					rng, _ = pgf.PosRange(pgf.File.Package, pgf.File.Name.End())
 				}
 			}
-		case source.Mod:
+		case file.Mod:
 			if pmf, err := s.ParseMod(ctx, fh); err == nil {
 				if mod := pmf.File.Module; mod != nil && mod.Syntax != nil {
 					rng, _ = pmf.Mapper.OffsetRange(mod.Syntax.Start.Byte, mod.Syntax.End.Byte)
 				}
 			}
 		}
-		srcDiags = append(srcDiags, &source.Diagnostic{
+		srcDiags = append(srcDiags, &Diagnostic{
 			URI:      fh.URI(),
 			Range:    rng,
 			Severity: protocol.SeverityError,
-			Source:   source.ListError,
+			Source:   ListError,
 			Message:  msg,
 		})
 	}
@@ -388,12 +384,12 @@ func (s *snapshot) applyCriticalErrorToFiles(ctx context.Context, msg string, fi
 // buildMetadata populates the updates map with metadata updates to
 // apply, based on the given pkg. It recurs through pkg.Imports to ensure that
 // metadata exists for all dependencies.
-func buildMetadata(updates map[PackageID]*source.Metadata, pkg *packages.Package, loadDir string, standalone bool) {
+func buildMetadata(updates map[PackageID]*metadata.Package, pkg *packages.Package, loadDir string, standalone bool) {
 	// Allow for multiple ad-hoc packages in the workspace (see #47584).
 	pkgPath := PackagePath(pkg.PkgPath)
 	id := PackageID(pkg.ID)
 
-	if source.IsCommandLineArguments(id) {
+	if metadata.IsCommandLineArguments(id) {
 		if len(pkg.CompiledGoFiles) != 1 {
 			bug.Reportf("unexpected files in command-line-arguments package: %v", pkg.CompiledGoFiles)
 			return
@@ -413,8 +409,12 @@ func buildMetadata(updates map[PackageID]*source.Metadata, pkg *packages.Package
 		return
 	}
 
+	if pkg.TypesSizes == nil {
+		panic(id + ".TypeSizes is nil")
+	}
+
 	// Recreate the metadata rather than reusing it to avoid locking.
-	m := &source.Metadata{
+	mp := &metadata.Package{
 		ID:         id,
 		PkgPath:    pkgPath,
 		Name:       PackageName(pkg.Name),
@@ -427,19 +427,19 @@ func buildMetadata(updates map[PackageID]*source.Metadata, pkg *packages.Package
 		Standalone: standalone,
 	}
 
-	updates[id] = m
+	updates[id] = mp
 
 	for _, filename := range pkg.CompiledGoFiles {
-		uri := span.URIFromPath(filename)
-		m.CompiledGoFiles = append(m.CompiledGoFiles, uri)
+		uri := protocol.URIFromPath(filename)
+		mp.CompiledGoFiles = append(mp.CompiledGoFiles, uri)
 	}
 	for _, filename := range pkg.GoFiles {
-		uri := span.URIFromPath(filename)
-		m.GoFiles = append(m.GoFiles, uri)
+		uri := protocol.URIFromPath(filename)
+		mp.GoFiles = append(mp.GoFiles, uri)
 	}
 	for _, filename := range pkg.IgnoredFiles {
-		uri := span.URIFromPath(filename)
-		m.IgnoredFiles = append(m.IgnoredFiles, uri)
+		uri := protocol.URIFromPath(filename)
+		mp.IgnoredFiles = append(mp.IgnoredFiles, uri)
 	}
 
 	depsByImpPath := make(map[ImportPath]PackageID)
@@ -543,8 +543,8 @@ func buildMetadata(updates map[PackageID]*source.Metadata, pkg *packages.Package
 		depsByImpPath[importPath] = PackageID(imported.ID)
 		depsByPkgPath[PackagePath(imported.PkgPath)] = PackageID(imported.ID)
 	}
-	m.DepsByImpPath = depsByImpPath
-	m.DepsByPkgPath = depsByPkgPath
+	mp.DepsByImpPath = depsByImpPath
+	mp.DepsByPkgPath = depsByPkgPath
 
 	// m.Diagnostics is set later in the loading pass, using
 	// computeLoadDiagnostics.
@@ -552,44 +552,47 @@ func buildMetadata(updates map[PackageID]*source.Metadata, pkg *packages.Package
 
 // computeLoadDiagnostics computes and sets m.Diagnostics for the given metadata m.
 //
-// It should only be called during metadata construction in snapshot.load.
-func computeLoadDiagnostics(ctx context.Context, m *source.Metadata, meta *metadataGraph, fs source.FileSource, workspacePackages map[PackageID]PackagePath) {
-	for _, packagesErr := range m.Errors {
+// It should only be called during package handle construction in buildPackageHandle.
+func computeLoadDiagnostics(ctx context.Context, snapshot *Snapshot, mp *metadata.Package) []*Diagnostic {
+	var diags []*Diagnostic
+	for _, packagesErr := range mp.Errors {
 		// Filter out parse errors from go list. We'll get them when we
 		// actually parse, and buggy overlay support may generate spurious
 		// errors. (See TestNewModule_Issue38207.)
 		if strings.Contains(packagesErr.Msg, "expected '") {
 			continue
 		}
-		pkgDiags, err := goPackagesErrorDiagnostics(ctx, packagesErr, m, fs)
+		pkgDiags, err := goPackagesErrorDiagnostics(ctx, packagesErr, mp, snapshot)
 		if err != nil {
 			// There are certain cases where the go command returns invalid
 			// positions, so we cannot panic or even bug.Reportf here.
-			event.Error(ctx, "unable to compute positions for list errors", err, tag.Package.Of(string(m.ID)))
+			event.Error(ctx, "unable to compute positions for list errors", err, tag.Package.Of(string(mp.ID)))
 			continue
 		}
-		m.Diagnostics = append(m.Diagnostics, pkgDiags...)
+		diags = append(diags, pkgDiags...)
 	}
 
 	// TODO(rfindley): this is buggy: an insignificant change to a modfile
 	// (or an unsaved modfile) could affect the position of deps errors,
 	// without invalidating the package.
-	depsDiags, err := depsErrors(ctx, m, meta, fs, workspacePackages)
+	depsDiags, err := depsErrors(ctx, snapshot, mp)
 	if err != nil {
 		if ctx.Err() == nil {
 			// TODO(rfindley): consider making this a bug.Reportf. depsErrors should
 			// not normally fail.
-			event.Error(ctx, "unable to compute deps errors", err, tag.Package.Of(string(m.ID)))
+			event.Error(ctx, "unable to compute deps errors", err, tag.Package.Of(string(mp.ID)))
 		}
+	} else {
+		diags = append(diags, depsDiags...)
 	}
-	m.Diagnostics = append(m.Diagnostics, depsDiags...)
+	return diags
 }
 
 // containsPackageLocked reports whether p is a workspace package for the
 // snapshot s.
 //
 // s.mu must be held while calling this function.
-func containsPackageLocked(s *snapshot, m *source.Metadata) bool {
+func containsPackageLocked(s *Snapshot, mp *metadata.Package) bool {
 	// In legacy workspace mode, or if a package does not have an associated
 	// module, a package is considered inside the workspace if any of its files
 	// are under the workspace root (and not excluded).
@@ -601,22 +604,22 @@ func containsPackageLocked(s *snapshot, m *source.Metadata) bool {
 	// TODO(rfindley): revisit this function. We should not need to predicate on
 	// gowork != "". It should suffice to consider workspace mod files (also, we
 	// will hopefully eliminate the concept of a workspace package soon).
-	if m.Module != nil && s.view.gowork != "" {
-		modURI := span.URIFromPath(m.Module.GoMod)
-		_, ok := s.workspaceModFiles[modURI]
+	if mp.Module != nil && s.view.gowork != "" {
+		modURI := protocol.URIFromPath(mp.Module.GoMod)
+		_, ok := s.view.workspaceModFiles[modURI]
 		if !ok {
 			return false
 		}
 
-		uris := map[span.URI]struct{}{}
-		for _, uri := range m.CompiledGoFiles {
+		uris := map[protocol.DocumentURI]struct{}{}
+		for _, uri := range mp.CompiledGoFiles {
 			uris[uri] = struct{}{}
 		}
-		for _, uri := range m.GoFiles {
+		for _, uri := range mp.GoFiles {
 			uris[uri] = struct{}{}
 		}
 
-		filterFunc := s.filterFunc()
+		filterFunc := s.view.filterFunc()
 		for uri := range uris {
 			// Don't use view.contains here. go.work files may include modules
 			// outside of the workspace folder.
@@ -627,19 +630,19 @@ func containsPackageLocked(s *snapshot, m *source.Metadata) bool {
 		return false
 	}
 
-	return containsFileInWorkspaceLocked(s, m)
+	return containsFileInWorkspaceLocked(s.view, mp)
 }
 
 // containsOpenFileLocked reports whether any file referenced by m is open in
 // the snapshot s.
 //
 // s.mu must be held while calling this function.
-func containsOpenFileLocked(s *snapshot, m *source.Metadata) bool {
-	uris := map[span.URI]struct{}{}
-	for _, uri := range m.CompiledGoFiles {
+func containsOpenFileLocked(s *Snapshot, mp *metadata.Package) bool {
+	uris := map[protocol.DocumentURI]struct{}{}
+	for _, uri := range mp.CompiledGoFiles {
 		uris[uri] = struct{}{}
 	}
-	for _, uri := range m.GoFiles {
+	for _, uri := range mp.GoFiles {
 		uris[uri] = struct{}{}
 	}
 
@@ -656,12 +659,12 @@ func containsOpenFileLocked(s *snapshot, m *source.Metadata) bool {
 // workspace of the snapshot s.
 //
 // s.mu must be held while calling this function.
-func containsFileInWorkspaceLocked(s *snapshot, m *source.Metadata) bool {
-	uris := map[span.URI]struct{}{}
-	for _, uri := range m.CompiledGoFiles {
+func containsFileInWorkspaceLocked(v *View, mp *metadata.Package) bool {
+	uris := map[protocol.DocumentURI]struct{}{}
+	for _, uri := range mp.CompiledGoFiles {
 		uris[uri] = struct{}{}
 	}
-	for _, uri := range m.GoFiles {
+	for _, uri := range mp.GoFiles {
 		uris[uri] = struct{}{}
 	}
 
@@ -671,7 +674,7 @@ func containsFileInWorkspaceLocked(s *snapshot, m *source.Metadata) bool {
 
 		// The package's files are in this view. It may be a workspace package.
 		// Vendored packages are not likely to be interesting to the user.
-		if !strings.Contains(string(uri), "/vendor/") && s.contains(uri) {
+		if !strings.Contains(string(uri), "/vendor/") && v.contains(uri) {
 			return true
 		}
 	}
@@ -683,42 +686,42 @@ func containsFileInWorkspaceLocked(s *snapshot, m *source.Metadata) bool {
 // contain intermediate test variants.
 //
 // s.mu must be held while calling this function.
-func computeWorkspacePackagesLocked(s *snapshot, meta *metadataGraph) map[PackageID]PackagePath {
+func computeWorkspacePackagesLocked(s *Snapshot, meta *metadata.Graph) immutable.Map[PackageID, PackagePath] {
 	workspacePackages := make(map[PackageID]PackagePath)
-	for _, m := range meta.metadata {
-		if !containsPackageLocked(s, m) {
+	for _, mp := range meta.Packages {
+		if !containsPackageLocked(s, mp) {
 			continue
 		}
 
-		if source.IsCommandLineArguments(m.ID) {
+		if metadata.IsCommandLineArguments(mp.ID) {
 			// If all the files contained in m have a real package, we don't need to
 			// keep m as a workspace package.
-			if allFilesHaveRealPackages(meta, m) {
+			if allFilesHaveRealPackages(meta, mp) {
 				continue
 			}
 
 			// We only care about command-line-arguments packages if they are still
 			// open.
-			if !containsOpenFileLocked(s, m) {
+			if !containsOpenFileLocked(s, mp) {
 				continue
 			}
 		}
 
 		switch {
-		case m.ForTest == "":
+		case mp.ForTest == "":
 			// A normal package.
-			workspacePackages[m.ID] = m.PkgPath
-		case m.ForTest == m.PkgPath, m.ForTest+"_test" == m.PkgPath:
+			workspacePackages[mp.ID] = mp.PkgPath
+		case mp.ForTest == mp.PkgPath, mp.ForTest+"_test" == mp.PkgPath:
 			// The test variant of some workspace package or its x_test.
 			// To load it, we need to load the non-test variant with -test.
 			//
 			// Notably, this excludes intermediate test variants from workspace
 			// packages.
-			assert(!m.IsIntermediateTestVariant(), "unexpected ITV")
-			workspacePackages[m.ID] = m.ForTest
+			assert(!mp.IsIntermediateTestVariant(), "unexpected ITV")
+			workspacePackages[mp.ID] = mp.ForTest
 		}
 	}
-	return workspacePackages
+	return immutable.MapOf(workspacePackages)
 }
 
 // allFilesHaveRealPackages reports whether all files referenced by m are
@@ -728,12 +731,12 @@ func computeWorkspacePackagesLocked(s *snapshot, meta *metadataGraph) map[Packag
 // function returns false.
 //
 // If m is not a command-line-arguments package, this is trivially true.
-func allFilesHaveRealPackages(g *metadataGraph, m *source.Metadata) bool {
-	n := len(m.CompiledGoFiles)
+func allFilesHaveRealPackages(g *metadata.Graph, mp *metadata.Package) bool {
+	n := len(mp.CompiledGoFiles)
 checkURIs:
-	for _, uri := range append(m.CompiledGoFiles[0:n:n], m.GoFiles...) {
-		for _, id := range g.ids[uri] {
-			if !source.IsCommandLineArguments(id) {
+	for _, uri := range append(mp.CompiledGoFiles[0:n:n], mp.GoFiles...) {
+		for _, id := range g.IDs[uri] {
+			if !metadata.IsCommandLineArguments(id) {
 				continue checkURIs
 			}
 		}
@@ -755,7 +758,7 @@ func isTestMain(pkg *packages.Package, gocache string) bool {
 	if len(pkg.GoFiles) > 1 {
 		return false
 	}
-	if !source.InDir(gocache, pkg.GoFiles[0]) {
+	if !pathutil.InDir(gocache, pkg.GoFiles[0]) {
 		return false
 	}
 	return true

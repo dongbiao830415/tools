@@ -8,23 +8,23 @@ import (
 	"context"
 	"sync"
 
-	"golang.org/x/tools/gopls/internal/lsp/source"
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/lsp/protocol"
 )
 
-// An overlayFS is a source.FileSource that keeps track of overlays on top of a
+// An overlayFS is a file.Source that keeps track of overlays on top of a
 // delegate FileSource.
 type overlayFS struct {
-	delegate source.FileSource
+	delegate file.Source
 
 	mu       sync.Mutex
-	overlays map[span.URI]*Overlay
+	overlays map[protocol.DocumentURI]*Overlay
 }
 
-func newOverlayFS(delegate source.FileSource) *overlayFS {
+func newOverlayFS(delegate file.Source) *overlayFS {
 	return &overlayFS{
 		delegate: delegate,
-		overlays: make(map[span.URI]*Overlay),
+		overlays: make(map[protocol.DocumentURI]*Overlay),
 	}
 }
 
@@ -39,7 +39,7 @@ func (fs *overlayFS) Overlays() []*Overlay {
 	return overlays
 }
 
-func (fs *overlayFS) ReadFile(ctx context.Context, uri span.URI) (source.FileHandle, error) {
+func (fs *overlayFS) ReadFile(ctx context.Context, uri protocol.DocumentURI) (file.Handle, error) {
 	fs.mu.Lock()
 	overlay, ok := fs.overlays[uri]
 	fs.mu.Unlock()
@@ -50,23 +50,23 @@ func (fs *overlayFS) ReadFile(ctx context.Context, uri span.URI) (source.FileHan
 }
 
 // An Overlay is a file open in the editor. It may have unsaved edits.
-// It implements the source.FileHandle interface.
+// It implements the file.Handle interface.
 type Overlay struct {
-	uri     span.URI
+	uri     protocol.DocumentURI
 	content []byte
-	hash    source.Hash
+	hash    file.Hash
 	version int32
-	kind    source.FileKind
+	kind    file.Kind
 
 	// saved is true if a file matches the state on disk,
 	// and therefore does not need to be part of the overlay sent to go/packages.
 	saved bool
 }
 
-func (o *Overlay) URI() span.URI { return o.uri }
+func (o *Overlay) URI() protocol.DocumentURI { return o.uri }
 
-func (o *Overlay) FileIdentity() source.FileIdentity {
-	return source.FileIdentity{
+func (o *Overlay) Identity() file.Identity {
+	return file.Identity{
 		URI:  o.uri,
 		Hash: o.hash,
 	}
@@ -75,4 +75,4 @@ func (o *Overlay) FileIdentity() source.FileIdentity {
 func (o *Overlay) Content() ([]byte, error) { return o.content, nil }
 func (o *Overlay) Version() int32           { return o.version }
 func (o *Overlay) SameContentsOnDisk() bool { return o.saved }
-func (o *Overlay) Kind() source.FileKind    { return o.kind }
+func (o *Overlay) Kind() file.Kind          { return o.kind }

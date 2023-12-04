@@ -18,16 +18,17 @@ import (
 	"strings"
 	"unicode"
 
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/lsp/cache"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/safetoken"
 	"golang.org/x/tools/gopls/internal/lsp/source"
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/util/safetoken"
 	"golang.org/x/tools/internal/fuzzy"
 )
 
 // packageClauseCompletions offers completions for a package declaration when
 // one is not present in the given file.
-func packageClauseCompletions(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle, position protocol.Position) ([]CompletionItem, *Selection, error) {
+func packageClauseCompletions(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, position protocol.Position) ([]CompletionItem, *Selection, error) {
 	// We know that the AST for this file will be empty due to the missing
 	// package declaration, but parse it anyway to get a mapper.
 	// TODO(adonovan): opt: there's no need to parse just to get a mapper.
@@ -72,7 +73,7 @@ func packageCompletionSurrounding(pgf *source.ParsedGoFile, offset int) (*Select
 	// If the file lacks a package declaration, the parser will return an empty
 	// AST. As a work-around, try to parse an expression from the file contents.
 	fset := token.NewFileSet()
-	expr, _ := parser.ParseExprFrom(fset, m.URI.Filename(), pgf.Src, parser.Mode(0))
+	expr, _ := parser.ParseExprFrom(fset, m.URI.Path(), pgf.Src, parser.Mode(0))
 	if expr == nil {
 		return nil, fmt.Errorf("unparseable file (%s)", m.URI)
 	}
@@ -178,7 +179,7 @@ func cursorInComment(file *token.File, cursor token.Pos, src []byte) bool {
 
 // packageNameCompletions returns name completions for a package clause using
 // the current name as prefix.
-func (c *completer) packageNameCompletions(ctx context.Context, fileURI span.URI, name *ast.Ident) error {
+func (c *completer) packageNameCompletions(ctx context.Context, fileURI protocol.DocumentURI, name *ast.Ident) error {
 	cursor := int(c.pos - name.NamePos)
 	if cursor < 0 || cursor > len(name.Name) {
 		return errors.New("cursor is not in package name identifier")
@@ -202,7 +203,7 @@ func (c *completer) packageNameCompletions(ctx context.Context, fileURI span.URI
 // have the given prefix and are used in the same directory as the given
 // file. This also includes test packages for these packages (<pkg>_test) and
 // the directory name itself.
-func packageSuggestions(ctx context.Context, snapshot source.Snapshot, fileURI span.URI, prefix string) (packages []candidate, err error) {
+func packageSuggestions(ctx context.Context, snapshot *cache.Snapshot, fileURI protocol.DocumentURI, prefix string) (packages []candidate, err error) {
 	active, err := snapshot.WorkspaceMetadata(ctx)
 	if err != nil {
 		return nil, err
@@ -222,7 +223,7 @@ func packageSuggestions(ctx context.Context, snapshot source.Snapshot, fileURI s
 		}
 	}()
 
-	dirPath := filepath.Dir(fileURI.Filename())
+	dirPath := filepath.Dir(fileURI.Path())
 	dirName := filepath.Base(dirPath)
 	if !isValidDirName(dirName) {
 		return packages, nil
@@ -233,18 +234,18 @@ func packageSuggestions(ctx context.Context, snapshot source.Snapshot, fileURI s
 
 	// The `go` command by default only allows one package per directory but we
 	// support multiple package suggestions since gopls is build system agnostic.
-	for _, m := range active {
-		if m.Name == "main" || m.Name == "" {
+	for _, mp := range active {
+		if mp.Name == "main" || mp.Name == "" {
 			continue
 		}
-		if _, ok := seenPkgs[m.Name]; ok {
+		if _, ok := seenPkgs[mp.Name]; ok {
 			continue
 		}
 
 		// Only add packages that are previously used in the current directory.
 		var relevantPkg bool
-		for _, uri := range m.CompiledGoFiles {
-			if filepath.Dir(uri.Filename()) == dirPath {
+		for _, uri := range mp.CompiledGoFiles {
+			if filepath.Dir(uri.Path()) == dirPath {
 				relevantPkg = true
 				break
 			}
@@ -256,13 +257,13 @@ func packageSuggestions(ctx context.Context, snapshot source.Snapshot, fileURI s
 		// Add a found package used in current directory as a high relevance
 		// suggestion and the test package for it as a medium relevance
 		// suggestion.
-		if score := float64(matcher.Score(string(m.Name))); score > 0 {
-			packages = append(packages, toCandidate(string(m.Name), score*highScore))
+		if score := float64(matcher.Score(string(mp.Name))); score > 0 {
+			packages = append(packages, toCandidate(string(mp.Name), score*highScore))
 		}
-		seenPkgs[m.Name] = struct{}{}
+		seenPkgs[mp.Name] = struct{}{}
 
-		testPkgName := m.Name + "_test"
-		if _, ok := seenPkgs[testPkgName]; ok || strings.HasSuffix(string(m.Name), "_test") {
+		testPkgName := mp.Name + "_test"
+		if _, ok := seenPkgs[testPkgName]; ok || strings.HasSuffix(string(mp.Name), "_test") {
 			continue
 		}
 		if score := float64(matcher.Score(string(testPkgName))); score > 0 {

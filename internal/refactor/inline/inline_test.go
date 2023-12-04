@@ -388,6 +388,77 @@ func TestBasics(t *testing.T) {
 			`func _(ch chan int) { f(ch) }`,
 			`func _(ch chan int) { <-(<-chan int)(ch) }`,
 		},
+		{
+			// (a regression test for unnecessary braces)
+			"In block elision, blank decls don't count when computing name conflicts.",
+			`func f(x int) { var _ = x; var _ = 3 }`,
+			`func _() { var _ = 1; f(2) }`,
+			`func _() {
+	var _ = 1
+	var _ = 2
+	var _ = 3
+}`,
+		},
+		{
+			// (a regression test for a missing conversion)
+			"Implicit return conversions are inserted in expr-context reduction.",
+			`func f(x int) error { return nil }`,
+			`func _() { if err := f(0); err != nil {} }`,
+			`func _() {
+	if err := error(nil); err != nil {
+	}
+}`,
+		},
+	})
+}
+
+func TestDuplicable(t *testing.T) {
+	runTests(t, []testcase{
+		{
+			"Empty strings are duplicable.",
+			`func f(s string) { print(s, s) }`,
+			`func _() { f("")  }`,
+			`func _() { print("", "") }`,
+		},
+		{
+			"Non-empty string literals are not duplicable.",
+			`func f(s string) { print(s, s) }`,
+			`func _() { f("hi")  }`,
+			`func _() {
+	var s string = "hi"
+	print(s, s)
+}`,
+		},
+		{
+			"Empty array literals are duplicable.",
+			`func f(a [2]int) { print(a, a) }`,
+			`func _() { f([2]int{})  }`,
+			`func _() { print([2]int{}, [2]int{}) }`,
+		},
+		{
+			"Non-empty array literals are not duplicable.",
+			`func f(a [2]int) { print(a, a) }`,
+			`func _() { f([2]int{1, 2})  }`,
+			`func _() {
+	var a [2]int = [2]int{1, 2}
+	print(a, a)
+}`,
+		},
+		{
+			"Empty struct literals are duplicable.",
+			`func f(s S) { print(s, s) }; type S struct { x int }`,
+			`func _() { f(S{})  }`,
+			`func _() { print(S{}, S{}) }`,
+		},
+		{
+			"Non-empty struct literals are not duplicable.",
+			`func f(s S) { print(s, s) }; type S struct { x int }`,
+			`func _() { f(S{x: 1})  }`,
+			`func _() {
+	var s S = S{x: 1}
+	print(s, s)
+}`,
+		},
 	})
 }
 
@@ -534,6 +605,36 @@ func TestSubstitution(t *testing.T) {
 			`func _() { var local int; _ = local }`,
 		},
 		{
+			"Arguments that are used are detected",
+			`func f(int) {}`,
+			`func _() { var local int; _ = local; f(local) }`,
+			`func _() { var local int; _ = local }`,
+		},
+		{
+			"Arguments that are used are detected",
+			`func f(x, y int) { print(x) }`,
+			`func _() { var z int; f(z, z) }`,
+			`func _() {
+	var z int
+	var _ int = z
+	print(z)
+}`,
+		},
+		{
+			"Function parameters are always used",
+			`func f(int) {}`,
+			`func _() {
+	func(local int) {
+		f(local)
+	}(1)
+}`,
+			`func _() {
+	func(local int) {
+
+	}(1)
+}`,
+		},
+		{
 			"Regression test for detection of shadowing in nested functions.",
 			`func f(x int) { _ = func() { y := 1; print(y); print(x) } }`,
 			`func _(y int) { f(y) } `,
@@ -582,7 +683,7 @@ func TestTailCallStrategy(t *testing.T) {
 			"Tail call with non-trivial return conversion (caller.sig != callee.sig).",
 			`func f() error { return E{} }; type E struct{error}`,
 			`func _() any { return f() }`,
-			`func _() any { return func() error { return E{} }() }`,
+			`func _() any { return error(E{}) }`,
 		},
 	})
 }
@@ -617,6 +718,18 @@ func TestSpreadCalls(t *testing.T) {
 	)
 }`,
 		},
+		{
+			"Spread call in return (#63398).",
+			`func f() (int, error) { return 0, nil }`,
+			`func _() (int, error) { return f() }`,
+			`func _() (int, error) { return 0, nil }`,
+		},
+		{
+			"Implicit return conversions defeat reduction of spread returns, for now.",
+			`func f(x int) (_, _ error) { return nil, nil }`,
+			`func _() { _, _ = f(0) }`,
+			`func _() { _, _ = func() (_, _ error) { return nil, nil }() }`,
+		},
 	})
 }
 
@@ -626,7 +739,7 @@ func TestVariadic(t *testing.T) {
 			"Variadic cancellation (basic).",
 			`func f(args ...any) { defer f(&args); println(args) }`,
 			`func _(slice []any) { f(slice...) }`,
-			`func _(slice []any) { func(args []any) { defer f(&args); println(args) }(slice) }`,
+			`func _(slice []any) { func() { var args []any = slice; defer f(&args); println(args) }() }`,
 		},
 		{
 			"Variadic cancellation (literalization with parameter elimination).",
@@ -714,6 +827,39 @@ func TestParameterBindingDecl(t *testing.T) {
 			`func f(int, y any, z int) { defer g(0); println(int, y, z) }; func g(int) int`,
 			`func _() { f(g(1), g(2), g(3)) }`,
 			`func _() { func(int, y any, z int) { defer g(0); println(int, y, z) }(g(1), g(2), g(3)) }`,
+		},
+		{
+			"An indirect method selection (*x).g acts as a read.",
+			`func f(x *T, y any) any { return x.g(y) }; type T struct{}; func (T) g(x any) any { return x }`,
+			`func _(x *T) { f(x, recover()) }`,
+			`func _(x *T) {
+	var y any = recover()
+	x.g(y)
+}`,
+		},
+		{
+			"A direct method selection x.g is pure.",
+			`func f(x *T, y any) any { return x.g(y) }; type T struct{}; func (*T) g(x any) any { return x }`,
+			`func _(x *T) { f(x, recover()) }`,
+			`func _(x *T) { x.g(recover()) }`,
+		},
+		{
+			"Literalization can make use of a binding decl (all params).",
+			`func f(x, y int) int { defer println(); return y + x }; func g(int) int`,
+			`func _() { println(f(g(1), g(2))) }`,
+			`func _() { println(func() int { var x, y int = g(1), g(2); defer println(); return y + x }()) }`,
+		},
+		{
+			"Literalization can make use of a binding decl (some params).",
+			`func f(x, y int) int { z := y + x; defer println(); return z }; func g(int) int`,
+			`func _() { println(f(g(1), g(2))) }`,
+			`func _() { println(func() int { var x int = g(1); z := g(2) + x; defer println(); return z }()) }`,
+		},
+		{
+			"Literalization can't yet use of a binding decl if named results.",
+			`func f(x, y int) (z int) { z = y + x; defer println(); return }; func g(int) int`,
+			`func _() { println(f(g(1), g(2))) }`,
+			`func _() { println(func(x int) (z int) { z = g(2) + x; defer println(); return }(g(1))) }`,
 		},
 	})
 }

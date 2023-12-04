@@ -19,12 +19,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/tools/gopls/internal/lsp"
+	"golang.org/x/tools/gopls/internal/debug"
 	"golang.org/x/tools/gopls/internal/lsp/cache"
 	"golang.org/x/tools/gopls/internal/lsp/command"
-	"golang.org/x/tools/gopls/internal/lsp/debug"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/source"
+	"golang.org/x/tools/gopls/internal/server"
+	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/event/tag"
 	"golang.org/x/tools/internal/jsonrpc2"
@@ -41,7 +41,7 @@ type StreamServer struct {
 	daemon bool
 
 	// optionsOverrides is passed to newly created sessions.
-	optionsOverrides func(*source.Options)
+	optionsOverrides func(*settings.Options)
 
 	// serverForTest may be set to a test fake for testing.
 	serverForTest protocol.Server
@@ -50,22 +50,22 @@ type StreamServer struct {
 // NewStreamServer creates a StreamServer using the shared cache. If
 // withTelemetry is true, each session is instrumented with telemetry that
 // records RPC statistics.
-func NewStreamServer(cache *cache.Cache, daemon bool, optionsFunc func(*source.Options)) *StreamServer {
+func NewStreamServer(cache *cache.Cache, daemon bool, optionsFunc func(*settings.Options)) *StreamServer {
 	return &StreamServer{cache: cache, daemon: daemon, optionsOverrides: optionsFunc}
 }
 
 func (s *StreamServer) Binder() *ServerBinder {
 	newServer := func(ctx context.Context, client protocol.ClientCloser) protocol.Server {
 		session := cache.NewSession(ctx, s.cache)
-		server := s.serverForTest
-		if server == nil {
-			options := source.DefaultOptions(s.optionsOverrides)
-			server = lsp.NewServer(session, client, options)
+		svr := s.serverForTest
+		if svr == nil {
+			options := settings.DefaultOptions(s.optionsOverrides)
+			svr = server.New(session, client, options)
 			if instance := debug.GetInstance(ctx); instance != nil {
-				instance.AddService(server, session)
+				instance.AddService(svr, session)
 			}
 		}
-		return server
+		return svr
 	}
 	return NewServerBinder(newServer)
 }
@@ -75,19 +75,19 @@ func (s *StreamServer) Binder() *ServerBinder {
 func (s *StreamServer) ServeStream(ctx context.Context, conn jsonrpc2.Conn) error {
 	client := protocol.ClientDispatcher(conn)
 	session := cache.NewSession(ctx, s.cache)
-	server := s.serverForTest
-	if server == nil {
-		options := source.DefaultOptions(s.optionsOverrides)
-		server = lsp.NewServer(session, client, options)
+	svr := s.serverForTest
+	if svr == nil {
+		options := settings.DefaultOptions(s.optionsOverrides)
+		svr = server.New(session, client, options)
 		if instance := debug.GetInstance(ctx); instance != nil {
-			instance.AddService(server, session)
+			instance.AddService(svr, session)
 		}
 	}
 	// Clients may or may not send a shutdown message. Make sure the server is
 	// shut down.
 	// TODO(rFindley): this shutdown should perhaps be on a disconnected context.
 	defer func() {
-		if err := server.Shutdown(ctx); err != nil {
+		if err := svr.Shutdown(ctx); err != nil {
 			event.Error(ctx, "error shutting down", err)
 		}
 	}()
@@ -100,7 +100,7 @@ func (s *StreamServer) ServeStream(ctx context.Context, conn jsonrpc2.Conn) erro
 	conn.Go(ctx,
 		protocol.Handlers(
 			handshaker(session, executable, s.daemon,
-				protocol.ServerHandler(server,
+				protocol.ServerHandler(svr,
 					jsonrpc2.MethodNotFound))))
 	if s.daemon {
 		log.Printf("Session %s: connected", session.ID())

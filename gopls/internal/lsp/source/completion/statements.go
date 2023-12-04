@@ -10,9 +10,10 @@ import (
 	"go/token"
 	"go/types"
 
+	"golang.org/x/tools/gopls/internal/lsp/cache"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/snippet"
 	"golang.org/x/tools/gopls/internal/lsp/source"
+	"golang.org/x/tools/gopls/internal/lsp/source/completion/snippet"
 )
 
 // addStatementCandidates adds full statement completion candidates
@@ -307,9 +308,8 @@ func (c *completer) addErrCheck() {
 	}
 
 	c.items = append(c.items, CompletionItem{
-		Label: label,
-		// There doesn't seem to be a more appropriate kind.
-		Kind:    protocol.KeywordCompletion,
+		Label:   label,
+		Kind:    protocol.SnippetCompletion,
 		Score:   highScore,
 		snippet: &snip,
 	})
@@ -321,7 +321,7 @@ func (c *completer) addErrCheck() {
 // returns "b" etc. An empty string indicates that the function signature
 // does not take a testing.TB parameter or does so but is ignored such
 // as func someFunc(*testing.T).
-func getTestVar(enclosingFunc *funcInfo, pkg source.Package) string {
+func getTestVar(enclosingFunc *funcInfo, pkg *cache.Package) string {
 	if enclosingFunc == nil || enclosingFunc.sig == nil {
 		return ""
 	}

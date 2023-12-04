@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/build/constraint"
+	"go/parser"
 	"go/token"
 	"go/types"
 	"io"
@@ -29,27 +30,54 @@ import (
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/types/objectpath"
-	"golang.org/x/tools/gopls/internal/bug"
+	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/filecache"
+	"golang.org/x/tools/gopls/internal/lsp/cache/metadata"
+	"golang.org/x/tools/gopls/internal/lsp/cache/methodsets"
+	"golang.org/x/tools/gopls/internal/lsp/cache/typerefs"
+	"golang.org/x/tools/gopls/internal/lsp/cache/xrefs"
 	"golang.org/x/tools/gopls/internal/lsp/command"
-	"golang.org/x/tools/gopls/internal/lsp/filecache"
 	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/source"
-	"golang.org/x/tools/gopls/internal/lsp/source/methodsets"
-	"golang.org/x/tools/gopls/internal/lsp/source/typerefs"
-	"golang.org/x/tools/gopls/internal/lsp/source/xrefs"
-	"golang.org/x/tools/gopls/internal/span"
+	"golang.org/x/tools/gopls/internal/settings"
+	"golang.org/x/tools/gopls/internal/util/bug"
+	"golang.org/x/tools/gopls/internal/util/constraints"
+	"golang.org/x/tools/gopls/internal/util/immutable"
+	"golang.org/x/tools/gopls/internal/util/maps"
+	"golang.org/x/tools/gopls/internal/util/pathutil"
+	"golang.org/x/tools/gopls/internal/util/persistent"
+	"golang.org/x/tools/gopls/internal/vulncheck"
 	"golang.org/x/tools/internal/event"
+	"golang.org/x/tools/internal/event/label"
 	"golang.org/x/tools/internal/event/tag"
 	"golang.org/x/tools/internal/gocommand"
 	"golang.org/x/tools/internal/memoize"
 	"golang.org/x/tools/internal/packagesinternal"
-	"golang.org/x/tools/internal/persistent"
 	"golang.org/x/tools/internal/typesinternal"
 )
 
-type snapshot struct {
+// A GlobalSnapshotID uniquely identifies a snapshot within this process and
+// increases monotonically with snapshot creation time.
+//
+// We use a distinct integral type for global IDs to help enforce correct
+// usage.
+//
+// TODO(rfindley): remove this as it should not be necessary for correctness.
+type GlobalSnapshotID uint64
+
+// A Snapshot represents the current state for a given view.
+//
+// It is first and foremost an idempotent implementation of file.Source whose
+// ReadFile method returns consistent information about the existence and
+// content of each file throughout its lifetime.
+//
+// However, the snapshot also manages additional state (such as parsed files
+// and packages) that are derived from file content.
+//
+// Snapshots are responsible for bookkeeping and invalidation of this state,
+// implemented in Snapshot.clone.
+type Snapshot struct {
 	sequenceID uint64
-	globalID   source.GlobalSnapshotID
+	globalID   GlobalSnapshotID
 
 	// TODO(rfindley): the snapshot holding a reference to the view poses
 	// lifecycle problems: a view may be shut down and waiting for work
@@ -77,7 +105,7 @@ type snapshot struct {
 	// initializedErr holds the last error resulting from initialization. If
 	// initialization fails, we only retry when the workspace modules change,
 	// to avoid too many go/packages calls.
-	initializedErr *source.CriticalError
+	initializedErr *CriticalError
 
 	// mu guards all of the maps in the snapshot, as well as the builtin URI.
 	mu sync.Mutex
@@ -86,14 +114,15 @@ type snapshot struct {
 	//
 	// TODO(rfindley): would it make more sense to eagerly parse builtin, and
 	// instead store a *ParsedGoFile here?
-	builtin span.URI
+	builtin protocol.DocumentURI
 
 	// meta holds loaded metadata.
 	//
-	// meta is guarded by mu, but the metadataGraph itself is immutable.
+	// meta is guarded by mu, but the Graph itself is immutable.
+	//
 	// TODO(rfindley): in many places we hold mu while operating on meta, even
 	// though we only need to hold mu while reading the pointer.
-	meta *metadataGraph
+	meta *metadata.Graph
 
 	// files maps file URIs to their corresponding FileHandles.
 	// It may invalidated when a file's content changes.
@@ -101,7 +130,7 @@ type snapshot struct {
 
 	// symbolizeHandles maps each file URI to a handle for the future
 	// result of computing the symbols declared in that file.
-	symbolizeHandles *persistent.Map[span.URI, *memoize.Promise] // *memoize.Promise[symbolizeResult]
+	symbolizeHandles *persistent.Map[protocol.DocumentURI, *memoize.Promise] // *memoize.Promise[symbolizeResult]
 
 	// packages maps a packageKey to a *packageHandle.
 	// It may be invalidated when a file's content changes.
@@ -119,46 +148,36 @@ type snapshot struct {
 	activePackages *persistent.Map[PackageID, *Package]
 
 	// workspacePackages contains the workspace's packages, which are loaded
-	// when the view is created. It contains no intermediate test variants.
-	// TODO(rfindley): use a persistent.Map.
-	workspacePackages map[PackageID]PackagePath
+	// when the view is created. It does not contain intermediate test variants.
+	workspacePackages immutable.Map[PackageID, PackagePath]
 
 	// shouldLoad tracks packages that need to be reloaded, mapping a PackageID
 	// to the package paths that should be used to reload it
 	//
 	// When we try to load a package, we clear it from the shouldLoad map
 	// regardless of whether the load succeeded, to prevent endless loads.
-	shouldLoad map[PackageID][]PackagePath
+	shouldLoad *persistent.Map[PackageID, []PackagePath]
 
 	// unloadableFiles keeps track of files that we've failed to load.
-	unloadableFiles *persistent.Set[span.URI]
+	unloadableFiles *persistent.Set[protocol.DocumentURI]
 
 	// TODO(rfindley): rename the handles below to "promises". A promise is
 	// different from a handle (we mutate the package handle.)
 
 	// parseModHandles keeps track of any parseModHandles for the snapshot.
 	// The handles need not refer to only the view's go.mod file.
-	parseModHandles *persistent.Map[span.URI, *memoize.Promise] // *memoize.Promise[parseModResult]
+	parseModHandles *persistent.Map[protocol.DocumentURI, *memoize.Promise] // *memoize.Promise[parseModResult]
 
 	// parseWorkHandles keeps track of any parseWorkHandles for the snapshot.
 	// The handles need not refer to only the view's go.work file.
-	parseWorkHandles *persistent.Map[span.URI, *memoize.Promise] // *memoize.Promise[parseWorkResult]
+	parseWorkHandles *persistent.Map[protocol.DocumentURI, *memoize.Promise] // *memoize.Promise[parseWorkResult]
 
 	// Preserve go.mod-related handles to avoid garbage-collecting the results
 	// of various calls to the go command. The handles need not refer to only
 	// the view's go.mod file.
-	modTidyHandles *persistent.Map[span.URI, *memoize.Promise] // *memoize.Promise[modTidyResult]
-	modWhyHandles  *persistent.Map[span.URI, *memoize.Promise] // *memoize.Promise[modWhyResult]
-	modVulnHandles *persistent.Map[span.URI, *memoize.Promise] // *memoize.Promise[modVulnResult]
-
-	// workspaceModFiles holds the set of mod files active in this snapshot.
-	//
-	// This is either empty, a single entry for the workspace go.mod file, or the
-	// set of mod files used by the workspace go.work file.
-	//
-	// This set is immutable inside the snapshot, and therefore is not guarded by mu.
-	workspaceModFiles    map[span.URI]struct{}
-	workspaceModFilesErr error // error encountered computing workspaceModFiles
+	modTidyHandles *persistent.Map[protocol.DocumentURI, *memoize.Promise] // *memoize.Promise[modTidyResult]
+	modWhyHandles  *persistent.Map[protocol.DocumentURI, *memoize.Promise] // *memoize.Promise[modWhyResult]
+	modVulnHandles *persistent.Map[protocol.DocumentURI, *memoize.Promise] // *memoize.Promise[modVulnResult]
 
 	// importGraph holds a shared import graph to use for type-checking. Adding
 	// more packages to this import graph can speed up type checking, at the
@@ -171,23 +190,21 @@ type snapshot struct {
 	// pkgIndex is an index of package IDs, for efficient storage of typerefs.
 	pkgIndex *typerefs.PackageIndex
 
-	// Only compute module prefixes once, as they are used with high frequency to
-	// detect ignored files.
-	ignoreFilterOnce sync.Once
-	ignoreFilter     *ignoreFilter
+	// moduleUpgrades tracks known upgrades for module paths in each modfile.
+	// Each modfile has a map of module name to upgrade version.
+	moduleUpgrades *persistent.Map[protocol.DocumentURI, map[string]string]
 
-	// options holds the user configuration at the time this snapshot was
-	// created.
-	options *source.Options
+	// vulns maps each go.mod file's URI to its known vulnerabilities.
+	vulns *persistent.Map[protocol.DocumentURI, *vulncheck.Result]
 }
 
 var globalSnapshotID uint64
 
-func nextSnapshotID() source.GlobalSnapshotID {
-	return source.GlobalSnapshotID(atomic.AddUint64(&globalSnapshotID, 1))
+func nextSnapshotID() GlobalSnapshotID {
+	return GlobalSnapshotID(atomic.AddUint64(&globalSnapshotID, 1))
 }
 
-var _ memoize.RefCounted = (*snapshot)(nil) // snapshots are reference-counted
+var _ memoize.RefCounted = (*Snapshot)(nil) // snapshots are reference-counted
 
 // Acquire prevents the snapshot from being destroyed until the returned function is called.
 //
@@ -198,7 +215,7 @@ var _ memoize.RefCounted = (*snapshot)(nil) // snapshots are reference-counted
 // an advantage of the current approach, which forces the caller to
 // consider the release function at every stage, making a reference
 // leak more obvious.)
-func (s *snapshot) Acquire() func() {
+func (s *Snapshot) Acquire() func() {
 	type uP = unsafe.Pointer
 	if destroyedBy := atomic.LoadPointer((*uP)(uP(&s.destroyedBy))); destroyedBy != nil {
 		log.Panicf("%d: acquire() after Destroy(%q)", s.globalID, *(*string)(destroyedBy))
@@ -207,7 +224,7 @@ func (s *snapshot) Acquire() func() {
 	return s.refcount.Done
 }
 
-func (s *snapshot) awaitPromise(ctx context.Context, p *memoize.Promise) (interface{}, error) {
+func (s *Snapshot) awaitPromise(ctx context.Context, p *memoize.Promise) (interface{}, error) {
 	return p.Get(ctx, s)
 }
 
@@ -224,7 +241,7 @@ func (s *snapshot) awaitPromise(ctx context.Context, p *memoize.Promise) (interf
 //
 // v.snapshotMu must be held while calling this function, in order to preserve
 // the invariants described by the docstring for v.snapshot.
-func (v *View) destroy(s *snapshot, destroyedBy string) {
+func (v *View) destroy(s *Snapshot, destroyedBy string) {
 	v.snapshotWG.Add(1)
 	go func() {
 		defer v.snapshotWG.Done()
@@ -232,7 +249,7 @@ func (v *View) destroy(s *snapshot, destroyedBy string) {
 	}()
 }
 
-func (s *snapshot) destroy(destroyedBy string) {
+func (s *Snapshot) destroy(destroyedBy string) {
 	// Wait for all leases to end before commencing destruction.
 	s.refcount.Wait()
 
@@ -253,86 +270,124 @@ func (s *snapshot) destroy(destroyedBy string) {
 	s.modVulnHandles.Destroy()
 	s.modWhyHandles.Destroy()
 	s.unloadableFiles.Destroy()
+	s.moduleUpgrades.Destroy()
+	s.vulns.Destroy()
 }
 
-func (s *snapshot) SequenceID() uint64 {
+// SequenceID is the sequence id of this snapshot within its containing
+// view.
+//
+// Relative to their view sequence ids are monotonically increasing, but this
+// does not hold globally: when new views are created their initial snapshot
+// has sequence ID 0. For operations that span multiple views, use global
+// IDs.
+func (s *Snapshot) SequenceID() uint64 {
 	return s.sequenceID
 }
 
-func (s *snapshot) GlobalID() source.GlobalSnapshotID {
+// GlobalID is a globally unique identifier for this snapshot. Global IDs are
+// monotonic: subsequent snapshots will have higher global ID, though
+// subsequent snapshots in a view may not have adjacent global IDs.
+func (s *Snapshot) GlobalID() GlobalSnapshotID {
 	return s.globalID
 }
 
-func (s *snapshot) View() source.View {
+// SnapshotLabels returns a new slice of labels that should be used for events
+// related to a snapshot.
+func (s *Snapshot) Labels() []label.Label {
+	return []label.Label{tag.Snapshot.Of(s.SequenceID()), tag.Directory.Of(s.Folder())}
+}
+
+// Folder returns the folder at the base of this snapshot.
+func (s *Snapshot) Folder() protocol.DocumentURI {
+	return s.view.folder.Dir
+}
+
+// View returns the View associated with this snapshot.
+func (s *Snapshot) View() *View {
 	return s.view
 }
 
-func (s *snapshot) FileKind(fh source.FileHandle) source.FileKind {
+// FileKind returns the type of a file.
+//
+// We can't reliably deduce the kind from the file name alone,
+// as some editors can be told to interpret a buffer as
+// language different from the file name heuristic, e.g. that
+// an .html file actually contains Go "html/template" syntax,
+// or even that a .go file contains Python.
+func (s *Snapshot) FileKind(fh file.Handle) file.Kind {
 	// The kind of an unsaved buffer comes from the
 	// TextDocumentItem.LanguageID field in the didChange event,
 	// not from the file name. They may differ.
 	if o, ok := fh.(*Overlay); ok {
-		if o.kind != source.UnknownKind {
+		if o.kind != file.UnknownKind {
 			return o.kind
 		}
 	}
 
-	fext := filepath.Ext(fh.URI().Filename())
+	fext := filepath.Ext(fh.URI().Path())
 	switch fext {
 	case ".go":
-		return source.Go
+		return file.Go
 	case ".mod":
-		return source.Mod
+		return file.Mod
 	case ".sum":
-		return source.Sum
+		return file.Sum
 	case ".work":
-		return source.Work
+		return file.Work
 	}
-	exts := s.options.TemplateExtensions
+	exts := s.Options().TemplateExtensions
 	for _, ext := range exts {
 		if fext == ext || fext == "."+ext {
-			return source.Tmpl
+			return file.Tmpl
 		}
 	}
 	// and now what? This should never happen, but it does for cgo before go1.15
-	return source.Go
+	return file.Go
 }
 
-func (s *snapshot) Options() *source.Options {
-	return s.options // temporarily return view options.
+// Options returns the options associated with this snapshot.
+func (s *Snapshot) Options() *settings.Options {
+	return s.view.folder.Options
 }
 
-func (s *snapshot) BackgroundContext() context.Context {
+// BackgroundContext returns a context used for all background processing
+// on behalf of this snapshot.
+func (s *Snapshot) BackgroundContext() context.Context {
 	return s.backgroundCtx
 }
 
-func (s *snapshot) ModFiles() []span.URI {
-	var uris []span.URI
-	for modURI := range s.workspaceModFiles {
+// ModFiles are the go.mod files enclosed in the snapshot's view and known
+// to the snapshot.
+func (s *Snapshot) ModFiles() []protocol.DocumentURI {
+	var uris []protocol.DocumentURI
+	for modURI := range s.view.workspaceModFiles {
 		uris = append(uris, modURI)
 	}
 	return uris
 }
 
-func (s *snapshot) WorkFile() span.URI {
+// WorkFile, if non-empty, is the go.work file for the workspace.
+func (s *Snapshot) WorkFile() protocol.DocumentURI {
 	gowork, _ := s.view.GOWORK()
 	return gowork
 }
 
-func (s *snapshot) Templates() map[span.URI]source.FileHandle {
+// Templates returns the .tmpl files.
+func (s *Snapshot) Templates() map[protocol.DocumentURI]file.Handle {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tmpls := map[span.URI]source.FileHandle{}
-	s.files.Range(func(k span.URI, fh source.FileHandle) {
-		if s.FileKind(fh) == source.Tmpl {
+	tmpls := map[protocol.DocumentURI]file.Handle{}
+	s.files.Range(func(k protocol.DocumentURI, fh file.Handle) {
+		if s.FileKind(fh) == file.Tmpl {
 			tmpls[k] = fh
 		}
 	})
 	return tmpls
 }
 
-func (s *snapshot) validBuildConfiguration() bool {
+func (s *Snapshot) validBuildConfiguration() bool {
 	// Since we only really understand the `go` command, if the user has a
 	// different GOPACKAGESDRIVER, assume that their configuration is valid.
 	if s.view.hasGopackagesDriver {
@@ -341,7 +396,7 @@ func (s *snapshot) validBuildConfiguration() bool {
 
 	// Check if the user is working within a module or if we have found
 	// multiple modules in the workspace.
-	if len(s.workspaceModFiles) > 0 {
+	if len(s.view.workspaceModFiles) > 0 {
 		return true
 	}
 
@@ -353,39 +408,13 @@ func (s *snapshot) validBuildConfiguration() bool {
 	return false
 }
 
-// workspaceMode describes the way in which the snapshot's workspace should
-// be loaded.
-//
-// TODO(rfindley): remove this, in favor of specific methods.
-func (s *snapshot) workspaceMode() workspaceMode {
-	var mode workspaceMode
-
-	// If the view has an invalid configuration, don't build the workspace
-	// module.
-	validBuildConfiguration := s.validBuildConfiguration()
-	if !validBuildConfiguration {
-		return mode
-	}
-	// If the view is not in a module and contains no modules, but still has a
-	// valid workspace configuration, do not create the workspace module.
-	// It could be using GOPATH or a different build system entirely.
-	if len(s.workspaceModFiles) == 0 && validBuildConfiguration {
-		return mode
-	}
-	mode |= moduleMode
-	if s.options.TempModfile {
-		mode |= tempModfile
-	}
-	return mode
-}
-
 // config returns the configuration used for the snapshot's interaction with
 // the go/packages API. It uses the given working directory.
 //
 // TODO(rstambler): go/packages requires that we do not provide overlays for
 // multiple modules in on config, so buildOverlay needs to filter overlays by
 // module.
-func (s *snapshot) config(ctx context.Context, inv *gocommand.Invocation) *packages.Config {
+func (s *Snapshot) config(ctx context.Context, inv *gocommand.Invocation) *packages.Config {
 
 	cfg := &packages.Config{
 		Context:    ctx,
@@ -408,7 +437,7 @@ func (s *snapshot) config(ctx context.Context, inv *gocommand.Invocation) *packa
 			panic("go/packages must not be used to parse files")
 		},
 		Logf: func(format string, args ...interface{}) {
-			if s.options.VerboseOutput {
+			if s.Options().VerboseOutput {
 				event.Log(ctx, fmt.Sprintf(format, args...))
 			}
 		},
@@ -420,11 +449,40 @@ func (s *snapshot) config(ctx context.Context, inv *gocommand.Invocation) *packa
 	if typesinternal.SetUsesCgo(&types.Config{}) {
 		cfg.Mode |= packages.LoadMode(packagesinternal.TypecheckCgo)
 	}
-	packagesinternal.SetGoCmdRunner(cfg, s.view.gocmdRunner)
 	return cfg
 }
 
-func (s *snapshot) RunGoCommandDirect(ctx context.Context, mode source.InvocationFlags, inv *gocommand.Invocation) (*bytes.Buffer, error) {
+// InvocationFlags represents the settings of a particular go command invocation.
+// It is a mode, plus a set of flag bits.
+type InvocationFlags int
+
+const (
+	// Normal is appropriate for commands that might be run by a user and don't
+	// deliberately modify go.mod files, e.g. `go test`.
+	Normal InvocationFlags = iota
+	// WriteTemporaryModFile is for commands that need information from a
+	// modified version of the user's go.mod file, e.g. `go mod tidy` used to
+	// generate diagnostics.
+	WriteTemporaryModFile
+	// LoadWorkspace is for packages.Load, and other operations that should
+	// consider the whole workspace at once.
+	LoadWorkspace
+	// AllowNetwork is a flag bit that indicates the invocation should be
+	// allowed to access the network.
+	AllowNetwork InvocationFlags = 1 << 10
+)
+
+func (m InvocationFlags) Mode() InvocationFlags {
+	return m & (AllowNetwork - 1)
+}
+
+func (m InvocationFlags) AllowNetwork() bool {
+	return m&AllowNetwork != 0
+}
+
+// RunGoCommandDirect runs the given `go` command. Verb, Args, and
+// WorkingDir must be specified.
+func (s *Snapshot) RunGoCommandDirect(ctx context.Context, mode InvocationFlags, inv *gocommand.Invocation) (*bytes.Buffer, error) {
 	_, inv, cleanup, err := s.goCommandInvocation(ctx, mode, inv)
 	if err != nil {
 		return nil, err
@@ -434,7 +492,13 @@ func (s *snapshot) RunGoCommandDirect(ctx context.Context, mode source.Invocatio
 	return s.view.gocmdRunner.Run(ctx, *inv)
 }
 
-func (s *snapshot) RunGoCommandPiped(ctx context.Context, mode source.InvocationFlags, inv *gocommand.Invocation, stdout, stderr io.Writer) error {
+// RunGoCommandPiped runs the given `go` command, writing its output
+// to stdout and stderr. Verb, Args, and WorkingDir must be specified.
+//
+// RunGoCommandPiped runs the command serially using gocommand.RunPiped,
+// enforcing that this command executes exclusively to other commands on the
+// server.
+func (s *Snapshot) RunGoCommandPiped(ctx context.Context, mode InvocationFlags, inv *gocommand.Invocation, stdout, stderr io.Writer) error {
 	_, inv, cleanup, err := s.goCommandInvocation(ctx, mode, inv)
 	if err != nil {
 		return err
@@ -443,19 +507,16 @@ func (s *snapshot) RunGoCommandPiped(ctx context.Context, mode source.Invocation
 	return s.view.gocmdRunner.RunPiped(ctx, *inv, stdout, stderr)
 }
 
-func (s *snapshot) RunGoCommands(ctx context.Context, allowNetwork bool, wd string, run func(invoke func(...string) (*bytes.Buffer, error)) error) (bool, []byte, []byte, error) {
-	var flags source.InvocationFlags
-	if s.workspaceMode()&tempModfile != 0 {
-		flags = source.WriteTemporaryModFile
-	} else {
-		flags = source.Normal
-	}
-	if allowNetwork {
-		flags |= source.AllowNetwork
-	}
+// RunGoModUpdateCommands runs a series of `go` commands that updates the go.mod
+// and go.sum file for wd, and returns their updated contents.
+//
+// TODO(rfindley): the signature of RunGoModUpdateCommands is very confusing.
+// Simplify it.
+func (s *Snapshot) RunGoModUpdateCommands(ctx context.Context, wd string, run func(invoke func(...string) (*bytes.Buffer, error)) error) ([]byte, []byte, error) {
+	flags := WriteTemporaryModFile | AllowNetwork
 	tmpURI, inv, cleanup, err := s.goCommandInvocation(ctx, flags, &gocommand.Invocation{WorkingDir: wd})
 	if err != nil {
-		return false, nil, nil, err
+		return nil, nil, err
 	}
 	defer cleanup()
 	invoke := func(args ...string) (*bytes.Buffer, error) {
@@ -464,21 +525,21 @@ func (s *snapshot) RunGoCommands(ctx context.Context, allowNetwork bool, wd stri
 		return s.view.gocmdRunner.Run(ctx, *inv)
 	}
 	if err := run(invoke); err != nil {
-		return false, nil, nil, err
+		return nil, nil, err
 	}
-	if flags.Mode() != source.WriteTemporaryModFile {
-		return false, nil, nil, nil
+	if flags.Mode() != WriteTemporaryModFile {
+		return nil, nil, nil
 	}
 	var modBytes, sumBytes []byte
-	modBytes, err = os.ReadFile(tmpURI.Filename())
+	modBytes, err = os.ReadFile(tmpURI.Path())
 	if err != nil && !os.IsNotExist(err) {
-		return false, nil, nil, err
+		return nil, nil, err
 	}
-	sumBytes, err = os.ReadFile(strings.TrimSuffix(tmpURI.Filename(), ".mod") + ".sum")
+	sumBytes, err = os.ReadFile(strings.TrimSuffix(tmpURI.Path(), ".mod") + ".sum")
 	if err != nil && !os.IsNotExist(err) {
-		return false, nil, nil, err
+		return nil, nil, err
 	}
-	return true, modBytes, sumBytes, nil
+	return modBytes, sumBytes, nil
 }
 
 // goCommandInvocation populates inv with configuration for running go commands on the snapshot.
@@ -487,23 +548,22 @@ func (s *snapshot) RunGoCommands(ctx context.Context, allowNetwork bool, wd stri
 // explicitly, rather than implicitly deriving it from flags and inv.
 //
 // TODO(adonovan): simplify cleanup mechanism. It's hard to see, but
-// it used only after call to tempModFile. Clarify that it is only
-// non-nil on success.
-func (s *snapshot) goCommandInvocation(ctx context.Context, flags source.InvocationFlags, inv *gocommand.Invocation) (tmpURI span.URI, updatedInv *gocommand.Invocation, cleanup func(), err error) {
-	allowModfileModificationOption := s.options.AllowModfileModifications
-	allowNetworkOption := s.options.AllowImplicitNetworkAccess
+// it used only after call to tempModFile.
+func (s *Snapshot) goCommandInvocation(ctx context.Context, flags InvocationFlags, inv *gocommand.Invocation) (tmpURI protocol.DocumentURI, updatedInv *gocommand.Invocation, cleanup func(), err error) {
+	allowModfileModificationOption := s.Options().AllowModfileModifications
+	allowNetworkOption := s.Options().AllowImplicitNetworkAccess
 
 	// TODO(rfindley): this is very hard to follow, and may not even be doing the
 	// right thing: should inv.Env really trample view.options? Do we ever invoke
 	// this with a non-empty inv.Env?
 	//
 	// We should refactor to make it clearer that the correct env is being used.
-	inv.Env = append(append(append(os.Environ(), s.options.EnvSlice()...), inv.Env...), "GO111MODULE="+s.view.GO111MODULE())
-	inv.BuildFlags = append([]string{}, s.options.BuildFlags...)
+	inv.Env = append(append(append(os.Environ(), s.Options().EnvSlice()...), inv.Env...), "GO111MODULE="+s.view.GO111MODULE())
+	inv.BuildFlags = append([]string{}, s.Options().BuildFlags...)
 	cleanup = func() {} // fallback
 
 	// All logic below is for module mode.
-	if s.workspaceMode()&moduleMode == 0 {
+	if len(s.view.workspaceModFiles) == 0 {
 		return "", inv, cleanup, nil
 	}
 
@@ -525,19 +585,21 @@ func (s *snapshot) goCommandInvocation(ctx context.Context, flags source.Invocat
 	// These are dependent on a number of factors: whether we need to run in a
 	// synthetic workspace, whether flags are supported at the current go
 	// version, and what we're actually trying to achieve (the
-	// source.InvocationFlags).
+	// InvocationFlags).
+	//
+	// TODO(rfindley): should we set -overlays here?
 
-	var modURI span.URI
+	var modURI protocol.DocumentURI
 	// Select the module context to use.
 	// If we're type checking, we need to use the workspace context, meaning
 	// the main (workspace) module. Otherwise, we should use the module for
 	// the passed-in working dir.
-	if mode == source.LoadWorkspace {
+	if mode == LoadWorkspace {
 		if gowork, _ := s.view.GOWORK(); gowork == "" && s.view.gomod != "" {
 			modURI = s.view.gomod
 		}
 	} else {
-		modURI = s.GoModForFile(span.URIFromPath(inv.WorkingDir))
+		modURI = s.GoModForFile(protocol.URIFromPath(inv.WorkingDir))
 	}
 
 	var modContent []byte
@@ -562,10 +624,9 @@ func (s *snapshot) goCommandInvocation(ctx context.Context, flags source.Invocat
 
 	const mutableModFlag = "mod"
 	// If the mod flag isn't set, populate it based on the mode and workspace.
-	// TODO(rfindley): this doesn't make sense if we're not in module mode
 	if inv.ModFlag == "" {
 		switch mode {
-		case source.LoadWorkspace, source.Normal:
+		case LoadWorkspace, Normal:
 			if vendorEnabled {
 				inv.ModFlag = "vendor"
 			} else if !allowModfileModificationOption {
@@ -573,49 +634,36 @@ func (s *snapshot) goCommandInvocation(ctx context.Context, flags source.Invocat
 			} else {
 				inv.ModFlag = mutableModFlag
 			}
-		case source.WriteTemporaryModFile:
+		case WriteTemporaryModFile:
 			inv.ModFlag = mutableModFlag
 			// -mod must be readonly when using go.work files - see issue #48941
 			inv.Env = append(inv.Env, "GOWORK=off")
 		}
 	}
 
-	// Only use a temp mod file if the modfile can actually be mutated.
-	needTempMod := inv.ModFlag == mutableModFlag
-	useTempMod := s.workspaceMode()&tempModfile != 0
-	if needTempMod && !useTempMod {
-		return "", nil, cleanup, source.ErrTmpModfileUnsupported
-	}
+	// TODO(rfindley): if inv.ModFlag was already set to "mod", we may not have
+	// set GOWORK=off here. But that doesn't happen. Clean up this entire API so
+	// that we don't have this mutation of the invocation, which is quite hard to
+	// follow.
 
-	// We should use -modfile if:
-	//  - the workspace mode supports it
-	//  - we're using a go.work file on go1.18+, or we need a temp mod file (for
-	//    example, if running go mod tidy in a go.work workspace)
-	//
-	// TODO(rfindley): this is very hard to follow. Refactor.
-	if !needTempMod && s.view.gowork != "" {
-		// Since we're running in the workspace root, the go command will resolve GOWORK automatically.
-	} else if useTempMod {
+	// If the invocation needs to mutate the modfile, we must use a temp mod.
+	if inv.ModFlag == mutableModFlag {
 		if modURI == "" {
 			return "", nil, cleanup, fmt.Errorf("no go.mod file found in %s", inv.WorkingDir)
 		}
-		modFH, err := s.ReadFile(ctx, modURI)
-		if err != nil {
-			return "", nil, cleanup, err
-		}
 		// Use the go.sum if it happens to be available.
 		gosum := s.goSum(ctx, modURI)
-		tmpURI, cleanup, err = tempModFile(modFH, gosum)
+		tmpURI, cleanup, err = tempModFile(modURI, modContent, gosum)
 		if err != nil {
 			return "", nil, cleanup, err
 		}
-		inv.ModFile = tmpURI.Filename()
+		inv.ModFile = tmpURI.Path()
 	}
 
 	return tmpURI, inv, cleanup, nil
 }
 
-func (s *snapshot) buildOverlay() map[string][]byte {
+func (s *Snapshot) buildOverlay() map[string][]byte {
 	overlays := make(map[string][]byte)
 	for _, overlay := range s.overlays() {
 		if overlay.saved {
@@ -624,12 +672,12 @@ func (s *snapshot) buildOverlay() map[string][]byte {
 		// TODO(rfindley): previously, there was a todo here to make sure we don't
 		// send overlays outside of the current view. IMO we should instead make
 		// sure this doesn't matter.
-		overlays[overlay.URI().Filename()] = overlay.content
+		overlays[overlay.URI().Path()] = overlay.content
 	}
 	return overlays
 }
 
-func (s *snapshot) overlays() []*Overlay {
+func (s *Snapshot) overlays() []*Overlay {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -646,23 +694,28 @@ const (
 	typerefsKind    = "typerefs"
 )
 
-func (s *snapshot) PackageDiagnostics(ctx context.Context, ids ...PackageID) (map[span.URI][]*source.Diagnostic, error) {
+// PackageDiagnostics returns diagnostics for files contained in specified
+// packages.
+//
+// If these diagnostics cannot be loaded from cache, the requested packages
+// may be type-checked.
+func (s *Snapshot) PackageDiagnostics(ctx context.Context, ids ...PackageID) (map[protocol.DocumentURI][]*Diagnostic, error) {
 	ctx, done := event.Start(ctx, "cache.snapshot.PackageDiagnostics")
 	defer done()
 
 	var mu sync.Mutex
-	perFile := make(map[span.URI][]*source.Diagnostic)
-	collect := func(diags []*source.Diagnostic) {
+	perFile := make(map[protocol.DocumentURI][]*Diagnostic)
+	collect := func(diags []*Diagnostic) {
 		mu.Lock()
 		defer mu.Unlock()
 		for _, diag := range diags {
 			perFile[diag.URI] = append(perFile[diag.URI], diag)
 		}
 	}
-	pre := func(i int, ph *packageHandle) bool {
+	pre := func(_ int, ph *packageHandle) bool {
 		data, err := filecache.Get(diagnosticsKind, ph.key)
 		if err == nil { // hit
-			collect(ph.m.Diagnostics)
+			collect(ph.loadDiagnostics)
 			collect(decodeDiagnostics(data))
 			return false
 		} else if err != filecache.ErrNotFound {
@@ -671,21 +724,25 @@ func (s *snapshot) PackageDiagnostics(ctx context.Context, ids ...PackageID) (ma
 		return true
 	}
 	post := func(_ int, pkg *Package) {
-		collect(pkg.m.Diagnostics)
+		collect(pkg.loadDiagnostics)
 		collect(pkg.pkg.diagnostics)
 	}
 	return perFile, s.forEachPackage(ctx, ids, pre, post)
 }
 
-func (s *snapshot) References(ctx context.Context, ids ...PackageID) ([]source.XrefIndex, error) {
+// References returns cross-reference indexes for the specified packages.
+//
+// If these indexes cannot be loaded from cache, the requested packages may
+// be type-checked.
+func (s *Snapshot) References(ctx context.Context, ids ...PackageID) ([]XrefIndex, error) {
 	ctx, done := event.Start(ctx, "cache.snapshot.References")
 	defer done()
 
-	indexes := make([]source.XrefIndex, len(ids))
+	indexes := make([]XrefIndex, len(ids))
 	pre := func(i int, ph *packageHandle) bool {
 		data, err := filecache.Get(xrefsKind, ph.key)
 		if err == nil { // hit
-			indexes[i] = XrefIndex{m: ph.m, data: data}
+			indexes[i] = XrefIndex{mp: ph.mp, data: data}
 			return false
 		} else if err != filecache.ErrNotFound {
 			event.Error(ctx, "reading xrefs from filecache", err)
@@ -693,22 +750,26 @@ func (s *snapshot) References(ctx context.Context, ids ...PackageID) ([]source.X
 		return true
 	}
 	post := func(i int, pkg *Package) {
-		indexes[i] = XrefIndex{m: pkg.m, data: pkg.pkg.xrefs()}
+		indexes[i] = XrefIndex{mp: pkg.metadata, data: pkg.pkg.xrefs()}
 	}
 	return indexes, s.forEachPackage(ctx, ids, pre, post)
 }
 
-// An XrefIndex is a helper for looking up a package in a given package.
+// An XrefIndex is a helper for looking up references in a given package.
 type XrefIndex struct {
-	m    *source.Metadata
+	mp   *metadata.Package
 	data []byte
 }
 
 func (index XrefIndex) Lookup(targets map[PackagePath]map[objectpath.Path]struct{}) []protocol.Location {
-	return xrefs.Lookup(index.m, index.data, targets)
+	return xrefs.Lookup(index.mp, index.data, targets)
 }
 
-func (s *snapshot) MethodSets(ctx context.Context, ids ...PackageID) ([]*methodsets.Index, error) {
+// MethodSets returns method-set indexes for the specified packages.
+//
+// If these indexes cannot be loaded from cache, the requested packages may
+// be type-checked.
+func (s *Snapshot) MethodSets(ctx context.Context, ids ...PackageID) ([]*methodsets.Index, error) {
 	ctx, done := event.Start(ctx, "cache.snapshot.MethodSets")
 	defer done()
 
@@ -729,7 +790,14 @@ func (s *snapshot) MethodSets(ctx context.Context, ids ...PackageID) ([]*methods
 	return indexes, s.forEachPackage(ctx, ids, pre, post)
 }
 
-func (s *snapshot) MetadataForFile(ctx context.Context, uri span.URI) ([]*source.Metadata, error) {
+// MetadataForFile returns a new slice containing metadata for each
+// package containing the Go file identified by uri, ordered by the
+// number of CompiledGoFiles (i.e. "narrowest" to "widest" package),
+// and secondarily by IsIntermediateTestVariant (false < true).
+// The result may include tests and intermediate test variants of
+// importable packages.
+// It returns an error if the context was cancelled.
+func (s *Snapshot) MetadataForFile(ctx context.Context, uri protocol.DocumentURI) ([]*metadata.Package, error) {
 	if s.view.ViewType() == AdHocView {
 		// As described in golang/go#57209, in ad-hoc workspaces (where we load ./
 		// rather than ./...), preempting the directory load with file loads can
@@ -745,11 +813,11 @@ func (s *snapshot) MetadataForFile(ctx context.Context, uri span.URI) ([]*source
 	s.mu.Lock()
 
 	// Start with the set of package associations derived from the last load.
-	ids := s.meta.ids[uri]
+	ids := s.meta.IDs[uri]
 
 	shouldLoad := false // whether any packages containing uri are marked 'shouldLoad'
 	for _, id := range ids {
-		if len(s.shouldLoad[id]) > 0 {
+		if pkgs, _ := s.shouldLoad.Get(id); len(pkgs) > 0 {
 			shouldLoad = true
 		}
 	}
@@ -796,10 +864,10 @@ func (s *snapshot) MetadataForFile(ctx context.Context, uri span.URI) ([]*source
 	// Retrieve the metadata.
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ids = s.meta.ids[uri]
-	metas := make([]*source.Metadata, len(ids))
+	ids = s.meta.IDs[uri]
+	metas := make([]*metadata.Package, len(ids))
 	for i, id := range ids {
-		metas[i] = s.meta.metadata[id]
+		metas[i] = s.meta.Packages[id]
 		if metas[i] == nil {
 			panic("nil metadata")
 		}
@@ -829,7 +897,11 @@ func (s *snapshot) MetadataForFile(ctx context.Context, uri span.URI) ([]*source
 
 func boolLess(x, y bool) bool { return !x && y } // false < true
 
-func (s *snapshot) ReverseDependencies(ctx context.Context, id PackageID, transitive bool) (map[PackageID]*source.Metadata, error) {
+// ReverseDependencies returns a new mapping whose entries are
+// the ID and Metadata of each package in the workspace that
+// directly or transitively depend on the package denoted by id,
+// excluding id itself.
+func (s *Snapshot) ReverseDependencies(ctx context.Context, id PackageID, transitive bool) (map[PackageID]*metadata.Package, error) {
 	if err := s.awaitLoaded(ctx); err != nil {
 		return nil, err
 	}
@@ -837,9 +909,9 @@ func (s *snapshot) ReverseDependencies(ctx context.Context, id PackageID, transi
 	meta := s.meta
 	s.mu.Unlock()
 
-	var rdeps map[PackageID]*source.Metadata
+	var rdeps map[PackageID]*metadata.Package
 	if transitive {
-		rdeps = meta.reverseReflexiveTransitiveClosure(id)
+		rdeps = meta.ReverseReflexiveTransitiveClosure(id)
 
 		// Remove the original package ID from the map.
 		// (Callers all want irreflexivity but it's easier
@@ -848,9 +920,9 @@ func (s *snapshot) ReverseDependencies(ctx context.Context, id PackageID, transi
 
 	} else {
 		// direct reverse dependencies
-		rdeps = make(map[PackageID]*source.Metadata)
-		for _, rdepID := range meta.importedBy[id] {
-			if rdep := meta.metadata[rdepID]; rdep != nil {
+		rdeps = make(map[PackageID]*metadata.Package)
+		for _, rdepID := range meta.ImportedBy[id] {
+			if rdep := meta.Packages[rdepID]; rdep != nil {
 				rdeps[rdepID] = rdep
 			}
 		}
@@ -871,7 +943,7 @@ func (s *snapshot) ReverseDependencies(ctx context.Context, id PackageID, transi
 
 // getActivePackage returns a the memoized active package for id, if it exists.
 // If id is not active or has not yet been type-checked, it returns nil.
-func (s *snapshot) getActivePackage(id PackageID) *Package {
+func (s *Snapshot) getActivePackage(id PackageID) *Package {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -883,7 +955,7 @@ func (s *snapshot) getActivePackage(id PackageID) *Package {
 
 // setActivePackage checks if pkg is active, and if so either records it in
 // the active packages map or returns the existing memoized active package for id.
-func (s *snapshot) setActivePackage(id PackageID, pkg *Package) {
+func (s *Snapshot) setActivePackage(id PackageID, pkg *Package) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -898,12 +970,12 @@ func (s *snapshot) setActivePackage(id PackageID, pkg *Package) {
 	}
 }
 
-func (s *snapshot) resetActivePackagesLocked() {
+func (s *Snapshot) resetActivePackagesLocked() {
 	s.activePackages.Destroy()
 	s.activePackages = new(persistent.Map[PackageID, *Package])
 }
 
-func (s *snapshot) fileWatchingGlobPatterns(ctx context.Context) map[string]struct{} {
+func (s *Snapshot) fileWatchingGlobPatterns(ctx context.Context) map[string]struct{} {
 	extensions := "go,mod,sum,work"
 	for _, ext := range s.Options().TemplateExtensions {
 		extensions += "," + ext
@@ -917,8 +989,8 @@ func (s *snapshot) fileWatchingGlobPatterns(ctx context.Context) map[string]stru
 
 	// If GOWORK is outside the folder, ensure we are watching it.
 	gowork, _ := s.view.GOWORK()
-	if gowork != "" && !source.InDir(s.view.folder.Filename(), gowork.Filename()) {
-		patterns[gowork.Filename()] = struct{}{}
+	if gowork != "" && !pathutil.InDir(s.view.folder.Dir.Path(), gowork.Path()) {
+		patterns[gowork.Path()] = struct{}{}
 	}
 
 	// Add a pattern for each Go module in the workspace that is not within the view.
@@ -926,7 +998,7 @@ func (s *snapshot) fileWatchingGlobPatterns(ctx context.Context) map[string]stru
 	for _, dir := range dirs {
 		// If the directory is within the view's folder, we're already watching
 		// it with the first pattern above.
-		if source.InDir(s.view.folder.Filename(), dir) {
+		if pathutil.InDir(s.view.folder.Dir.Path(), dir) {
 			continue
 		}
 		// TODO(rstambler): If microsoft/vscode#3025 is resolved before
@@ -961,13 +1033,13 @@ func (s *snapshot) fileWatchingGlobPatterns(ctx context.Context) map[string]stru
 	return patterns
 }
 
-func (s *snapshot) addKnownSubdirs(patterns map[string]unit, wsDirs []string) {
+func (s *Snapshot) addKnownSubdirs(patterns map[string]unit, wsDirs []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.files.Dirs().Range(func(dir string) {
 		for _, wsDir := range wsDirs {
-			if source.InDir(wsDir, dir) {
+			if pathutil.InDir(wsDir, dir) {
 				patterns[dir] = unit{}
 			}
 		}
@@ -978,18 +1050,18 @@ func (s *snapshot) addKnownSubdirs(patterns map[string]unit, wsDirs []string) {
 //
 // A workspace directory is, roughly speaking, a directory for which we care
 // about file changes.
-func (s *snapshot) workspaceDirs(ctx context.Context) []string {
+func (s *Snapshot) workspaceDirs(ctx context.Context) []string {
 	dirSet := make(map[string]unit)
 
 	// Dirs should, at the very least, contain the working directory and folder.
-	dirSet[s.view.goCommandDir.Filename()] = unit{}
-	dirSet[s.view.folder.Filename()] = unit{}
+	dirSet[s.view.goCommandDir.Path()] = unit{}
+	dirSet[s.view.folder.Dir.Path()] = unit{}
 
 	// Additionally, if e.g. go.work indicates other workspace modules, we should
 	// include their directories too.
-	if s.workspaceModFilesErr == nil {
-		for modFile := range s.workspaceModFiles {
-			dir := filepath.Dir(modFile.Filename())
+	if s.view.workspaceModFilesErr == nil {
+		for modFile := range s.view.workspaceModFiles {
+			dir := filepath.Dir(modFile.Path())
 			dirSet[dir] = unit{}
 		}
 	}
@@ -1005,13 +1077,13 @@ func (s *snapshot) workspaceDirs(ctx context.Context) []string {
 // each relevant subdirectory. This is necessary only for clients (namely VS
 // Code) that do not send notifications for individual files in a directory
 // when the entire directory is deleted.
-func (s *snapshot) watchSubdirs() bool {
-	switch p := s.options.SubdirWatchPatterns; p {
-	case source.SubdirWatchPatternsOn:
+func (s *Snapshot) watchSubdirs() bool {
+	switch p := s.Options().SubdirWatchPatterns; p {
+	case settings.SubdirWatchPatternsOn:
 		return true
-	case source.SubdirWatchPatternsOff:
+	case settings.SubdirWatchPatternsOff:
 		return false
-	case source.SubdirWatchPatternsAuto:
+	case settings.SubdirWatchPatternsAuto:
 		// See the documentation of InternalOptions.SubdirWatchPatterns for an
 		// explanation of why VS Code gets a different default value here.
 		//
@@ -1019,7 +1091,7 @@ func (s *snapshot) watchSubdirs() bool {
 		// requirements that client names do not change. We should update the VS
 		// Code extension to set a default value of "subdirWatchPatterns" to "on",
 		// so that this workaround is only temporary.
-		if s.options.ClientInfo != nil && s.options.ClientInfo.Name == "Visual Studio Code" {
+		if s.Options().ClientInfo != nil && s.Options().ClientInfo.Name == "Visual Studio Code" {
 			return true
 		}
 		return false
@@ -1031,24 +1103,35 @@ func (s *snapshot) watchSubdirs() bool {
 
 // filesInDir returns all files observed by the snapshot that are contained in
 // a directory with the provided URI.
-func (s *snapshot) filesInDir(uri span.URI) []span.URI {
+func (s *Snapshot) filesInDir(uri protocol.DocumentURI) []protocol.DocumentURI {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	dir := uri.Filename()
+	dir := uri.Path()
 	if !s.files.Dirs().Contains(dir) {
 		return nil
 	}
-	var files []span.URI
-	s.files.Range(func(uri span.URI, _ source.FileHandle) {
-		if source.InDir(dir, uri.Filename()) {
+	var files []protocol.DocumentURI
+	s.files.Range(func(uri protocol.DocumentURI, _ file.Handle) {
+		if pathutil.InDir(dir, uri.Path()) {
 			files = append(files, uri)
 		}
 	})
 	return files
 }
 
-func (s *snapshot) WorkspaceMetadata(ctx context.Context) ([]*source.Metadata, error) {
+// WorkspaceMetadata returns a new, unordered slice containing
+// metadata for all ordinary and test packages (but not
+// intermediate test variants) in the workspace.
+//
+// The workspace is the set of modules typically defined by a
+// go.work file. It is not transitively closed: for example,
+// the standard library is not usually part of the workspace
+// even though every module in the workspace depends on it.
+//
+// Operations that must inspect all the dependencies of the
+// workspace packages should instead use AllMetadata.
+func (s *Snapshot) WorkspaceMetadata(ctx context.Context) ([]*metadata.Package, error) {
 	if err := s.awaitLoaded(ctx); err != nil {
 		return nil, err
 	}
@@ -1056,24 +1139,36 @@ func (s *snapshot) WorkspaceMetadata(ctx context.Context) ([]*source.Metadata, e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	meta := make([]*source.Metadata, 0, len(s.workspacePackages))
-	for id := range s.workspacePackages {
-		meta = append(meta, s.meta.metadata[id])
-	}
+	meta := make([]*metadata.Package, 0, s.workspacePackages.Len())
+	s.workspacePackages.Range(func(id PackageID, _ PackagePath) {
+		meta = append(meta, s.meta.Packages[id])
+	})
 	return meta, nil
+}
+
+// isWorkspacePackage reports whether the given package ID refers to a
+// workspace package for the snapshot.
+func (s *Snapshot) isWorkspacePackage(id PackageID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.workspacePackages.Value(id)
+	return ok
 }
 
 // Symbols extracts and returns symbol information for every file contained in
 // a loaded package. It awaits snapshot loading.
 //
-// TODO(rfindley): move this to the top of cache/symbols.go
-func (s *snapshot) Symbols(ctx context.Context, workspaceOnly bool) (map[span.URI][]source.Symbol, error) {
+// If workspaceOnly is set, this only includes symbols from files in a
+// workspace package. Otherwise, it returns symbols from all loaded packages.
+//
+// TODO(rfindley): move to symbols.go.
+func (s *Snapshot) Symbols(ctx context.Context, workspaceOnly bool) (map[protocol.DocumentURI][]Symbol, error) {
 	if err := s.awaitLoaded(ctx); err != nil {
 		return nil, err
 	}
 
 	var (
-		meta []*source.Metadata
+		meta []*metadata.Package
 		err  error
 	)
 	if workspaceOnly {
@@ -1085,12 +1180,12 @@ func (s *snapshot) Symbols(ctx context.Context, workspaceOnly bool) (map[span.UR
 		return nil, fmt.Errorf("loading metadata: %v", err)
 	}
 
-	goFiles := make(map[span.URI]struct{})
-	for _, m := range meta {
-		for _, uri := range m.GoFiles {
+	goFiles := make(map[protocol.DocumentURI]struct{})
+	for _, mp := range meta {
+		for _, uri := range mp.GoFiles {
 			goFiles[uri] = struct{}{}
 		}
-		for _, uri := range m.CompiledGoFiles {
+		for _, uri := range mp.CompiledGoFiles {
 			goFiles[uri] = struct{}{}
 		}
 	}
@@ -1100,7 +1195,7 @@ func (s *snapshot) Symbols(ctx context.Context, workspaceOnly bool) (map[span.UR
 		group    errgroup.Group
 		nprocs   = 2 * runtime.GOMAXPROCS(-1) // symbolize is a mix of I/O and CPU
 		resultMu sync.Mutex
-		result   = make(map[span.URI][]source.Symbol)
+		result   = make(map[protocol.DocumentURI][]Symbol)
 	)
 	group.SetLimit(nprocs)
 	for uri := range goFiles {
@@ -1124,7 +1219,16 @@ func (s *snapshot) Symbols(ctx context.Context, workspaceOnly bool) (map[span.UR
 	return result, nil
 }
 
-func (s *snapshot) AllMetadata(ctx context.Context) ([]*source.Metadata, error) {
+// AllMetadata returns a new unordered array of metadata for
+// all packages known to this snapshot, which includes the
+// packages of all workspace modules plus their transitive
+// import dependencies.
+//
+// It may also contain ad-hoc packages for standalone files.
+// It includes all test variants.
+//
+// TODO(rfindley): just return the metadata graph here.
+func (s *Snapshot) AllMetadata(ctx context.Context) ([]*metadata.Package, error) {
 	if err := s.awaitLoaded(ctx); err != nil {
 		return nil, err
 	}
@@ -1133,23 +1237,25 @@ func (s *snapshot) AllMetadata(ctx context.Context) ([]*source.Metadata, error) 
 	g := s.meta
 	s.mu.Unlock()
 
-	meta := make([]*source.Metadata, 0, len(g.metadata))
-	for _, m := range g.metadata {
-		meta = append(meta, m)
+	meta := make([]*metadata.Package, 0, len(g.Packages))
+	for _, mp := range g.Packages {
+		meta = append(meta, mp)
 	}
 	return meta, nil
 }
 
+// GoModForFile returns the URI of the go.mod file for the given URI.
+//
 // TODO(rfindley): clarify that this is only active modules. Or update to just
 // use findRootPattern.
-func (s *snapshot) GoModForFile(uri span.URI) span.URI {
-	return moduleForURI(s.workspaceModFiles, uri)
+func (s *Snapshot) GoModForFile(uri protocol.DocumentURI) protocol.DocumentURI {
+	return moduleForURI(s.view.workspaceModFiles, uri)
 }
 
-func moduleForURI(modFiles map[span.URI]struct{}, uri span.URI) span.URI {
-	var match span.URI
+func moduleForURI(modFiles map[protocol.DocumentURI]struct{}, uri protocol.DocumentURI) protocol.DocumentURI {
+	var match protocol.DocumentURI
 	for modURI := range modFiles {
-		if !source.InDir(filepath.Dir(modURI.Filename()), uri.Filename()) {
+		if !pathutil.InDir(filepath.Dir(modURI.Path()), uri.Path()) {
 			continue
 		}
 		if len(modURI) > len(match) {
@@ -1163,24 +1269,26 @@ func moduleForURI(modFiles map[span.URI]struct{}, uri span.URI) span.URI {
 // containing uri, or a parent of that directory.
 //
 // The given uri must be a file, not a directory.
-func nearestModFile(ctx context.Context, uri span.URI, fs source.FileSource) (span.URI, error) {
-	dir := filepath.Dir(uri.Filename())
+func nearestModFile(ctx context.Context, uri protocol.DocumentURI, fs file.Source) (protocol.DocumentURI, error) {
+	dir := filepath.Dir(uri.Path())
 	mod, err := findRootPattern(ctx, dir, "go.mod", fs)
 	if err != nil {
 		return "", err
 	}
-	return span.URIFromPath(mod), nil
+	return protocol.URIFromPath(mod), nil
 }
 
-func (s *snapshot) Metadata(id PackageID) *source.Metadata {
+// Metadata returns the metadata for the specified package,
+// or nil if it was not found.
+func (s *Snapshot) Metadata(id PackageID) *metadata.Package {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.meta.metadata[id]
+	return s.meta.Packages[id]
 }
 
 // clearShouldLoad clears package IDs that no longer need to be reloaded after
 // scopes has been loaded.
-func (s *snapshot) clearShouldLoad(scopes ...loadScope) {
+func (s *Snapshot) clearShouldLoad(scopes ...loadScope) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1189,27 +1297,30 @@ func (s *snapshot) clearShouldLoad(scopes ...loadScope) {
 		case packageLoadScope:
 			scopePath := PackagePath(scope)
 			var toDelete []PackageID
-			for id, pkgPaths := range s.shouldLoad {
+			s.shouldLoad.Range(func(id PackageID, pkgPaths []PackagePath) {
 				for _, pkgPath := range pkgPaths {
 					if pkgPath == scopePath {
 						toDelete = append(toDelete, id)
 					}
 				}
-			}
+			})
 			for _, id := range toDelete {
-				delete(s.shouldLoad, id)
+				s.shouldLoad.Delete(id)
 			}
 		case fileLoadScope:
-			uri := span.URI(scope)
-			ids := s.meta.ids[uri]
+			uri := protocol.DocumentURI(scope)
+			ids := s.meta.IDs[uri]
 			for _, id := range ids {
-				delete(s.shouldLoad, id)
+				s.shouldLoad.Delete(id)
 			}
 		}
 	}
 }
 
-func (s *snapshot) FindFile(uri span.URI) source.FileHandle {
+// FindFile returns the FileHandle for the given URI, if it is already
+// in the given snapshot.
+// TODO(adonovan): delete this operation; use ReadFile instead.
+func (s *Snapshot) FindFile(uri protocol.DocumentURI) file.Handle {
 	s.view.markKnown(uri)
 
 	s.mu.Lock()
@@ -1224,23 +1335,34 @@ func (s *snapshot) FindFile(uri span.URI) source.FileHandle {
 //
 // ReadFile succeeds even if the file does not exist. A non-nil error return
 // indicates some type of internal error, for example if ctx is cancelled.
-func (s *snapshot) ReadFile(ctx context.Context, uri span.URI) (source.FileHandle, error) {
+func (s *Snapshot) ReadFile(ctx context.Context, uri protocol.DocumentURI) (file.Handle, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return lockedSnapshot{s}.ReadFile(ctx, uri)
+	s.view.markKnown(uri)
+
+	fh, ok := s.files.Get(uri)
+	if !ok {
+		var err error
+		fh, err = s.view.fs.ReadFile(ctx, uri)
+		if err != nil {
+			return nil, err
+		}
+		s.files.Set(uri, fh)
+	}
+	return fh, nil
 }
 
 // preloadFiles delegates to the view FileSource to read the requested uris in
 // parallel, without holding the snapshot lock.
-func (s *snapshot) preloadFiles(ctx context.Context, uris []span.URI) {
-	files := make([]source.FileHandle, len(uris))
+func (s *Snapshot) preloadFiles(ctx context.Context, uris []protocol.DocumentURI) {
+	files := make([]file.Handle, len(uris))
 	var wg sync.WaitGroup
 	iolimit := make(chan struct{}, 20) // I/O concurrency limiting semaphore
 	for i, uri := range uris {
 		wg.Add(1)
 		iolimit <- struct{}{}
-		go func(i int, uri span.URI) {
+		go func(i int, uri protocol.DocumentURI) {
 			defer wg.Done()
 			fh, err := s.view.fs.ReadFile(ctx, uri)
 			<-iolimit
@@ -1267,25 +1389,8 @@ func (s *snapshot) preloadFiles(ctx context.Context, uris []span.URI) {
 	}
 }
 
-// A lockedSnapshot implements the source.FileSource interface while holding
-// the lock for the wrapped snapshot.
-type lockedSnapshot struct{ wrapped *snapshot }
-
-func (s lockedSnapshot) ReadFile(ctx context.Context, uri span.URI) (source.FileHandle, error) {
-	s.wrapped.view.markKnown(uri)
-	if fh, ok := s.wrapped.files.Get(uri); ok {
-		return fh, nil
-	}
-
-	fh, err := s.wrapped.view.fs.ReadFile(ctx, uri)
-	if err != nil {
-		return nil, err
-	}
-	s.wrapped.files.Set(uri, fh)
-	return fh, nil
-}
-
-func (s *snapshot) IsOpen(uri span.URI) bool {
+// IsOpen returns whether the editor currently has a file open.
+func (s *Snapshot) IsOpen(uri protocol.DocumentURI) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1295,7 +1400,7 @@ func (s *snapshot) IsOpen(uri span.URI) bool {
 }
 
 // TODO(rfindley): it would make sense for awaitLoaded to return metadata.
-func (s *snapshot) awaitLoaded(ctx context.Context) error {
+func (s *Snapshot) awaitLoaded(ctx context.Context) error {
 	loadErr := s.awaitLoadedAllErrors(ctx)
 
 	// TODO(rfindley): eliminate this function as part of simplifying
@@ -1306,13 +1411,16 @@ func (s *snapshot) awaitLoaded(ctx context.Context) error {
 	return nil
 }
 
-func (s *snapshot) CriticalError(ctx context.Context) *source.CriticalError {
+// CriticalError returns any critical errors in the workspace.
+//
+// A nil result may mean success, or context cancellation.
+func (s *Snapshot) CriticalError(ctx context.Context) *CriticalError {
 	// If we couldn't compute workspace mod files, then the load below is
 	// invalid.
 	//
 	// TODO(rfindley): is this a clear error to present to the user?
-	if s.workspaceModFilesErr != nil {
-		return &source.CriticalError{MainError: s.workspaceModFilesErr}
+	if s.view.workspaceModFilesErr != nil {
+		return &CriticalError{MainError: s.view.workspaceModFilesErr}
 	}
 
 	loadErr := s.awaitLoadedAllErrors(ctx)
@@ -1325,7 +1433,7 @@ func (s *snapshot) CriticalError(ctx context.Context) *source.CriticalError {
 	if loadErr == nil {
 		active, _ := s.WorkspaceMetadata(ctx)
 		if msg := shouldShowAdHocPackagesWarning(s, active); msg != "" {
-			return &source.CriticalError{
+			return &CriticalError{
 				MainError: errors.New(msg),
 			}
 		}
@@ -1343,11 +1451,11 @@ func (s *snapshot) CriticalError(ctx context.Context) *source.CriticalError {
 			err, diags := s.workspaceLayoutError(ctx)
 			if err != nil {
 				if ctx.Err() != nil {
-					return nil // see the API documentation for source.Snapshot
+					return nil // see the API documentation for Snapshot
 				}
-				return &source.CriticalError{
+				return &CriticalError{
 					MainError:   err,
-					Diagnostics: diags,
+					Diagnostics: maps.Group(diags, byURI),
 				}
 			}
 		}
@@ -1358,11 +1466,11 @@ func (s *snapshot) CriticalError(ctx context.Context) *source.CriticalError {
 		err, diags := s.workspaceLayoutError(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil // see the API documentation for source.Snapshot
+				return nil // see the API documentation for Snapshot
 			}
-			return &source.CriticalError{
+			return &CriticalError{
 				MainError:   err,
-				Diagnostics: diags,
+				Diagnostics: maps.Group(diags, byURI),
 			}
 		}
 	}
@@ -1374,12 +1482,12 @@ const adHocPackagesWarning = `You are outside of a module and outside of $GOPATH
 If you are using modules, please open your editor to a directory in your module.
 If you believe this warning is incorrect, please file an issue: https://github.com/golang/go/issues/new.`
 
-func shouldShowAdHocPackagesWarning(snapshot *snapshot, active []*source.Metadata) string {
+func shouldShowAdHocPackagesWarning(snapshot *Snapshot, active []*metadata.Package) string {
 	if !snapshot.validBuildConfiguration() {
-		for _, m := range active {
+		for _, mp := range active {
 			// A blank entry in DepsByImpPath
 			// indicates a missing dependency.
-			for _, importID := range m.DepsByImpPath {
+			for _, importID := range mp.DepsByImpPath {
 				if importID == "" {
 					return adHocPackagesWarning
 				}
@@ -1389,16 +1497,16 @@ func shouldShowAdHocPackagesWarning(snapshot *snapshot, active []*source.Metadat
 	return ""
 }
 
-func containsCommandLineArguments(metas []*source.Metadata) bool {
-	for _, m := range metas {
-		if source.IsCommandLineArguments(m.ID) {
+func containsCommandLineArguments(metas []*metadata.Package) bool {
+	for _, mp := range metas {
+		if metadata.IsCommandLineArguments(mp.ID) {
 			return true
 		}
 	}
 	return false
 }
 
-func (s *snapshot) awaitLoadedAllErrors(ctx context.Context) *source.CriticalError {
+func (s *Snapshot) awaitLoadedAllErrors(ctx context.Context) *CriticalError {
 	// Do not return results until the snapshot's view has been initialized.
 	s.AwaitInitialized(ctx)
 
@@ -1416,7 +1524,7 @@ func (s *snapshot) awaitLoadedAllErrors(ctx context.Context) *source.CriticalErr
 	// Also: GetCriticalError ignores context cancellation errors. Should we be
 	// returning nil here?
 	if ctx.Err() != nil {
-		return &source.CriticalError{MainError: ctx.Err()}
+		return &CriticalError{MainError: ctx.Err()}
 	}
 
 	// TODO(rfindley): reloading is not idempotent: if we try to reload or load
@@ -1426,30 +1534,31 @@ func (s *snapshot) awaitLoadedAllErrors(ctx context.Context) *source.CriticalErr
 
 	if err := s.reloadWorkspace(ctx); err != nil {
 		diags := s.extractGoCommandErrors(ctx, err)
-		return &source.CriticalError{
+		return &CriticalError{
 			MainError:   err,
-			Diagnostics: diags,
+			Diagnostics: maps.Group(diags, byURI),
 		}
 	}
 
 	if err := s.reloadOrphanedOpenFiles(ctx); err != nil {
 		diags := s.extractGoCommandErrors(ctx, err)
-		return &source.CriticalError{
+		return &CriticalError{
 			MainError:   err,
-			Diagnostics: diags,
+			Diagnostics: maps.Group(diags, byURI),
 		}
 	}
 	return nil
 }
 
-func (s *snapshot) getInitializationError() *source.CriticalError {
+func (s *Snapshot) getInitializationError() *CriticalError {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	return s.initializedErr
 }
 
-func (s *snapshot) AwaitInitialized(ctx context.Context) {
+// AwaitInitialized waits until the snapshot's view is initialized.
+func (s *Snapshot) AwaitInitialized(ctx context.Context) {
 	select {
 	case <-ctx.Done():
 		return
@@ -1461,11 +1570,11 @@ func (s *snapshot) AwaitInitialized(ctx context.Context) {
 }
 
 // reloadWorkspace reloads the metadata for all invalidated workspace packages.
-func (s *snapshot) reloadWorkspace(ctx context.Context) error {
+func (s *Snapshot) reloadWorkspace(ctx context.Context) error {
 	var scopes []loadScope
 	var seen map[PackagePath]bool
 	s.mu.Lock()
-	for _, pkgPaths := range s.shouldLoad {
+	s.shouldLoad.Range(func(_ PackageID, pkgPaths []PackagePath) {
 		for _, pkgPath := range pkgPaths {
 			if seen == nil {
 				seen = make(map[PackagePath]bool)
@@ -1476,7 +1585,7 @@ func (s *snapshot) reloadWorkspace(ctx context.Context) error {
 			seen[pkgPath] = true
 			scopes = append(scopes, packageLoadScope(pkgPath))
 		}
-	}
+	})
 	s.mu.Unlock()
 
 	if len(scopes) == 0 {
@@ -1505,7 +1614,7 @@ func (s *snapshot) reloadWorkspace(ctx context.Context) error {
 // canceled, any files still not contained in a package are marked as unloadable.
 //
 // An error is returned if the load is canceled.
-func (s *snapshot) reloadOrphanedOpenFiles(ctx context.Context) error {
+func (s *Snapshot) reloadOrphanedOpenFiles(ctx context.Context) error {
 	s.mu.Lock()
 	meta := s.meta
 	s.mu.Unlock()
@@ -1517,10 +1626,10 @@ func (s *snapshot) reloadOrphanedOpenFiles(ctx context.Context) error {
 	var files []*Overlay
 	for _, o := range open {
 		uri := o.URI()
-		if s.IsBuiltin(uri) || s.FileKind(o) != source.Go {
+		if s.IsBuiltin(uri) || s.FileKind(o) != file.Go {
 			continue
 		}
-		if len(meta.ids[uri]) == 0 {
+		if len(meta.IDs[uri]) == 0 {
 			files = append(files, o)
 		}
 	}
@@ -1540,7 +1649,7 @@ func (s *snapshot) reloadOrphanedOpenFiles(ctx context.Context) error {
 		return nil
 	}
 
-	var uris []span.URI
+	var uris []protocol.DocumentURI
 	for _, file := range files {
 		uris = append(uris, file.URI())
 	}
@@ -1591,7 +1700,7 @@ func (s *snapshot) reloadOrphanedOpenFiles(ctx context.Context) error {
 		// TODO(rfindley): instead of locking here, we should have load return the
 		// metadata graph that resulted from loading.
 		uri := file.URI()
-		if len(s.meta.ids[uri]) == 0 {
+		if len(s.meta.IDs[uri]) == 0 {
 			s.unloadableFiles.Add(uri)
 		}
 	}
@@ -1605,10 +1714,11 @@ func (s *snapshot) reloadOrphanedOpenFiles(ctx context.Context) error {
 // If the resulting diagnostic is nil, the file is either not orphaned or we
 // can't produce a good diagnostic.
 //
+// The caller must not mutate the result.
 // TODO(rfindley): reconcile the definition of "orphaned" here with
 // reloadOrphanedFiles. The latter does not include files with
 // command-line-arguments packages.
-func (s *snapshot) OrphanedFileDiagnostics(ctx context.Context) (map[span.URI]*source.Diagnostic, error) {
+func (s *Snapshot) OrphanedFileDiagnostics(ctx context.Context) (map[protocol.DocumentURI][]*Diagnostic, error) {
 	if err := s.awaitLoaded(ctx); err != nil {
 		return nil, err
 	}
@@ -1618,15 +1728,15 @@ func (s *snapshot) OrphanedFileDiagnostics(ctx context.Context) (map[span.URI]*s
 searchOverlays:
 	for _, o := range s.overlays() {
 		uri := o.URI()
-		if s.IsBuiltin(uri) || s.FileKind(o) != source.Go {
+		if s.IsBuiltin(uri) || s.FileKind(o) != file.Go {
 			continue
 		}
-		md, err := s.MetadataForFile(ctx, uri)
+		mps, err := s.MetadataForFile(ctx, uri)
 		if err != nil {
 			return nil, err
 		}
-		for _, m := range md {
-			if !source.IsCommandLineArguments(m.ID) || m.Standalone {
+		for _, mp := range mps {
+			if !metadata.IsCommandLineArguments(mp.ID) || mp.Standalone {
 				continue searchOverlays
 			}
 		}
@@ -1636,8 +1746,8 @@ searchOverlays:
 		return nil, nil
 	}
 
-	loadedModFiles := make(map[span.URI]struct{}) // all mod files, including dependencies
-	ignoredFiles := make(map[span.URI]bool)       // files reported in packages.Package.IgnoredFiles
+	loadedModFiles := make(map[protocol.DocumentURI]struct{}) // all mod files, including dependencies
+	ignoredFiles := make(map[protocol.DocumentURI]bool)       // files reported in packages.Package.IgnoredFiles
 
 	meta, err := s.AllMetadata(ctx)
 	if err != nil {
@@ -1646,7 +1756,7 @@ searchOverlays:
 
 	for _, meta := range meta {
 		if meta.Module != nil && meta.Module.GoMod != "" {
-			gomod := span.URIFromPath(meta.Module.GoMod)
+			gomod := protocol.URIFromPath(meta.Module.GoMod)
 			loadedModFiles[gomod] = struct{}{}
 		}
 		for _, ignored := range meta.IgnoredFiles {
@@ -1654,13 +1764,15 @@ searchOverlays:
 		}
 	}
 
-	diagnostics := make(map[span.URI]*source.Diagnostic)
+	// Note: diagnostics holds a slice for consistency with other diagnostic
+	// funcs.
+	diagnostics := make(map[protocol.DocumentURI][]*Diagnostic)
 	for _, fh := range files {
 		// Only warn about orphaned files if the file is well-formed enough to
 		// actually be part of a package.
 		//
 		// Use ParseGo as for open files this is likely to be a cache hit (we'll have )
-		pgf, err := s.ParseGo(ctx, fh, source.ParseHeader)
+		pgf, err := s.ParseGo(ctx, fh, ParseHeader)
 		if err != nil {
 			continue
 		}
@@ -1673,8 +1785,8 @@ searchOverlays:
 		}
 
 		var (
-			msg            string                // if non-empty, report a diagnostic with this message
-			suggestedFixes []source.SuggestedFix // associated fixes, if any
+			msg            string         // if non-empty, report a diagnostic with this message
+			suggestedFixes []SuggestedFix // associated fixes, if any
 		)
 
 		// If we have a relevant go.mod file, check whether the file is orphaned
@@ -1683,12 +1795,12 @@ searchOverlays:
 		// is harder to be precise in that case, and less important.
 		if goMod, err := nearestModFile(ctx, fh.URI(), s); err == nil && goMod != "" {
 			if _, ok := loadedModFiles[goMod]; !ok {
-				modDir := filepath.Dir(goMod.Filename())
-				viewDir := s.view.folder.Filename()
+				modDir := filepath.Dir(goMod.Path())
+				viewDir := s.view.folder.Dir.Path()
 
 				// When the module is underneath the view dir, we offer
 				// "use all modules" quick-fixes.
-				inDir := source.InDir(viewDir, modDir)
+				inDir := pathutil.InDir(viewDir, modDir)
 
 				if rel, err := filepath.Rel(viewDir, modDir); err == nil {
 					modDir = rel
@@ -1702,7 +1814,7 @@ searchOverlays:
 							ViewID: s.view.ID(),
 							Args:   []string{"use", modDir},
 						}); err == nil {
-							suggestedFixes = append(suggestedFixes, source.SuggestedFix{
+							suggestedFixes = append(suggestedFixes, SuggestedFix{
 								Title:      "Use this module in your go.work file",
 								Command:    &cmd,
 								ActionKind: protocol.QuickFix,
@@ -1714,7 +1826,7 @@ searchOverlays:
 								ViewID: s.view.ID(),
 								Args:   []string{"use", "-r", "."},
 							}); err == nil {
-								suggestedFixes = append(suggestedFixes, source.SuggestedFix{
+								suggestedFixes = append(suggestedFixes, SuggestedFix{
 									Title:      "Use all modules in your workspace",
 									Command:    &cmd,
 									ActionKind: protocol.QuickFix,
@@ -1729,7 +1841,7 @@ searchOverlays:
 							InitFirst: true,
 							Args:      []string{"use", modDir},
 						}); err == nil {
-							suggestedFixes = []source.SuggestedFix{
+							suggestedFixes = []SuggestedFix{
 								{
 									Title:      "Add a go.work file using this module",
 									Command:    &cmd,
@@ -1744,7 +1856,7 @@ searchOverlays:
 								InitFirst: true,
 								Args:      []string{"use", "-r", "."},
 							}); err == nil {
-								suggestedFixes = append(suggestedFixes, source.SuggestedFix{
+								suggestedFixes = append(suggestedFixes, SuggestedFix{
 									Title:      "Add a go.work file using all modules in your workspace",
 									Command:    &cmd,
 									ActionKind: protocol.QuickFix,
@@ -1756,6 +1868,7 @@ searchOverlays:
 					fix = `To work with multiple modules simultaneously, please upgrade to Go 1.18 or
 later, reinstall gopls, and use a go.work file.`
 				}
+
 				msg = fmt.Sprintf(`This file is within module %q, which is not included in your workspace.
 %s
 See the documentation for more information on setting up your workspace:
@@ -1763,41 +1876,48 @@ https://github.com/golang/tools/blob/master/gopls/doc/workspace.md.`, modDir, fi
 			}
 		}
 
-		if msg == "" && ignoredFiles[fh.URI()] {
-			// TODO(rfindley): use the constraint package to check if the file
-			// _actually_ satisfies the current build context.
-			hasConstraint := false
-			walkConstraints(pgf.File, func(constraint.Expr) bool {
-				hasConstraint = true
-				return false
-			})
-			var fix string
-			if hasConstraint {
-				fix = `This file may be excluded due to its build tags; try adding "-tags=<build tag>" to your gopls "buildFlags" configuration
+		if msg == "" {
+			if ignoredFiles[fh.URI()] {
+				// TODO(rfindley): use the constraint package to check if the file
+				// _actually_ satisfies the current build context.
+				hasConstraint := false
+				walkConstraints(pgf.File, func(constraint.Expr) bool {
+					hasConstraint = true
+					return false
+				})
+				var fix string
+				if hasConstraint {
+					fix = `This file may be excluded due to its build tags; try adding "-tags=<build tag>" to your gopls "buildFlags" configuration
 See the documentation for more information on working with build tags:
 https://github.com/golang/tools/blob/master/gopls/doc/settings.md#buildflags-string.`
-			} else if strings.Contains(filepath.Base(fh.URI().Filename()), "_") {
-				fix = `This file may be excluded due to its GOOS/GOARCH, or other build constraints.`
+				} else if strings.Contains(filepath.Base(fh.URI().Path()), "_") {
+					fix = `This file may be excluded due to its GOOS/GOARCH, or other build constraints.`
+				} else {
+					fix = `This file is ignored by your gopls build.` // we don't know why
+				}
+				msg = fmt.Sprintf("No packages found for open file %s.\n%s", fh.URI().Path(), fix)
 			} else {
-				fix = `This file is ignored by your gopls build.` // we don't know why
+				// Fall back: we're not sure why the file is orphaned.
+				// TODO(rfindley): we could do better here, diagnosing the lack of a
+				// go.mod file and malformed file names (see the perc%ent marker test).
+				msg = fmt.Sprintf("No packages found for open file %s.", fh.URI().Path())
 			}
-			msg = fmt.Sprintf("No packages found for open file %s.\n%s", fh.URI().Filename(), fix)
 		}
 
 		if msg != "" {
-			d := &source.Diagnostic{
+			d := &Diagnostic{
 				URI:            fh.URI(),
 				Range:          rng,
 				Severity:       protocol.SeverityWarning,
-				Source:         source.ListError,
+				Source:         ListError,
 				Message:        msg,
 				SuggestedFixes: suggestedFixes,
 			}
-			if ok := source.BundleQuickFixes(d); !ok {
+			if ok := BundleQuickFixes(d); !ok {
 				bug.Reportf("failed to bundle quick fixes for %v", d)
 			}
 			// Only report diagnostics if we detect an actual exclusion.
-			diagnostics[fh.URI()] = d
+			diagnostics[fh.URI()] = append(diagnostics[fh.URI()], d)
 		}
 	}
 	return diagnostics, nil
@@ -1810,14 +1930,15 @@ https://github.com/golang/tools/blob/master/gopls/doc/settings.md#buildflags-str
 //
 // Most likely, each call site of inVendor needs to be reconsidered to
 // understand and correctly implement the desired behavior.
-func inVendor(uri span.URI) bool {
+func inVendor(uri protocol.DocumentURI) bool {
 	_, after, found := strings.Cut(string(uri), "/vendor/")
 	// Only subdirectories of /vendor/ are considered vendored
 	// (/vendor/a/foo.go is vendored, /vendor/foo.go is not).
 	return found && strings.Contains(after, "/")
 }
 
-func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]source.FileHandle, newOptions *source.Options, forceReloadMetadata bool) (*snapshot, func()) {
+func (s *Snapshot) clone(ctx, bgCtx context.Context, changed StateChange) (*Snapshot, func()) {
+	changedFiles := changed.Files
 	ctx, done := event.Start(ctx, "cache.snapshot.clone")
 	defer done()
 
@@ -1825,36 +1946,32 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]source
 	defer s.mu.Unlock()
 
 	bgCtx, cancel := context.WithCancel(bgCtx)
-	result := &snapshot{
-		sequenceID:           s.sequenceID + 1,
-		globalID:             nextSnapshotID(),
-		store:                s.store,
-		view:                 s.view,
-		backgroundCtx:        bgCtx,
-		cancel:               cancel,
-		builtin:              s.builtin,
-		initialized:          s.initialized,
-		initializedErr:       s.initializedErr,
-		packages:             s.packages.Clone(),
-		activePackages:       s.activePackages.Clone(),
-		files:                s.files.Clone(changes),
-		symbolizeHandles:     cloneWithout(s.symbolizeHandles, changes),
-		workspacePackages:    make(map[PackageID]PackagePath, len(s.workspacePackages)),
-		unloadableFiles:      s.unloadableFiles.Clone(), // not cloneWithout: typing in a file doesn't necessarily make it loadable
-		parseModHandles:      cloneWithout(s.parseModHandles, changes),
-		parseWorkHandles:     cloneWithout(s.parseWorkHandles, changes),
-		modTidyHandles:       cloneWithout(s.modTidyHandles, changes),
-		modWhyHandles:        cloneWithout(s.modWhyHandles, changes),
-		modVulnHandles:       cloneWithout(s.modVulnHandles, changes),
-		workspaceModFiles:    s.workspaceModFiles,
-		workspaceModFilesErr: s.workspaceModFilesErr,
-		importGraph:          s.importGraph,
-		pkgIndex:             s.pkgIndex,
-		options:              s.options,
-	}
-
-	if newOptions != nil {
-		result.options = newOptions
+	result := &Snapshot{
+		sequenceID:        s.sequenceID + 1,
+		globalID:          nextSnapshotID(),
+		store:             s.store,
+		view:              s.view,
+		backgroundCtx:     bgCtx,
+		cancel:            cancel,
+		builtin:           s.builtin,
+		initialized:       s.initialized,
+		initializedErr:    s.initializedErr,
+		packages:          s.packages.Clone(),
+		activePackages:    s.activePackages.Clone(),
+		files:             s.files.Clone(changedFiles),
+		symbolizeHandles:  cloneWithout(s.symbolizeHandles, changedFiles),
+		workspacePackages: s.workspacePackages,
+		shouldLoad:        s.shouldLoad.Clone(),      // not cloneWithout: shouldLoad is cleared on loads
+		unloadableFiles:   s.unloadableFiles.Clone(), // not cloneWithout: typing in a file doesn't necessarily make it loadable
+		parseModHandles:   cloneWithout(s.parseModHandles, changedFiles),
+		parseWorkHandles:  cloneWithout(s.parseWorkHandles, changedFiles),
+		modTidyHandles:    cloneWithout(s.modTidyHandles, changedFiles),
+		modWhyHandles:     cloneWithout(s.modWhyHandles, changedFiles),
+		modVulnHandles:    cloneWithout(s.modVulnHandles, changedFiles),
+		importGraph:       s.importGraph,
+		pkgIndex:          s.pkgIndex,
+		moduleUpgrades:    cloneWith(s.moduleUpgrades, changed.ModuleUpgrades),
+		vulns:             cloneWith(s.vulns, changed.Vulns),
 	}
 
 	// Create a lease on the new snapshot.
@@ -1871,7 +1988,7 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]source
 	// vendor tree after 'go mod vendor' or 'rm -fr vendor/'.
 	//
 	// TODO(rfindley): revisit the location of this check.
-	for uri := range changes {
+	for uri := range changedFiles {
 		if inVendor(uri) && s.initializedErr != nil ||
 			strings.HasSuffix(string(uri), "/vendor/modules.txt") {
 			reinit = true
@@ -1883,8 +2000,8 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]source
 	// they exist. Importantly, we don't call ReadFile here: consider the case
 	// where a file is added on disk; we don't want to read the newly added file
 	// into the old snapshot, as that will break our change detection below.
-	oldFiles := make(map[span.URI]source.FileHandle)
-	for uri := range changes {
+	oldFiles := make(map[protocol.DocumentURI]file.Handle)
+	for uri := range changedFiles {
 		if fh, ok := s.files.Get(uri); ok {
 			oldFiles[uri] = fh
 		}
@@ -1894,46 +2011,37 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]source
 	// the old file wasn't saved, or the on-disk contents changed.
 	//
 	// oldFH may be nil.
-	changedOnDisk := func(oldFH, newFH source.FileHandle) bool {
+	changedOnDisk := func(oldFH, newFH file.Handle) bool {
 		if !newFH.SameContentsOnDisk() {
 			return false
 		}
 		if oe, ne := (oldFH != nil && fileExists(oldFH)), fileExists(newFH); !oe || !ne {
 			return oe != ne
 		}
-		return !oldFH.SameContentsOnDisk() || oldFH.FileIdentity() != newFH.FileIdentity()
-	}
-
-	if workURI, _ := s.view.GOWORK(); workURI != "" {
-		if newFH, ok := changes[workURI]; ok {
-			result.workspaceModFiles, result.workspaceModFilesErr = computeWorkspaceModFiles(ctx, s.view.gomod, workURI, s.view.effectiveGO111MODULE(), result)
-			if changedOnDisk(oldFiles[workURI], newFH) {
-				reinit = true
-			}
-		}
+		return !oldFH.SameContentsOnDisk() || oldFH.Identity() != newFH.Identity()
 	}
 
 	// Reinitialize if any workspace mod file has changed on disk.
-	for uri, newFH := range changes {
-		if _, ok := result.workspaceModFiles[uri]; ok && changedOnDisk(oldFiles[uri], newFH) {
+	for uri, newFH := range changedFiles {
+		if _, ok := result.view.workspaceModFiles[uri]; ok && changedOnDisk(oldFiles[uri], newFH) {
 			reinit = true
 		}
 	}
 
 	// Finally, process sumfile changes that may affect loading.
-	for uri, newFH := range changes {
+	for uri, newFH := range changedFiles {
 		if !changedOnDisk(oldFiles[uri], newFH) {
 			continue // like with go.mod files, we only reinit when things change on disk
 		}
-		dir, base := filepath.Split(uri.Filename())
+		dir, base := filepath.Split(uri.Path())
 		if base == "go.work.sum" && s.view.gowork != "" {
 			if dir == filepath.Dir(s.view.gowork) {
 				reinit = true
 			}
 		}
 		if base == "go.sum" {
-			modURI := span.URIFromPath(filepath.Join(dir, "go.mod"))
-			if _, active := result.workspaceModFiles[modURI]; active {
+			modURI := protocol.URIFromPath(filepath.Join(dir, "go.mod"))
+			if _, active := result.view.workspaceModFiles[modURI]; active {
 				reinit = true
 			}
 		}
@@ -1951,7 +2059,7 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]source
 
 	// Invalidate all package metadata if the workspace module has changed.
 	if reinit {
-		for k := range s.meta.metadata {
+		for k := range s.meta.Packages {
 			// TODO(rfindley): this seems brittle; can we just start over?
 			directIDs[k] = true
 		}
@@ -1962,7 +2070,7 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]source
 	anyFileOpenedOrClosed := false // opened files affect workspace packages
 	anyFileAdded := false          // adding a file can resolve missing dependencies
 
-	for uri, newFH := range changes {
+	for uri, newFH := range changedFiles {
 		// The original FileHandle for this URI is cached on the snapshot.
 		oldFH, _ := oldFiles[uri] // may be nil
 		_, oldOpen := oldFH.(*Overlay)
@@ -1976,7 +2084,7 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]source
 		// because the file type that matters is not what the *client* tells us,
 		// but what the Go command sees.
 		var invalidateMetadata, pkgFileChanged, importDeleted bool
-		if strings.HasSuffix(uri.Filename(), ".go") {
+		if strings.HasSuffix(uri.Path(), ".go") {
 			invalidateMetadata, pkgFileChanged, importDeleted = metadataChanges(ctx, s, oldFH, newFH)
 		}
 		if invalidateMetadata {
@@ -1984,11 +2092,11 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]source
 			result.unloadableFiles.Remove(uri)
 		}
 
-		invalidateMetadata = invalidateMetadata || forceReloadMetadata || reinit
+		invalidateMetadata = invalidateMetadata || reinit
 		anyImportDeleted = anyImportDeleted || importDeleted
 
 		// Mark all of the package IDs containing the given file.
-		filePackageIDs := invalidatedPackageIDs(uri, s.meta.ids, pkgFileChanged)
+		filePackageIDs := invalidatedPackageIDs(uri, s.meta.IDs, pkgFileChanged)
 		for id := range filePackageIDs {
 			directIDs[id] = directIDs[id] || invalidateMetadata // may insert 'false'
 		}
@@ -2050,8 +2158,8 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]source
 	// from an unparseable state to a parseable state, as we don't have a
 	// starting point to compare with.
 	if anyImportDeleted {
-		for id, metadata := range s.meta.metadata {
-			if len(metadata.Errors) > 0 {
+		for id, mp := range s.meta.Packages {
+			if len(mp.Errors) > 0 {
 				directIDs[id] = true
 			}
 		}
@@ -2063,8 +2171,8 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]source
 	// fixed, but until that proves necessary, just invalidate metadata for any
 	// package with missing dependencies.
 	if anyFileAdded {
-		for id, metadata := range s.meta.metadata {
-			for _, impID := range metadata.DepsByImpPath {
+		for id, mp := range s.meta.Packages {
+			for _, impID := range mp.DepsByImpPath {
 				if impID == "" { // missing import
 					directIDs[id] = true
 					break
@@ -2089,7 +2197,7 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]source
 			return
 		}
 		idsToInvalidate[id] = newInvalidateMetadata
-		for _, rid := range s.meta.importedBy[id] {
+		for _, rid := range s.meta.ImportedBy[id] {
 			addRevDeps(rid, invalidateMetadata)
 		}
 	}
@@ -2110,51 +2218,39 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]source
 		result.activePackages.Delete(id)
 	}
 
-	// Any packages that need loading in s still need loading in the new
-	// snapshot.
-	for k, v := range s.shouldLoad {
-		if result.shouldLoad == nil {
-			result.shouldLoad = make(map[PackageID][]PackagePath)
-		}
-		result.shouldLoad[k] = v
-	}
-
 	// Compute which metadata updates are required. We only need to invalidate
 	// packages directly containing the affected file, and only if it changed in
 	// a relevant way.
-	metadataUpdates := make(map[PackageID]*source.Metadata)
-	for k, v := range s.meta.metadata {
-		invalidateMetadata := idsToInvalidate[k]
+	metadataUpdates := make(map[PackageID]*metadata.Package)
+	for id, mp := range s.meta.Packages {
+		invalidateMetadata := idsToInvalidate[id]
 
 		// For metadata that has been newly invalidated, capture package paths
 		// requiring reloading in the shouldLoad map.
-		if invalidateMetadata && !source.IsCommandLineArguments(v.ID) {
-			if result.shouldLoad == nil {
-				result.shouldLoad = make(map[PackageID][]PackagePath)
-			}
-			needsReload := []PackagePath{v.PkgPath}
-			if v.ForTest != "" && v.ForTest != v.PkgPath {
+		if invalidateMetadata && !metadata.IsCommandLineArguments(mp.ID) {
+			needsReload := []PackagePath{mp.PkgPath}
+			if mp.ForTest != "" && mp.ForTest != mp.PkgPath {
 				// When reloading test variants, always reload their ForTest package as
 				// well. Otherwise, we may miss test variants in the resulting load.
 				//
 				// TODO(rfindley): is this actually sufficient? Is it possible that
 				// other test variants may be invalidated? Either way, we should
 				// determine exactly what needs to be reloaded here.
-				needsReload = append(needsReload, v.ForTest)
+				needsReload = append(needsReload, mp.ForTest)
 			}
-			result.shouldLoad[k] = needsReload
+			result.shouldLoad.Set(id, needsReload, nil)
 		}
 
 		// Check whether the metadata should be deleted.
 		if invalidateMetadata {
-			metadataUpdates[k] = nil
+			metadataUpdates[id] = nil
 			continue
 		}
 
 	}
 
 	// Update metadata, if necessary.
-	result.meta = s.meta.Clone(metadataUpdates)
+	result.meta = s.meta.Update(metadataUpdates)
 
 	// Update workspace and active packages, if necessary.
 	if result.meta != s.meta || anyFileOpenedOrClosed {
@@ -2164,25 +2260,23 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]source
 		result.workspacePackages = s.workspacePackages
 	}
 
-	// Don't bother copying the importedBy graph,
-	// as it changes each time we update metadata.
-
-	// TODO(rfindley): consolidate the this workspace mode detection with
-	// workspace invalidation.
-	workspaceModeChanged := s.workspaceMode() != result.workspaceMode()
-
-	// If the snapshot's workspace mode has changed, the packages loaded using
-	// the previous mode are no longer relevant, so clear them out.
-	if workspaceModeChanged {
-		result.workspacePackages = map[PackageID]PackagePath{}
-	}
 	return result, release
 }
 
-func cloneWithout[V any](m *persistent.Map[span.URI, V], changes map[span.URI]source.FileHandle) *persistent.Map[span.URI, V] {
+// cloneWithout clones m then deletes from it the keys of changes.
+func cloneWithout[K constraints.Ordered, V1, V2 any](m *persistent.Map[K, V1], changes map[K]V2) *persistent.Map[K, V1] {
 	m2 := m.Clone()
 	for k := range changes {
 		m2.Delete(k)
+	}
+	return m2
+}
+
+// cloneWith clones m then inserts the changes into it.
+func cloneWith[K constraints.Ordered, V any](m *persistent.Map[K, V], changes map[K]V) *persistent.Map[K, V] {
+	m2 := m.Clone()
+	for k, v := range changes {
+		m2.Set(k, v, nil)
 	}
 	return m2
 }
@@ -2195,13 +2289,13 @@ func cloneWithout[V any](m *persistent.Map[span.URI, V], changes map[span.URI]so
 // changed that happens not to be present in the map, but that's OK: the goal
 // of this function is to guarantee that IF the nearest mod file is present in
 // the map, it is invalidated.
-func deleteMostRelevantModFile(m *persistent.Map[span.URI, *memoize.Promise], changed span.URI) {
-	var mostRelevant span.URI
-	changedFile := changed.Filename()
+func deleteMostRelevantModFile(m *persistent.Map[protocol.DocumentURI, *memoize.Promise], changed protocol.DocumentURI) {
+	var mostRelevant protocol.DocumentURI
+	changedFile := changed.Path()
 
-	m.Range(func(modURI span.URI, _ *memoize.Promise) {
+	m.Range(func(modURI protocol.DocumentURI, _ *memoize.Promise) {
 		if len(modURI) > len(mostRelevant) {
-			if source.InDir(filepath.Dir(modURI.Filename()), changedFile) {
+			if pathutil.InDir(filepath.Dir(modURI.Path()), changedFile) {
 				mostRelevant = modURI
 			}
 		}
@@ -2219,7 +2313,7 @@ func deleteMostRelevantModFile(m *persistent.Map[span.URI, *memoize.Promise], ch
 // If packageFileChanged is set, the file is either a new file, or has a new
 // package name. In this case, all known packages in the directory will be
 // invalidated.
-func invalidatedPackageIDs(uri span.URI, known map[span.URI][]PackageID, packageFileChanged bool) map[PackageID]struct{} {
+func invalidatedPackageIDs(uri protocol.DocumentURI, known map[protocol.DocumentURI][]PackageID, packageFileChanged bool) map[PackageID]struct{} {
 	invalidated := make(map[PackageID]struct{})
 
 	// At a minimum, we invalidate packages known to contain uri.
@@ -2253,12 +2347,12 @@ func invalidatedPackageIDs(uri span.URI, known map[span.URI][]PackageID, package
 		}{fi, err}
 		return fi, err
 	}
-	dir := filepath.Dir(uri.Filename())
+	dir := filepath.Dir(uri.Path())
 	fi, err := getInfo(dir)
 	if err == nil {
 		// Aggregate all possibly relevant package IDs.
 		for knownURI, ids := range known {
-			knownDir := filepath.Dir(knownURI.Filename())
+			knownDir := filepath.Dir(knownURI.Path())
 			knownFI, err := getInfo(knownDir)
 			if err != nil {
 				continue
@@ -2277,7 +2371,7 @@ func invalidatedPackageIDs(uri span.URI, known map[span.URI][]PackageID, package
 // accomplishes this by checking to see if the original and current FileHandles
 // are both overlays, and if the current FileHandle is saved while the original
 // FileHandle was not saved.
-func fileWasSaved(originalFH, currentFH source.FileHandle) bool {
+func fileWasSaved(originalFH, currentFH file.Handle) bool {
 	c, ok := currentFH.(*Overlay)
 	if !ok || c == nil {
 		return true
@@ -2303,21 +2397,21 @@ func fileWasSaved(originalFH, currentFH source.FileHandle) bool {
 //     changed).
 //   - importDeleted means that an import has been deleted, or we can't
 //     determine if an import was deleted due to errors.
-func metadataChanges(ctx context.Context, lockedSnapshot *snapshot, oldFH, newFH source.FileHandle) (invalidate, pkgFileChanged, importDeleted bool) {
+func metadataChanges(ctx context.Context, lockedSnapshot *Snapshot, oldFH, newFH file.Handle) (invalidate, pkgFileChanged, importDeleted bool) {
 	if oe, ne := oldFH != nil && fileExists(oldFH), fileExists(newFH); !oe || !ne { // existential changes
 		changed := oe != ne
 		return changed, changed, !ne // we don't know if an import was deleted
 	}
 
 	// If the file hasn't changed, there's no need to reload.
-	if oldFH.FileIdentity() == newFH.FileIdentity() {
+	if oldFH.Identity() == newFH.Identity() {
 		return false, false, false
 	}
 
 	fset := token.NewFileSet()
 	// Parse headers to compare package names and imports.
-	oldHeads, oldErr := lockedSnapshot.view.parseCache.parseFiles(ctx, fset, source.ParseHeader, false, oldFH)
-	newHeads, newErr := lockedSnapshot.view.parseCache.parseFiles(ctx, fset, source.ParseHeader, false, newFH)
+	oldHeads, oldErr := lockedSnapshot.view.parseCache.parseFiles(ctx, fset, ParseHeader, false, oldFH)
+	newHeads, newErr := lockedSnapshot.view.parseCache.parseFiles(ctx, fset, ParseHeader, false, newFH)
 
 	if oldErr != nil || newErr != nil {
 		errChanged := (oldErr == nil) != (newErr == nil)
@@ -2363,8 +2457,8 @@ func metadataChanges(ctx context.Context, lockedSnapshot *snapshot, oldFH, newFH
 	// Note: if this affects performance we can probably avoid parsing in the
 	// common case by first scanning the source for potential comments.
 	if !invalidate {
-		origFulls, oldErr := lockedSnapshot.view.parseCache.parseFiles(ctx, fset, source.ParseFull, false, oldFH)
-		newFulls, newErr := lockedSnapshot.view.parseCache.parseFiles(ctx, fset, source.ParseFull, false, newFH)
+		origFulls, oldErr := lockedSnapshot.view.parseCache.parseFiles(ctx, fset, ParseFull, false, oldFH)
+		newFulls, newErr := lockedSnapshot.view.parseCache.parseFiles(ctx, fset, ParseFull, false, newFH)
 		if oldErr == nil && newErr == nil {
 			invalidate = magicCommentsChanged(origFulls[0].File, newFulls[0].File)
 		} else {
@@ -2431,7 +2525,8 @@ func extractMagicComments(f *ast.File) []string {
 	return results
 }
 
-func (s *snapshot) BuiltinFile(ctx context.Context) (*source.ParsedGoFile, error) {
+// BuiltinFile returns information about the special builtin package.
+func (s *Snapshot) BuiltinFile(ctx context.Context) (*ParsedGoFile, error) {
 	s.AwaitInitialized(ctx)
 
 	s.mu.Lock()
@@ -2439,7 +2534,7 @@ func (s *snapshot) BuiltinFile(ctx context.Context) (*source.ParsedGoFile, error
 	s.mu.Unlock()
 
 	if builtin == "" {
-		return nil, fmt.Errorf("no builtin package for view %s", s.view.name)
+		return nil, fmt.Errorf("no builtin package for view %s", s.view.folder.Name)
 	}
 
 	fh, err := s.ReadFile(ctx, builtin)
@@ -2448,7 +2543,7 @@ func (s *snapshot) BuiltinFile(ctx context.Context) (*source.ParsedGoFile, error
 	}
 	// For the builtin file only, we need syntactic object resolution
 	// (since we can't type check).
-	mode := source.ParseFull &^ source.SkipObjectResolution
+	mode := ParseFull &^ parser.SkipObjectResolution
 	pgfs, err := s.view.parseCache.parseFiles(ctx, token.NewFileSet(), mode, false, fh)
 	if err != nil {
 		return nil, err
@@ -2456,7 +2551,8 @@ func (s *snapshot) BuiltinFile(ctx context.Context) (*source.ParsedGoFile, error
 	return pgfs[0], nil
 }
 
-func (s *snapshot) IsBuiltin(uri span.URI) bool {
+// IsBuiltin reports whether uri is part of the builtin package.
+func (s *Snapshot) IsBuiltin(uri protocol.DocumentURI) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// We should always get the builtin URI in a canonical form, so use simple
@@ -2464,9 +2560,9 @@ func (s *snapshot) IsBuiltin(uri span.URI) bool {
 	return uri == s.builtin
 }
 
-func (s *snapshot) setBuiltin(path string) {
+func (s *Snapshot) setBuiltin(path string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.builtin = span.URIFromPath(path)
+	s.builtin = protocol.URIFromPath(path)
 }
