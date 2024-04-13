@@ -50,6 +50,7 @@ import (
 	"flag"
 	"fmt"
 	"go/format"
+	"io/ioutil"
 	"math"
 	"os"
 	"strconv"
