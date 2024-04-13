@@ -10,17 +10,16 @@ import (
 	"strings"
 	"testing"
 
-	"golang.org/x/tools/gopls/internal/hooks"
-	. "golang.org/x/tools/gopls/internal/test/integration"
 	"golang.org/x/tools/gopls/internal/test/compare"
+	. "golang.org/x/tools/gopls/internal/test/integration"
 	"golang.org/x/tools/gopls/internal/util/bug"
 
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
 )
 
 func TestMain(m *testing.M) {
 	bug.PanicOnBugs = true
-	Main(m, hooks.Options)
+	Main(m)
 }
 
 const workspaceProxy = `
@@ -427,8 +426,9 @@ func main() {
 		{"default", WithOptions(ProxyFiles(proxy), WorkspaceFolders("a"))},
 		{"nested", WithOptions(ProxyFiles(proxy))},
 	}.Run(t, mod, func(t *testing.T, env *Env) {
-		env.OnceMet(
-			InitialWorkspaceLoad,
+		// With zero-config gopls, we must open a/main.go to have a View including a/go.mod.
+		env.OpenFile("a/main.go")
+		env.AfterChange(
 			Diagnostics(env.AtRegexp("a/go.mod", "require")),
 		)
 		env.RunGoCommandInDir("a", "mod", "tidy")
@@ -491,8 +491,8 @@ var _ = blah.Name
 		env.AfterChange(
 			// We would like for the error to appear in the v2 module, but
 			// as of writing non-workspace packages are not diagnosed.
-			Diagnostics(env.AtRegexp("a/main.go", `"example.com/blah/v2"`), WithMessage("cannot find module providing")),
-			Diagnostics(env.AtRegexp("a/go.mod", `require example.com/blah/v2`), WithMessage("cannot find module providing")),
+			Diagnostics(env.AtRegexp("a/main.go", `"example.com/blah/v2"`), WithMessage("no required module provides")),
+			Diagnostics(env.AtRegexp("a/go.mod", `require example.com/blah/v2`), WithMessage("no required module provides")),
 			ReadDiagnostics("a/go.mod", &modDiags),
 		)
 

@@ -2,9 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build go1.18
-// +build go1.18
-
 package vulntest
 
 import (
@@ -17,7 +14,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/vulncheck/osv"
 )
 

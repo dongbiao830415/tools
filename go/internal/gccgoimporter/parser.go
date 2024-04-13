@@ -20,6 +20,9 @@ import (
 	"strings"
 	"text/scanner"
 	"unicode/utf8"
+
+	"golang.org/x/tools/internal/aliases"
+	"golang.org/x/tools/internal/typesinternal"
 )
 
 type parser struct {
@@ -240,13 +243,6 @@ func (p *parser) parseName() string {
 	return name
 }
 
-func deref(typ types.Type) types.Type {
-	if p, _ := typ.(*types.Pointer); p != nil {
-		typ = p.Elem()
-	}
-	return typ
-}
-
 // parseField parses a Field:
 //
 //	Field = Name Type [string] .
@@ -260,7 +256,7 @@ func (p *parser) parseField(pkg *types.Package) (field *types.Var, tag string) {
 		if aname, ok := p.aliases[n]; ok {
 			name = aname
 		} else {
-			switch typ := deref(typ).(type) {
+			switch typ := aliases.Unalias(typesinternal.Unpointer(typ)).(type) {
 			case *types.Basic:
 				name = typ.Name()
 			case *types.Named:
@@ -579,7 +575,7 @@ func (p *parser) parseNamedType(nlist []interface{}) types.Type {
 	t := obj.Type()
 	p.update(t, nlist)
 
-	nt, ok := t.(*types.Named)
+	nt, ok := aliases.Unalias(t).(*types.Named)
 	if !ok {
 		// This can happen for unsafe.Pointer, which is a TypeName holding a Basic type.
 		pt := p.parseType(pkg)
@@ -950,6 +946,7 @@ const (
 	gccgoBuiltinERROR      = 19
 	gccgoBuiltinBYTE       = 20
 	gccgoBuiltinRUNE       = 21
+	gccgoBuiltinANY        = 22
 )
 
 func lookupBuiltinType(typ int) types.Type {
@@ -974,6 +971,7 @@ func lookupBuiltinType(typ int) types.Type {
 		gccgoBuiltinERROR:      types.Universe.Lookup("error").Type(),
 		gccgoBuiltinBYTE:       types.Universe.Lookup("byte").Type(),
 		gccgoBuiltinRUNE:       types.Universe.Lookup("rune").Type(),
+		gccgoBuiltinANY:        types.Universe.Lookup("any").Type(),
 	}[typ]
 }
 
@@ -1332,7 +1330,7 @@ func (p *parser) parsePackage() *types.Package {
 	}
 	p.fixups = nil
 	for _, typ := range p.typeList {
-		if it, ok := typ.(*types.Interface); ok {
+		if it, ok := aliases.Unalias(typ).(*types.Interface); ok {
 			it.Complete()
 		}
 	}

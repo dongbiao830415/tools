@@ -176,7 +176,7 @@ func Inline(logf func(string, ...any), caller *Caller, callee *Callee) ([]byte, 
 		// function body. In essence the question is: which
 		// is more likely to have comments?
 		// Usually the callee body will be larger and more
-		// statement-heavy than the the arguments, but a
+		// statement-heavy than the arguments, but a
 		// strategy may widen the scope of the replacement
 		// (res.old) from CallExpr to, say, its enclosing
 		// block, so the caller nodes dominate.
@@ -485,7 +485,7 @@ func inline(logf func(string, ...any), caller *Caller, callee *gobCallee) (*resu
 			// check not shadowed at caller.
 			found := caller.lookup(obj.Name) // always finds something
 			if found.Pos().IsValid() {
-				return nil, fmt.Errorf("cannot inline because built-in %q is shadowed in caller by a %s (line %d)",
+				return nil, fmt.Errorf("cannot inline, because the callee refers to built-in %q, which in the caller is shadowed by a %s (declared at line %d)",
 					obj.Name, objectKind(found),
 					caller.Fset.PositionFor(found.Pos(), false).Line)
 			}
@@ -505,8 +505,9 @@ func inline(logf func(string, ...any), caller *Caller, callee *gobCallee) (*resu
 					// around the refactored signature.
 					found := caller.lookup(obj.Name)
 					if found != nil && !isPkgLevel(found) {
-						return nil, fmt.Errorf("cannot inline because %q is shadowed in caller by a %s (line %d)",
-							obj.Name, objectKind(found),
+						return nil, fmt.Errorf("cannot inline, because the callee refers to %s %q, which in the caller is shadowed by a %s (declared at line %d)",
+							obj.Kind, obj.Name,
+							objectKind(found),
 							caller.Fset.PositionFor(found.Pos(), false).Line)
 					}
 				} else {
@@ -1133,8 +1134,7 @@ func arguments(caller *Caller, calleeDecl *ast.FuncDecl, assign1 func(*types.Var
 			// updating arg.{expr,typ}.
 			indices := seln.Index()
 			for _, index := range indices[:len(indices)-1] {
-				t := deref(arg.typ)
-				fld := typeparams.CoreType(t).(*types.Struct).Field(index)
+				fld := typeparams.CoreType(typeparams.Deref(arg.typ)).(*types.Struct).Field(index)
 				if fld.Pkg() != caller.Types && !fld.Exported() {
 					return nil, fmt.Errorf("in %s, implicit reference to unexported field .%s cannot be made explicit",
 						debugFormatNode(caller.Fset, caller.Call.Fun),
@@ -1153,7 +1153,7 @@ func arguments(caller *Caller, calleeDecl *ast.FuncDecl, assign1 func(*types.Var
 
 			// Make * or & explicit.
 			argIsPtr := isPointer(arg.typ)
-			paramIsPtr := isPointer(seln.Obj().Type().(*types.Signature).Recv().Type())
+			paramIsPtr := isPointer(seln.Obj().Type().Underlying().(*types.Signature).Recv().Type())
 			if !argIsPtr && paramIsPtr {
 				// &recv
 				arg.expr = &ast.UnaryExpr{Op: token.AND, X: arg.expr}
@@ -1161,7 +1161,7 @@ func arguments(caller *Caller, calleeDecl *ast.FuncDecl, assign1 func(*types.Var
 			} else if argIsPtr && !paramIsPtr {
 				// *recv
 				arg.expr = &ast.StarExpr{X: arg.expr}
-				arg.typ = deref(arg.typ)
+				arg.typ = typeparams.Deref(arg.typ)
 				arg.duplicable = false
 				arg.pure = false
 			}

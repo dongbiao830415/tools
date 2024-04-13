@@ -17,10 +17,10 @@ import (
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/file"
-	"golang.org/x/tools/gopls/internal/lsp/cache"
-	"golang.org/x/tools/gopls/internal/lsp/command"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
+	"golang.org/x/tools/gopls/internal/protocol/command"
 	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/gopls/internal/vulncheck/govulncheck"
 	"golang.org/x/tools/internal/event"
@@ -68,7 +68,7 @@ func collectDiagnostics(ctx context.Context, snapshot *cache.Snapshot, diagFn fu
 	var mu sync.Mutex
 	reports := make(map[protocol.DocumentURI][]*cache.Diagnostic)
 
-	for _, uri := range snapshot.ModFiles() {
+	for _, uri := range snapshot.View().ModFiles() {
 		uri := uri
 		g.Go(func() error {
 			fh, err := snapshot.ReadFile(ctx, uri)
@@ -115,12 +115,16 @@ func ModTidyDiagnostics(ctx context.Context, snapshot *cache.Snapshot, fh file.H
 
 	tidied, err := snapshot.ModTidy(ctx, pm)
 	if err != nil {
-		if err != cache.ErrNoModOnDisk {
+		if err != cache.ErrNoModOnDisk && !strings.Contains(err.Error(), "GOPROXY=off") {
 			// TODO(rfindley): the check for ErrNoModOnDisk was historically determined
 			// to be benign, but may date back to the time when the Go command did not
 			// have overlay support.
 			//
 			// See if we can pass the overlay to the Go command, and eliminate this guard..
+
+			// TODO(golang/go#56395): remove the arbitrary suppression of the mod
+			// tidy error when GOPROXY=off. The true fix for this noisy log message
+			// is to fix the mod tidy diagnostics.
 			event.Error(ctx, fmt.Sprintf("tidy: diagnosing %s", pm.URI), err)
 		}
 		return nil, nil

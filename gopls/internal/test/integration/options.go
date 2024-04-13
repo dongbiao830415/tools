@@ -5,15 +5,16 @@
 package integration
 
 import (
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/test/integration/fake"
 )
 
 type runConfig struct {
-	editor    fake.EditorConfig
-	sandbox   fake.SandboxConfig
-	modes     Mode
-	skipHooks bool
+	editor        fake.EditorConfig
+	sandbox       fake.SandboxConfig
+	modes         Mode
+	noLogsOnError bool
+	writeGoSum    []string
 }
 
 func defaultConfig() runConfig {
@@ -46,6 +47,17 @@ func ProxyFiles(txt string) RunOption {
 	})
 }
 
+// WriteGoSum causes the environment to write a go.sum file for the requested
+// relative directories (via `go list -mod=mod`), before starting gopls.
+//
+// Useful for tests that use ProxyFiles, but don't care about crafting the
+// go.sum content.
+func WriteGoSum(dirs ...string) RunOption {
+	return optionSetter(func(opts *runConfig) {
+		opts.writeGoSum = dirs
+	})
+}
+
 // Modes configures the execution modes that the test should run in.
 //
 // By default, modes are configured by the test runner. If this option is set,
@@ -60,6 +72,13 @@ func Modes(modes Mode) RunOption {
 	})
 }
 
+// NoLogsOnError turns off dumping the LSP logs on test failures.
+func NoLogsOnError() RunOption {
+	return optionSetter(func(opts *runConfig) {
+		opts.noLogsOnError = true
+	})
+}
+
 // WindowsLineEndings configures the editor to use windows line endings.
 func WindowsLineEndings() RunOption {
 	return optionSetter(func(opts *runConfig) {
@@ -71,6 +90,13 @@ func WindowsLineEndings() RunOption {
 func ClientName(name string) RunOption {
 	return optionSetter(func(opts *runConfig) {
 		opts.editor.ClientName = name
+	})
+}
+
+// CapabilitiesJSON sets the capabalities json.
+func CapabilitiesJSON(capabilities []byte) RunOption {
+	return optionSetter(func(opts *runConfig) {
+		opts.editor.CapabilitiesJSON = capabilities
 	})
 }
 
@@ -98,9 +124,27 @@ func WorkspaceFolders(relFolders ...string) RunOption {
 		// Use an empty non-nil slice to signal explicitly no folders.
 		relFolders = []string{}
 	}
+
 	return optionSetter(func(opts *runConfig) {
 		opts.editor.WorkspaceFolders = relFolders
 	})
+}
+
+// FolderSettings defines per-folder workspace settings, keyed by relative path
+// to the folder.
+//
+// Use in conjunction with WorkspaceFolders to have different settings for
+// different folders.
+type FolderSettings map[string]Settings
+
+func (fs FolderSettings) set(opts *runConfig) {
+	// Re-use the Settings type, for symmetry, but translate back into maps for
+	// the editor config.
+	folders := make(map[string]map[string]any)
+	for k, v := range fs {
+		folders[k] = v
+	}
+	opts.editor.FolderSettings = folders
 }
 
 // EnvVars sets environment variables for the LSP session. When applying these

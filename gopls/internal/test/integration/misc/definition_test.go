@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	. "golang.org/x/tools/gopls/internal/test/integration"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/test/compare"
+	. "golang.org/x/tools/gopls/internal/test/integration"
 )
 
 const internalDefinition = `
@@ -495,9 +495,7 @@ const _ = b.K
 		}
 
 		// Run 'go mod vendor' outside the editor.
-		if err := env.Sandbox.RunGoCommand(env.Ctx, ".", "mod", []string{"vendor"}, nil, true); err != nil {
-			t.Fatalf("go mod vendor: %v", err)
-		}
+		env.RunGoCommand("mod", "vendor")
 
 		// Synchronize changes to watched files.
 		env.Await(env.DoneWithChangeWatchedFiles())

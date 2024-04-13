@@ -13,8 +13,8 @@ import (
 	"os"
 	"strings"
 
-	"golang.org/x/tools/gopls/internal/lsp/command"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
+	"golang.org/x/tools/gopls/internal/protocol/command"
 	"golang.org/x/tools/gopls/internal/server"
 	"golang.org/x/tools/gopls/internal/util/slices"
 	"golang.org/x/tools/internal/tool"
@@ -44,7 +44,7 @@ This interface is experimental and commands may change or disappear without noti
 
 Examples:
 
-	$ gopls execute gopls.add_import '{"ImportPath": "fmt", "URI", "file:///hello.go"}'
+	$ gopls execute gopls.add_import '{"ImportPath": "fmt", "URI": "file:///hello.go"}'
 	$ gopls execute gopls.run_tests '{"URI": "file:///a_test.go", "Tests": ["Test"]}'
 	$ gopls execute gopls.list_known_packages '{"URI": "file:///hello.go"}'
 

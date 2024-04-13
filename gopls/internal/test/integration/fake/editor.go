@@ -17,10 +17,11 @@ import (
 	"strings"
 	"sync"
 
-	"golang.org/x/tools/gopls/internal/lsp/command"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
+	"golang.org/x/tools/gopls/internal/protocol/command"
 	"golang.org/x/tools/gopls/internal/test/integration/fake/glob"
 	"golang.org/x/tools/gopls/internal/util/pathutil"
+	"golang.org/x/tools/gopls/internal/util/slices"
 	"golang.org/x/tools/internal/jsonrpc2"
 	"golang.org/x/tools/internal/jsonrpc2/servertest"
 	"golang.org/x/tools/internal/xcontext"
@@ -72,7 +73,7 @@ func (b buffer) text() string {
 }
 
 // EditorConfig configures the editor's LSP session. This is similar to
-// source.UserOptions, but we use a separate type here so that we expose only
+// golang.UserOptions, but we use a separate type here so that we expose only
 // that configuration which we support.
 //
 // The zero value for EditorConfig is the default configuration.
@@ -81,6 +82,8 @@ type EditorConfig struct {
 	//
 	// Since this can only be set during initialization, changing this field via
 	// Editor.ChangeConfiguration has no effect.
+	//
+	// If empty, "fake.Editor" is used.
 	ClientName string
 
 	// Env holds environment variables to apply on top of the default editor
@@ -109,7 +112,13 @@ type EditorConfig struct {
 	FileAssociations map[string]string
 
 	// Settings holds user-provided configuration for the LSP server.
-	Settings map[string]interface{}
+	Settings map[string]any
+
+	// FolderSettings holds user-provided per-folder configuration, if any.
+	//
+	// It maps each folder (as a relative path to the sandbox workdir) to its
+	// configuration mapping (like Settings).
+	FolderSettings map[string]map[string]any
 
 	// CapabilitiesJSON holds JSON client capabilities to overlay over the
 	// editor's default client capabilities.
@@ -215,7 +224,7 @@ func (e *Editor) Client() *Client {
 }
 
 // makeSettings builds the settings map for use in LSP settings RPCs.
-func makeSettings(sandbox *Sandbox, config EditorConfig) map[string]interface{} {
+func makeSettings(sandbox *Sandbox, config EditorConfig, scopeURI *protocol.URI) map[string]any {
 	env := make(map[string]string)
 	for k, v := range sandbox.GoEnv() {
 		env[k] = v
@@ -228,7 +237,7 @@ func makeSettings(sandbox *Sandbox, config EditorConfig) map[string]interface{} 
 		env[k] = v
 	}
 
-	settings := map[string]interface{}{
+	settings := map[string]any{
 		"env": env,
 
 		// Use verbose progress reporting so that integration tests can assert on
@@ -247,60 +256,54 @@ func makeSettings(sandbox *Sandbox, config EditorConfig) map[string]interface{} 
 		settings[k] = v
 	}
 
+	// If the server is requesting configuration for a specific scope, apply
+	// settings for the nearest folder that has customized settings, if any.
+	if scopeURI != nil {
+		var (
+			scopePath       = protocol.DocumentURI(*scopeURI).Path()
+			closestDir      string         // longest dir with settings containing the scope, if any
+			closestSettings map[string]any // settings for that dir, if any
+		)
+		for relPath, settings := range config.FolderSettings {
+			dir := sandbox.Workdir.AbsPath(relPath)
+			if strings.HasPrefix(scopePath+string(filepath.Separator), dir+string(filepath.Separator)) && len(dir) > len(closestDir) {
+				closestDir = dir
+				closestSettings = settings
+			}
+		}
+		if closestSettings != nil {
+			for k, v := range closestSettings {
+				settings[k] = v
+			}
+		}
+	}
+
 	return settings
 }
 
 func (e *Editor) initialize(ctx context.Context) error {
 	config := e.Config()
 
-	params := &protocol.ParamInitialize{}
-	if e.config.ClientName != "" {
-		params.ClientInfo = &protocol.ClientInfo{
-			Name:    e.config.ClientName,
-			Version: "v1.0.0",
-		}
+	clientName := config.ClientName
+	if clientName == "" {
+		clientName = "fake.Editor"
 	}
-	params.InitializationOptions = makeSettings(e.sandbox, config)
+
+	params := &protocol.ParamInitialize{}
+	params.ClientInfo = &protocol.ClientInfo{
+		Name:    clientName,
+		Version: "v1.0.0",
+	}
+	params.InitializationOptions = makeSettings(e.sandbox, config, nil)
 	params.WorkspaceFolders = makeWorkspaceFolders(e.sandbox, config.WorkspaceFolders)
 
-	// Set various client capabilities that are sought by gopls.
-	params.Capabilities.Workspace.Configuration = true // support workspace/configuration
-	params.Capabilities.Window.WorkDoneProgress = true // support window/workDoneProgress
-	params.Capabilities.TextDocument.Completion.CompletionItem.TagSupport = &protocol.CompletionItemTagOptions{}
-	params.Capabilities.TextDocument.Completion.CompletionItem.TagSupport.ValueSet = []protocol.CompletionItemTag{protocol.ComplDeprecated}
-	params.Capabilities.TextDocument.Completion.CompletionItem.SnippetSupport = true
-	params.Capabilities.TextDocument.SemanticTokens.Requests.Full = &protocol.Or_ClientSemanticTokensRequestOptions_full{Value: true}
-	params.Capabilities.TextDocument.SemanticTokens.TokenTypes = []string{
-		"namespace", "type", "class", "enum", "interface",
-		"struct", "typeParameter", "parameter", "variable", "property", "enumMember",
-		"event", "function", "method", "macro", "keyword", "modifier", "comment",
-		"string", "number", "regexp", "operator",
+	capabilities, err := clientCapabilities(config)
+	if err != nil {
+		return fmt.Errorf("unmarshalling EditorConfig.CapabilitiesJSON: %v", err)
 	}
-	params.Capabilities.TextDocument.SemanticTokens.TokenModifiers = []string{
-		"declaration", "definition", "readonly", "static",
-		"deprecated", "abstract", "async", "modification", "documentation", "defaultLibrary",
-	}
-	// The LSP tests have historically enabled this flag,
-	// but really we should test both ways for older editors.
-	params.Capabilities.TextDocument.DocumentSymbol.HierarchicalDocumentSymbolSupport = true
-	// Glob pattern watching is enabled.
-	params.Capabilities.Workspace.DidChangeWatchedFiles.DynamicRegistration = true
-	// "rename" operations are used for package renaming.
-	//
-	// TODO(rfindley): add support for other resource operations (create, delete, ...)
-	params.Capabilities.Workspace.WorkspaceEdit = &protocol.WorkspaceEditClientCapabilities{
-		ResourceOperations: []protocol.ResourceOperationKind{
-			"rename",
-		},
-	}
-	// Apply capabilities overlay.
-	if config.CapabilitiesJSON != nil {
-		if err := json.Unmarshal(config.CapabilitiesJSON, &params.Capabilities); err != nil {
-			return fmt.Errorf("unmarshalling EditorConfig.CapabilitiesJSON: %v", err)
-		}
-	}
+	params.Capabilities = capabilities
 
-	trace := protocol.TraceValues("messages")
+	trace := protocol.TraceValue("messages")
 	params.Trace = &trace
 	// TODO: support workspace folders.
 	if e.Server != nil {
@@ -323,6 +326,50 @@ func (e *Editor) initialize(ctx context.Context) error {
 	}
 	// TODO: await initial configuration here, or expect gopls to manage that?
 	return nil
+}
+
+func clientCapabilities(cfg EditorConfig) (protocol.ClientCapabilities, error) {
+	var capabilities protocol.ClientCapabilities
+	// Set various client capabilities that are sought by gopls.
+	capabilities.Workspace.Configuration = true // support workspace/configuration
+	capabilities.TextDocument.Completion.CompletionItem.TagSupport = &protocol.CompletionItemTagOptions{}
+	capabilities.TextDocument.Completion.CompletionItem.TagSupport.ValueSet = []protocol.CompletionItemTag{protocol.ComplDeprecated}
+	capabilities.TextDocument.Completion.CompletionItem.SnippetSupport = true
+	capabilities.TextDocument.SemanticTokens.Requests.Full = &protocol.Or_ClientSemanticTokensRequestOptions_full{Value: true}
+	capabilities.Window.WorkDoneProgress = true // support window/workDoneProgress
+	capabilities.TextDocument.SemanticTokens.TokenTypes = []string{
+		"namespace", "type", "class", "enum", "interface",
+		"struct", "typeParameter", "parameter", "variable", "property", "enumMember",
+		"event", "function", "method", "macro", "keyword", "modifier", "comment",
+		"string", "number", "regexp", "operator",
+		// Additional types supported by this client:
+		"label",
+	}
+	capabilities.TextDocument.SemanticTokens.TokenModifiers = []string{
+		"declaration", "definition", "readonly", "static",
+		"deprecated", "abstract", "async", "modification", "documentation", "defaultLibrary",
+	}
+	// The LSP tests have historically enabled this flag,
+	// but really we should test both ways for older editors.
+	capabilities.TextDocument.DocumentSymbol.HierarchicalDocumentSymbolSupport = true
+	// Glob pattern watching is enabled.
+	capabilities.Workspace.DidChangeWatchedFiles.DynamicRegistration = true
+	// "rename" operations are used for package renaming.
+	//
+	// TODO(rfindley): add support for other resource operations (create, delete, ...)
+	capabilities.Workspace.WorkspaceEdit = &protocol.WorkspaceEditClientCapabilities{
+		ResourceOperations: []protocol.ResourceOperationKind{
+			"rename",
+		},
+	}
+
+	// Apply capabilities overlay.
+	if cfg.CapabilitiesJSON != nil {
+		if err := json.Unmarshal(cfg.CapabilitiesJSON, &capabilities); err != nil {
+			return protocol.ClientCapabilities{}, fmt.Errorf("unmarshalling EditorConfig.CapabilitiesJSON: %v", err)
+		}
+	}
+	return capabilities, nil
 }
 
 // marshalUnmarshal is a helper to json Marshal and then Unmarshal as a
@@ -530,17 +577,17 @@ var defaultFileAssociations = map[string]*regexp.Regexp{
 
 // languageID returns the language identifier for the path p given the user
 // configured fileAssociations.
-func languageID(p string, fileAssociations map[string]string) string {
+func languageID(p string, fileAssociations map[string]string) protocol.LanguageKind {
 	base := path.Base(p)
 	for lang, re := range fileAssociations {
 		re := regexp.MustCompile(re)
 		if re.MatchString(base) {
-			return lang
+			return protocol.LanguageKind(lang)
 		}
 	}
 	for lang, re := range defaultFileAssociations {
 		if re.MatchString(base) {
-			return lang
+			return protocol.LanguageKind(lang)
 		}
 	}
 	return ""
@@ -902,6 +949,21 @@ func (e *Editor) ApplyQuickFixes(ctx context.Context, loc protocol.Location, dia
 
 // ApplyCodeAction applies the given code action.
 func (e *Editor) ApplyCodeAction(ctx context.Context, action protocol.CodeAction) error {
+	// Resolve the code actions if necessary and supported.
+	if action.Edit == nil {
+		editSupport, err := e.EditResolveSupport()
+		if err != nil {
+			return err
+		}
+		if editSupport {
+			ca, err := e.Server.ResolveCodeAction(ctx, &action)
+			if err != nil {
+				return err
+			}
+			action.Edit = ca.Edit
+		}
+	}
+
 	if action.Edit != nil {
 		for _, change := range action.Edit.DocumentChanges {
 			if change.TextDocumentEdit != nil {
@@ -910,7 +972,7 @@ func (e *Editor) ApplyCodeAction(ctx context.Context, action protocol.CodeAction
 					// Skip edits for old versions.
 					continue
 				}
-				if err := e.EditBuffer(ctx, path, change.TextDocumentEdit.Edits); err != nil {
+				if err := e.EditBuffer(ctx, path, protocol.AsTextEdits(change.TextDocumentEdit.Edits)); err != nil {
 					return fmt.Errorf("editing buffer %q: %w", path, err)
 				}
 			}
@@ -932,11 +994,11 @@ func (e *Editor) ApplyCodeAction(ctx context.Context, action protocol.CodeAction
 
 // GetQuickFixes returns the available quick fix code actions.
 func (e *Editor) GetQuickFixes(ctx context.Context, loc protocol.Location, diagnostics []protocol.Diagnostic) ([]protocol.CodeAction, error) {
-	return e.getCodeActions(ctx, loc, diagnostics, protocol.QuickFix, protocol.SourceFixAll)
+	return e.CodeActions(ctx, loc, diagnostics, protocol.QuickFix, protocol.SourceFixAll)
 }
 
 func (e *Editor) applyCodeActions(ctx context.Context, loc protocol.Location, diagnostics []protocol.Diagnostic, only ...protocol.CodeActionKind) (int, error) {
-	actions, err := e.getCodeActions(ctx, loc, diagnostics, only...)
+	actions, err := e.CodeActions(ctx, loc, diagnostics, only...)
 	if err != nil {
 		return 0, err
 	}
@@ -963,7 +1025,7 @@ func (e *Editor) applyCodeActions(ctx context.Context, loc protocol.Location, di
 	return applied, nil
 }
 
-func (e *Editor) getCodeActions(ctx context.Context, loc protocol.Location, diagnostics []protocol.Diagnostic, only ...protocol.CodeActionKind) ([]protocol.CodeAction, error) {
+func (e *Editor) CodeActions(ctx context.Context, loc protocol.Location, diagnostics []protocol.Diagnostic, only ...protocol.CodeActionKind) ([]protocol.CodeAction, error) {
 	if e.Server == nil {
 		return nil, nil
 	}
@@ -1264,7 +1326,7 @@ func (e *Editor) SignatureHelp(ctx context.Context, loc protocol.Location) (*pro
 }
 
 func (e *Editor) RenameFile(ctx context.Context, oldPath, newPath string) error {
-	closed, opened, err := e.renameBuffers(ctx, oldPath, newPath)
+	closed, opened, err := e.renameBuffers(oldPath, newPath)
 	if err != nil {
 		return err
 	}
@@ -1290,7 +1352,7 @@ func (e *Editor) RenameFile(ctx context.Context, oldPath, newPath string) error 
 // renameBuffers renames in-memory buffers affected by the renaming of
 // oldPath->newPath, returning the resulting text documents that must be closed
 // and opened over the LSP.
-func (e *Editor) renameBuffers(ctx context.Context, oldPath, newPath string) (closed []protocol.TextDocumentIdentifier, opened []protocol.TextDocumentItem, _ error) {
+func (e *Editor) renameBuffers(oldPath, newPath string) (closed []protocol.TextDocumentIdentifier, opened []protocol.TextDocumentItem, _ error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -1361,7 +1423,7 @@ func (e *Editor) applyTextDocumentEdit(ctx context.Context, change protocol.Text
 			return err
 		}
 	}
-	return e.EditBuffer(ctx, path, change.Edits)
+	return e.EditBuffer(ctx, path, protocol.AsTextEdits(change.Edits))
 }
 
 // Config returns the current editor configuration.
@@ -1469,6 +1531,14 @@ func (e *Editor) CodeAction(ctx context.Context, loc protocol.Location, diagnost
 		return nil, err
 	}
 	return lens, nil
+}
+
+func (e *Editor) EditResolveSupport() (bool, error) {
+	capabilities, err := clientCapabilities(e.Config())
+	if err != nil {
+		return false, err
+	}
+	return capabilities.TextDocument.CodeAction.ResolveSupport != nil && slices.Contains(capabilities.TextDocument.CodeAction.ResolveSupport.Properties, "edit"), nil
 }
 
 // Hover triggers a hover at the given position in an open buffer.

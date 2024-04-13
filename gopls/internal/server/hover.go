@@ -8,9 +8,9 @@ import (
 	"context"
 
 	"golang.org/x/tools/gopls/internal/file"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/source"
+	"golang.org/x/tools/gopls/internal/golang"
 	"golang.org/x/tools/gopls/internal/mod"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/telemetry"
 	"golang.org/x/tools/gopls/internal/template"
 	"golang.org/x/tools/gopls/internal/work"
@@ -27,20 +27,21 @@ func (s *server) Hover(ctx context.Context, params *protocol.HoverParams) (_ *pr
 	ctx, done := event.Start(ctx, "lsp.Server.hover", tag.URI.Of(params.TextDocument.URI))
 	defer done()
 
-	snapshot, fh, ok, release, err := s.beginFileRequest(ctx, params.TextDocument.URI, file.UnknownKind)
-	defer release()
-	if !ok {
+	fh, snapshot, release, err := s.fileOf(ctx, params.TextDocument.URI)
+	if err != nil {
 		return nil, err
 	}
+	defer release()
+
 	switch snapshot.FileKind(fh) {
 	case file.Mod:
 		return mod.Hover(ctx, snapshot, fh, params.Position)
 	case file.Go:
-		return source.Hover(ctx, snapshot, fh, params.Position)
+		return golang.Hover(ctx, snapshot, fh, params.Position)
 	case file.Tmpl:
 		return template.Hover(ctx, snapshot, fh, params.Position)
 	case file.Work:
 		return work.Hover(ctx, snapshot, fh, params.Position)
 	}
-	return nil, nil
+	return nil, nil // empty result
 }

@@ -7,10 +7,12 @@ package server
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sync"
 
-	"golang.org/x/tools/gopls/internal/lsp/cache"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/cache"
+	"golang.org/x/tools/gopls/internal/protocol"
+	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/internal/event"
 )
 
@@ -37,14 +39,13 @@ func (s *server) addView(ctx context.Context, name string, dir protocol.Document
 	if state < serverInitialized {
 		return nil, nil, fmt.Errorf("addView called before server initialized")
 	}
-	options, err := s.fetchFolderOptions(ctx, dir)
+	opts, err := s.fetchFolderOptions(ctx, dir)
 	if err != nil {
 		return nil, nil, err
 	}
-	folder := &cache.Folder{
-		Dir:     dir,
-		Name:    name,
-		Options: options,
+	folder, err := s.newFolder(ctx, dir, name, opts)
+	if err != nil {
+		return nil, nil, err
 	}
 	_, snapshot, release, err := s.session.NewView(ctx, folder)
 	return snapshot, release, err
@@ -54,6 +55,17 @@ func (s *server) DidChangeConfiguration(ctx context.Context, _ *protocol.DidChan
 	ctx, done := event.Start(ctx, "lsp.Server.didChangeConfiguration")
 	defer done()
 
+	var wg sync.WaitGroup
+	wg.Add(1)
+	defer wg.Done()
+	if s.Options().VerboseWorkDoneProgress {
+		work := s.progress.Start(ctx, DiagnosticWorkTitle(FromDidChangeConfiguration), "Calculating diagnostics...", nil, nil)
+		go func() {
+			wg.Wait()
+			work.End(ctx, "Done.")
+		}()
+	}
+
 	// Apply any changes to the session-level settings.
 	options, err := s.fetchFolderOptions(ctx, "")
 	if err != nil {
@@ -62,41 +74,58 @@ func (s *server) DidChangeConfiguration(ctx context.Context, _ *protocol.DidChan
 	s.SetOptions(options)
 
 	// Collect options for all workspace folders.
-	seen := make(map[protocol.DocumentURI]bool)
-	for _, view := range s.session.Views() {
-		if seen[view.Folder()] {
+	// If none have changed, this is a no op.
+	folderOpts := make(map[protocol.DocumentURI]*settings.Options)
+	changed := false
+	// The set of views is implicitly guarded by the fact that gopls processes
+	// didChange notifications synchronously.
+	//
+	// TODO(rfindley): investigate this assumption: perhaps we should hold viewMu
+	// here.
+	views := s.session.Views()
+	for _, view := range views {
+		folder := view.Folder()
+		if folderOpts[folder.Dir] != nil {
 			continue
 		}
-		seen[view.Folder()] = true
-		options, err := s.fetchFolderOptions(ctx, view.Folder())
+		opts, err := s.fetchFolderOptions(ctx, folder.Dir)
 		if err != nil {
 			return err
 		}
-		s.session.SetFolderOptions(ctx, view.Folder(), options)
+
+		if !reflect.DeepEqual(folder.Options, opts) {
+			changed = true
+		}
+		folderOpts[folder.Dir] = opts
+	}
+	if !changed {
+		return nil
 	}
 
-	var wg sync.WaitGroup
+	var newFolders []*cache.Folder
+	for _, view := range views {
+		folder := view.Folder()
+		opts := folderOpts[folder.Dir]
+		newFolder, err := s.newFolder(ctx, folder.Dir, folder.Name, opts)
+		if err != nil {
+			return err
+		}
+		newFolders = append(newFolders, newFolder)
+	}
+	s.session.UpdateFolders(ctx, newFolders)
+
+	// The view set may have been updated above.
+	viewsToDiagnose := make(map[*cache.View][]protocol.DocumentURI)
 	for _, view := range s.session.Views() {
-		view := view
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			snapshot, release, err := view.Snapshot()
-			if err != nil {
-				return // view is shut down; no need to diagnose
-			}
-			defer release()
-			s.diagnoseSnapshot(snapshot, nil, 0)
-		}()
+		viewsToDiagnose[view] = nil
 	}
 
-	if s.Options().VerboseWorkDoneProgress {
-		work := s.progress.Start(ctx, DiagnosticWorkTitle(FromDidChangeConfiguration), "Calculating diagnostics...", nil, nil)
-		go func() {
-			wg.Wait()
-			work.End(ctx, "Done.")
-		}()
-	}
+	modCtx, modID := s.needsDiagnosis(ctx, viewsToDiagnose)
+	wg.Add(1)
+	go func() {
+		s.diagnoseChangedViews(modCtx, modID, viewsToDiagnose, FromDidChangeConfiguration)
+		wg.Done()
+	}()
 
 	// An options change may have affected the detected Go version.
 	s.checkViewGoVersions()

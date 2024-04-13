@@ -16,26 +16,28 @@ import (
 	"sync"
 
 	"golang.org/x/mod/modfile"
+	"golang.org/x/tools/gopls/internal/cache"
+	"golang.org/x/tools/gopls/internal/cache/metadata"
+	"golang.org/x/tools/gopls/internal/cache/parsego"
 	"golang.org/x/tools/gopls/internal/file"
-	"golang.org/x/tools/gopls/internal/lsp/cache"
-	"golang.org/x/tools/gopls/internal/lsp/cache/metadata"
-	"golang.org/x/tools/gopls/internal/lsp/cache/parsego"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/source"
+	"golang.org/x/tools/gopls/internal/golang"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/util/safetoken"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/event/tag"
+	"mvdan.cc/xurls/v2"
 )
 
 func (s *server) DocumentLink(ctx context.Context, params *protocol.DocumentLinkParams) (links []protocol.DocumentLink, err error) {
 	ctx, done := event.Start(ctx, "lsp.Server.documentLink")
 	defer done()
 
-	snapshot, fh, ok, release, err := s.beginFileRequest(ctx, params.TextDocument.URI, file.UnknownKind)
-	defer release()
-	if !ok {
+	fh, snapshot, release, err := s.fileOf(ctx, params.TextDocument.URI)
+	if err != nil {
 		return nil, err
 	}
+	defer release()
+
 	switch snapshot.FileKind(fh) {
 	case file.Mod:
 		links, err = modLinks(ctx, snapshot, fh)
@@ -45,9 +47,9 @@ func (s *server) DocumentLink(ctx context.Context, params *protocol.DocumentLink
 	// Don't return errors for document links.
 	if err != nil {
 		event.Error(ctx, "failed to compute document links", err, tag.URI.Of(fh.URI()))
-		return nil, nil
+		return nil, nil // empty result
 	}
-	return links, nil
+	return links, nil // may be empty (for other file types)
 }
 
 func modLinks(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle) ([]protocol.DocumentLink, error) {
@@ -86,7 +88,7 @@ func modLinks(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle) ([]
 	}
 
 	// Get all the links that are contained in the comments of the file.
-	urlRegexp := snapshot.Options().URLRegexp
+	urlRegexp := xurls.Relaxed()
 	for _, expr := range pm.File.Syntax.Stmt {
 		comments := expr.Comment()
 		if comments == nil {
@@ -108,7 +110,7 @@ func modLinks(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle) ([]
 // goLinks returns the set of hyperlink annotations for the specified Go file.
 func goLinks(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle) ([]protocol.DocumentLink, error) {
 
-	pgf, err := snapshot.ParseGo(ctx, fh, parsego.ParseFull)
+	pgf, err := snapshot.ParseGo(ctx, fh, parsego.Full)
 	if err != nil {
 		return nil, err
 	}
@@ -120,9 +122,9 @@ func goLinks(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle) ([]p
 
 		// If links are to pkg.go.dev, append module version suffixes.
 		// This requires the import map from the package metadata. Ignore errors.
-		var depsByImpPath map[source.ImportPath]source.PackageID
+		var depsByImpPath map[golang.ImportPath]golang.PackageID
 		if strings.ToLower(snapshot.Options().LinkTarget) == "pkg.go.dev" {
-			if meta, err := source.NarrowestMetadataForFile(ctx, snapshot, fh.URI()); err == nil {
+			if meta, err := golang.NarrowestMetadataForFile(ctx, snapshot, fh.URI()); err == nil {
 				depsByImpPath = meta.DepsByImpPath
 			}
 		}
@@ -158,7 +160,7 @@ func goLinks(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle) ([]p
 		}
 	}
 
-	urlRegexp := snapshot.Options().URLRegexp
+	urlRegexp := xurls.Relaxed()
 
 	// Gather links found in string literals.
 	var str []*ast.BasicLit

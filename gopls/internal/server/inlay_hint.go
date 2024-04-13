@@ -8,9 +8,9 @@ import (
 	"context"
 
 	"golang.org/x/tools/gopls/internal/file"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/source"
+	"golang.org/x/tools/gopls/internal/golang"
 	"golang.org/x/tools/gopls/internal/mod"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/event/tag"
 )
@@ -19,16 +19,17 @@ func (s *server) InlayHint(ctx context.Context, params *protocol.InlayHintParams
 	ctx, done := event.Start(ctx, "lsp.Server.inlayHint", tag.URI.Of(params.TextDocument.URI))
 	defer done()
 
-	snapshot, fh, ok, release, err := s.beginFileRequest(ctx, params.TextDocument.URI, file.UnknownKind)
-	defer release()
-	if !ok {
+	fh, snapshot, release, err := s.fileOf(ctx, params.TextDocument.URI)
+	if err != nil {
 		return nil, err
 	}
+	defer release()
+
 	switch snapshot.FileKind(fh) {
 	case file.Mod:
 		return mod.InlayHint(ctx, snapshot, fh, params.Range)
 	case file.Go:
-		return source.InlayHint(ctx, snapshot, fh, params.Range)
+		return golang.InlayHint(ctx, snapshot, fh, params.Range)
 	}
-	return nil, nil
+	return nil, nil // empty result
 }

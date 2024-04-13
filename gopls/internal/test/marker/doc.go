@@ -33,66 +33,55 @@ which is extracted to a temporary directory. The relative path to the .txt
 file is used as the subtest name. The preliminary section of the file
 (before the first archive entry) is a free-form comment.
 
-These tests were inspired by (and in many places copied from) a previous
-iteration of the marker tests built on top of the packagestest framework.
-Key design decisions motivating this reimplementation are as follows:
-  - The old tests had a single global session, causing interaction at a
-    distance and several awkward workarounds.
-  - The old tests could not be safely parallelized, because certain tests
-    manipulated the server options
-  - Relatedly, the old tests did not have a logic grouping of assertions into
-    a single unit, resulting in clusters of files serving clusters of
-    entangled assertions.
-  - The old tests used locations in the source as test names and as the
-    identity of golden content, meaning that a single edit could change the
-    name of an arbitrary number of subtests, and making it difficult to
-    manually edit golden content.
-  - The old tests did not hew closely to LSP concepts, resulting in, for
-    example, each marker implementation doing its own position
-    transformations, and inventing its own mechanism for configuration.
-  - The old tests had an ad-hoc session initialization process. The integration
-    test environment has had more time devoted to its initialization, and has a
-    more convenient API.
-  - The old tests lacked documentation, and often had failures that were hard
-    to understand. By starting from scratch, we can revisit these aspects.
-
 # Special files
 
 There are several types of file within the test archive that are given special
 treatment by the test runner:
+
   - "skip": the presence of this file causes the test to be skipped, with
     the file content used as the skip message.
+
   - "flags": this file is treated as a whitespace-separated list of flags
     that configure the MarkerTest instance. Supported flags:
-    -min_go=go1.20 sets the minimum Go version for the test;
+    -{min,max}_go=go1.20 sets the {min,max}imum Go version for the test
+    (inclusive)
     -cgo requires that CGO_ENABLED is set and the cgo tool is available
     -write_sumfile=a,b,c instructs the test runner to generate go.sum files
     in these directories before running the test.
     -skip_goos=a,b,c instructs the test runner to skip the test for the
     listed GOOS values.
+    -skip_goarch=a,b,c does the same for GOARCH.
     -ignore_extra_diags suppresses errors for unmatched diagnostics
-    TODO(rfindley): using build constraint expressions for -skip_goos would
+    TODO(rfindley): using build constraint expressions for -skip_go{os,arch} would
     be clearer.
     -filter_builtins=false disables the filtering of builtins from
     completion results.
     -filter_keywords=false disables the filtering of keywords from
     completion results.
+    -errors_ok=true suppresses errors for Error level log entries.
     TODO(rfindley): support flag values containing whitespace.
+
   - "settings.json": this file is parsed as JSON, and used as the
     session configuration (see gopls/doc/settings.md)
+
   - "capabilities.json": this file is parsed as JSON client capabilities,
     and applied as an overlay over the default editor client capabilities.
     see https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#clientCapabilities
     for more details.
+
   - "env": this file is parsed as a list of VAR=VALUE fields specifying the
     editor environment.
+
   - Golden files: Within the archive, file names starting with '@' are
     treated as "golden" content, and are not written to disk, but instead are
     made available to test methods expecting an argument of type *Golden,
     using the identifier following '@'. For example, if the first parameter of
     Foo were of type *Golden, the test runner would convert the identifier a
     in the call @foo(a, "b", 3) into a *Golden by collecting golden file
-    data starting with "@a/".
+    data starting with "@a/". As a special case, for tests that only need one
+    golden file, the data contained in the file "@a" is indexed in the *Golden
+    value by the empty string "".
+
   - proxy files: any file starting with proxy/ is treated as a Go proxy
     file. If present, these files are written to a separate temporary
     directory and GOPROXY is set to file://<proxy directory>.
@@ -151,18 +140,18 @@ The following markers are supported within marker tests:
     TODO(adonovan): in the older marker framework, the annotation asserted
     two additional fields (source="compiler", kind="error"). Restore them?
 
-  - def(src, dst location): perform a textDocument/definition request at
+  - def(src, dst location): performs a textDocument/definition request at
     the src location, and check the result points to the dst location.
 
   - documentLink(golden): asserts that textDocument/documentLink returns
     links as described by the golden file.
 
-  - foldingrange(golden): perform a textDocument/foldingRange for the
+  - foldingrange(golden): performs a textDocument/foldingRange for the
     current document, and compare with the golden content, which is the
     original source annotated with numbered tags delimiting the resulting
     ranges (e.g. <1 kind="..."> ... </1>).
 
-  - format(golden): perform a textDocument/format request for the enclosing
+  - format(golden): performs a textDocument/format request for the enclosing
     file, and compare against the named golden file. If the formatting
     request succeeds, the golden file must contain the resulting formatted
     source. If the formatting request fails, the golden file must contain
@@ -172,9 +161,12 @@ The following markers are supported within marker tests:
     textDocument/highlight request at the given src location, which should
     highlight the provided dst locations.
 
-  - hover(src, dst location, sm stringMatcher): perform a
-    textDocument/hover at the src location, and checks that the result is
-    the dst location, with matching hover content.
+  - hover(src, dst location, sm stringMatcher): performs a textDocument/hover
+    at the src location, and checks that the result is the dst location, with
+    matching hover content.
+
+  - hovererr(src, sm stringMatcher): performs a textDocument/hover at the src
+    location, and checks that the error matches the given stringMatcher.
 
   - implementations(src location, want ...location): makes a
     textDocument/implementation query at the src location and
@@ -215,7 +207,7 @@ The following markers are supported within marker tests:
     signatureHelp at the given location should match the provided string, with
     the active parameter (an index) highlighted.
 
-  - suggestedfix(location, regexp, kind, golden): like diag, the location and
+  - suggestedfix(location, regexp, golden): like diag, the location and
     regexp identify an expected diagnostic. This diagnostic must
     to have exactly one associated code action of the specified kind.
     This action is executed for its editing effects on the source files.
@@ -232,6 +224,8 @@ The following markers are supported within marker tests:
     unexpected completion items may occur in the results.
     TODO(rfindley): this exists for compatibility with the old marker tests.
     Replace this with rankl, and rename.
+    A "!" prefix on a label asserts that the symbol is not a
+    completion candidate.
 
   - rankl(location, ...label): like rank, but only cares about completion
     item labels.
@@ -245,7 +239,7 @@ The following markers are supported within marker tests:
     textDocument/completion request at the location, and searches for a
     result with label matching that of the provided completion item
     (TODO(rfindley): accept a label rather than a completion item). Check
-    the the result snippet matches the provided snippet.
+    the result snippet matches the provided snippet.
 
   - symbol(golden): makes a textDocument/documentSymbol request
     for the enclosing file, formats the response with one symbol
@@ -306,11 +300,14 @@ parameter type pairs:
 
 Here is a complete example:
 
+	This test checks hovering over constants.
+
 	-- a.go --
 	package a
 
 	const abc = 0x2a //@hover("b", "abc", abc),hover(" =", "abc", abc)
-	-- @abc/hover.md --
+
+	-- @abc --
 	```go
 	const abc untyped int = 42
 	```
@@ -326,13 +323,13 @@ The first argument holds the test context, including fake editor with open
 files, and sandboxed directory.
 
 Argument converters translate the "b" and "abc" arguments into locations by
-interpreting each one as a regular expression and finding the location of
-its first match on the preceding portion of the line, and the abc identifier
-into a dictionary of golden content containing "hover.md". Then the
-hoverMarker method executes a textDocument/hover LSP request at the src
-position, and ensures the result spans "abc", with the markdown content from
-hover.md. (Note that the markdown content includes the expect annotation as
-the doc comment.)
+interpreting each one as a substring (or as a regular expression, if of the
+form re"a|b") and finding the location of its first occurrence on the preceding
+portion of the line, and the abc identifier into a the golden content contained
+in the file @abc. Then the hoverMarker method executes a textDocument/hover LSP
+request at the src position, and ensures the result spans "abc", with the
+markdown content from @abc. (Note that the markdown content includes the expect
+annotation as the doc comment.)
 
 The next hover on the same line asserts the same result, but initiates the
 hover immediately after "abc" in the source. This tests that we find the

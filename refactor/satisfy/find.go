@@ -355,7 +355,7 @@ func (f *Finder) expr(e ast.Expr) types.Type {
 		f.sig = saved
 
 	case *ast.CompositeLit:
-		switch T := coreType(deref(tv.Type)).(type) {
+		switch T := coreType(typeparams.Deref(tv.Type)).(type) {
 		case *types.Struct:
 			for i, elem := range e.Elts {
 				if kv, ok := elem.(*ast.KeyValueExpr); ok {
@@ -411,7 +411,7 @@ func (f *Finder) expr(e ast.Expr) types.Type {
 			}
 		}
 
-	case *typeparams.IndexListExpr:
+	case *ast.IndexListExpr:
 		// f[X, Y] -- generic instantiation
 
 	case *ast.SliceExpr:
@@ -690,7 +690,7 @@ func (f *Finder) stmt(s ast.Stmt) {
 				case *types.Map:
 					xelem = ux.Elem()
 				case *types.Pointer: // *array
-					xelem = coreType(deref(ux)).(*types.Array).Elem()
+					xelem = coreType(typeparams.Deref(ux)).(*types.Array).Elem()
 				case *types.Slice:
 					xelem = ux.Elem()
 				}
@@ -708,14 +708,6 @@ func (f *Finder) stmt(s ast.Stmt) {
 
 // -- Plundered from golang.org/x/tools/go/ssa -----------------
 
-// deref returns a pointer's element type; otherwise it returns typ.
-func deref(typ types.Type) types.Type {
-	if p, ok := coreType(typ).(*types.Pointer); ok {
-		return p.Elem()
-	}
-	return typ
-}
-
 func unparen(e ast.Expr) ast.Expr { return astutil.Unparen(e) }
 
 func isInterface(T types.Type) bool { return types.IsInterface(T) }
@@ -732,6 +724,6 @@ func instance(info *types.Info, expr ast.Expr) bool {
 	default:
 		return false
 	}
-	_, ok := typeparams.GetInstances(info)[id]
+	_, ok := info.Instances[id]
 	return ok
 }

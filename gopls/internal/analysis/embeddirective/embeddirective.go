@@ -2,39 +2,32 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package embeddirective defines an Analyzer that validates //go:embed directives.
-// The analyzer defers fixes to its parent source.Analyzer.
 package embeddirective
 
 import (
+	_ "embed"
 	"go/ast"
 	"go/token"
 	"go/types"
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/internal/aliases"
+	"golang.org/x/tools/internal/analysisinternal"
 )
 
-const Doc = `check //go:embed directive usage
-
-This analyzer checks that the embed package is imported if //go:embed
-directives are present, providing a suggested fix to add the import if
-it is missing.
-
-This analyzer also checks that //go:embed directives precede the
-declaration of a single variable.`
+//go:embed doc.go
+var doc string
 
 var Analyzer = &analysis.Analyzer{
 	Name:             "embed",
-	Doc:              Doc,
-	Requires:         []*analysis.Analyzer{},
+	Doc:              analysisinternal.MustExtractDoc(doc, "embed"),
 	Run:              run,
 	RunDespiteErrors: true,
+	URL:              "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/embeddirective",
 }
 
-// source.fixedByImportingEmbed relies on this message to filter
-// out fixable diagnostics from this Analyzer.
-const MissingImportMessage = `must import "embed" when using go:embed directives`
+const FixCategory = "addembedimport" // recognized by gopls ApplyFix
 
 func run(pass *analysis.Pass) (interface{}, error) {
 	for _, f := range pass.Files {
@@ -52,28 +45,39 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		}
 
 		for _, c := range comments {
-			report := func(msg string) {
+			pos, end := c.Pos(), c.Pos()+token.Pos(len("//go:embed"))
+
+			if !hasEmbedImport {
 				pass.Report(analysis.Diagnostic{
-					Pos:     c.Pos(),
-					End:     c.Pos() + token.Pos(len("//go:embed")),
-					Message: msg,
+					Pos:      pos,
+					End:      end,
+					Message:  `must import "embed" when using go:embed directives`,
+					Category: FixCategory,
+					SuggestedFixes: []analysis.SuggestedFix{{
+						Message: `Add missing "embed" import`,
+						// No TextEdits => computed by a gopls command.
+					}},
 				})
 			}
 
-			if !hasEmbedImport {
-				report(MissingImportMessage)
-			}
-
+			var msg string
 			spec := nextVarSpec(c, f)
 			switch {
 			case spec == nil:
-				report(`go:embed directives must precede a "var" declaration`)
+				msg = `go:embed directives must precede a "var" declaration`
 			case len(spec.Names) != 1:
-				report("declarations following go:embed directives must define a single variable")
+				msg = "declarations following go:embed directives must define a single variable"
 			case len(spec.Values) > 0:
-				report("declarations following go:embed directives must not specify a value")
+				msg = "declarations following go:embed directives must not specify a value"
 			case !embeddableType(pass.TypesInfo.Defs[spec.Names[0]]):
-				report("declarations following go:embed directives must be of type string, []byte or embed.FS")
+				msg = "declarations following go:embed directives must be of type string, []byte or embed.FS"
+			}
+			if msg != "" {
+				pass.Report(analysis.Diagnostic{
+					Pos:     pos,
+					End:     end,
+					Message: msg,
+				})
 			}
 		}
 	}
@@ -144,7 +148,7 @@ func embeddableType(o types.Object) bool {
 
 	// For embed.FS the underlying type is an implementation detail.
 	// As long as the named type resolves to embed.FS, it is OK.
-	if named, ok := o.Type().(*types.Named); ok {
+	if named, ok := aliases.Unalias(o.Type()).(*types.Named); ok {
 		obj := named.Obj()
 		if obj.Pkg() != nil && obj.Pkg().Path() == "embed" && obj.Name() == "FS" {
 			return true

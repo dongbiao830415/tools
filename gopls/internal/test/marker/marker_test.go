@@ -30,16 +30,16 @@ import (
 	"github.com/google/go-cmp/cmp"
 
 	"golang.org/x/tools/go/expect"
+	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/debug"
-	"golang.org/x/tools/gopls/internal/hooks"
-	"golang.org/x/tools/gopls/internal/lsp/cache"
-	"golang.org/x/tools/gopls/internal/lsp/lsprpc"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/lsprpc"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/test/compare"
 	"golang.org/x/tools/gopls/internal/test/integration"
 	"golang.org/x/tools/gopls/internal/test/integration/fake"
 	"golang.org/x/tools/gopls/internal/util/bug"
 	"golang.org/x/tools/gopls/internal/util/safetoken"
+	"golang.org/x/tools/gopls/internal/util/slices"
 	"golang.org/x/tools/internal/diff"
 	"golang.org/x/tools/internal/diff/myers"
 	"golang.org/x/tools/internal/jsonrpc2"
@@ -53,13 +53,48 @@ var update = flag.Bool("update", false, "if set, update test data during marker 
 func TestMain(m *testing.M) {
 	bug.PanicOnBugs = true
 	testenv.ExitIfSmallMachine()
+	// Disable GOPACKAGESDRIVER, as it can cause spurious test failures.
+	os.Setenv("GOPACKAGESDRIVER", "off")
 	os.Exit(m.Run())
 }
 
 // Test runs the marker tests from the testdata directory.
 //
 // See package documentation for details on how marker tests work.
+//
+// These tests were inspired by (and in many places copied from) a previous
+// iteration of the marker tests built on top of the packagestest framework.
+// Key design decisions motivating this reimplementation are as follows:
+//   - The old tests had a single global session, causing interaction at a
+//     distance and several awkward workarounds.
+//   - The old tests could not be safely parallelized, because certain tests
+//     manipulated the server options
+//   - Relatedly, the old tests did not have a logic grouping of assertions into
+//     a single unit, resulting in clusters of files serving clusters of
+//     entangled assertions.
+//   - The old tests used locations in the source as test names and as the
+//     identity of golden content, meaning that a single edit could change the
+//     name of an arbitrary number of subtests, and making it difficult to
+//     manually edit golden content.
+//   - The old tests did not hew closely to LSP concepts, resulting in, for
+//     example, each marker implementation doing its own position
+//     transformations, and inventing its own mechanism for configuration.
+//   - The old tests had an ad-hoc session initialization process. The integration
+//     test environment has had more time devoted to its initialization, and has a
+//     more convenient API.
+//   - The old tests lacked documentation, and often had failures that were hard
+//     to understand. By starting from scratch, we can revisit these aspects.
 func Test(t *testing.T) {
+	if testing.Short() {
+		builder := os.Getenv("GO_BUILDER_NAME")
+		// Note that HasPrefix(builder, "darwin-" only matches legacy builders.
+		// LUCI builder names start with x_tools-goN.NN.
+		// We want to exclude solaris on both legacy and LUCI builders, as
+		// it is timing out.
+		if strings.HasPrefix(builder, "darwin-") || strings.Contains(builder, "solaris") {
+			t.Skip("golang/go#64473: skipping with -short: this test is too slow on darwin and solaris builders")
+		}
+	}
 	// The marker tests must be able to run go/packages.Load.
 	testenv.NeedsGoPackages(t)
 
@@ -79,10 +114,11 @@ func Test(t *testing.T) {
 			if test.skipReason != "" {
 				t.Skip(test.skipReason)
 			}
-			for _, goos := range test.skipGOOS {
-				if runtime.GOOS == goos {
-					t.Skipf("skipping on %s due to -skip_goos", runtime.GOOS)
-				}
+			if slices.Contains(test.skipGOOS, runtime.GOOS) {
+				t.Skipf("skipping on %s due to -skip_goos", runtime.GOOS)
+			}
+			if slices.Contains(test.skipGOARCH, runtime.GOARCH) {
+				t.Skipf("skipping on %s due to -skip_goos", runtime.GOOS)
 			}
 
 			// TODO(rfindley): it may be more useful to have full support for build
@@ -93,6 +129,13 @@ func Test(t *testing.T) {
 					t.Fatalf("parsing -min_go version: %v", err)
 				}
 				testenv.NeedsGo1Point(t, go1point)
+			}
+			if test.maxGoVersion != "" {
+				var go1point int
+				if _, err := fmt.Sscanf(test.maxGoVersion, "go1.%d", &go1point); err != nil {
+					t.Fatalf("parsing -max_go version: %v", err)
+				}
+				testenv.SkipAfterGo1Point(t, go1point)
 			}
 			if test.cgo {
 				testenv.NeedsTool(t, "cgo")
@@ -130,6 +173,7 @@ func Test(t *testing.T) {
 			for file := range test.files {
 				run.env.OpenFile(file)
 			}
+
 			// Wait for the didOpen notifications to be processed, then collect
 			// diagnostics.
 			var diags map[string]*protocol.PublishDiagnosticsParams
@@ -187,6 +231,13 @@ func Test(t *testing.T) {
 				}
 			}
 
+			// Now that all markers have executed, check whether there where any
+			// unexpected error logs.
+			// This guards against noisiness: see golang/go#66746)
+			if !test.errorsOK {
+				run.env.AfterChange(integration.NoErrorLogs())
+			}
+
 			formatted, err := formatTest(test)
 			if err != nil {
 				t.Errorf("formatTest: %v", err)
@@ -195,19 +246,14 @@ func Test(t *testing.T) {
 				if err := os.WriteFile(filename, formatted, 0644); err != nil {
 					t.Error(err)
 				}
-			} else {
-				// On go 1.19 and later, verify that the testdata has not changed.
-				//
-				// On earlier Go versions, the golden test data varies due to different
-				// markdown escaping.
+			} else if !t.Failed() {
+				// Verify that the testdata has not changed.
 				//
 				// Only check this if the test hasn't already failed, otherwise we'd
 				// report duplicate mismatches of golden data.
-				if testenv.Go1Point() >= 19 && !t.Failed() {
-					// Otherwise, verify that formatted content matches.
-					if diff := compare.NamedText("formatted", "on-disk", string(formatted), string(test.content)); diff != "" {
-						t.Errorf("formatted test does not match on-disk content:\n%s", diff)
-					}
+				// Otherwise, verify that formatted content matches.
+				if diff := compare.NamedText("formatted", "on-disk", string(formatted), string(test.content)); diff != "" {
+					t.Errorf("formatted test does not match on-disk content:\n%s", diff)
 				}
 			}
 		})
@@ -232,6 +278,9 @@ func (m marker) ctx() context.Context { return m.run.env.Ctx }
 func (m marker) T() testing.TB { return m.run.env.T }
 
 // server returns the LSP server for the marker test run.
+func (m marker) editor() *fake.Editor { return m.run.env.Editor }
+
+// server returns the LSP server for the marker test run.
 func (m marker) server() protocol.Server { return m.run.env.Editor.Server }
 
 // uri returns the URI of the file containing the marker.
@@ -251,7 +300,7 @@ func (mark marker) path() string {
 
 // mapper returns a *protocol.Mapper for the current file.
 func (mark marker) mapper() *protocol.Mapper {
-	mapper, err := mark.run.env.Editor.Mapper(mark.path())
+	mapper, err := mark.editor().Mapper(mark.path())
 	if err != nil {
 		mark.T().Fatalf("failed to get mapper for current mark: %v", err)
 	}
@@ -262,6 +311,7 @@ func (mark marker) mapper() *protocol.Mapper {
 //
 // It formats the error message using mark.sprintf.
 func (mark marker) errorf(format string, args ...any) {
+	mark.T().Helper()
 	msg := mark.sprintf(format, args...)
 	// TODO(adonovan): consider using fmt.Fprintf(os.Stderr)+t.Fail instead of
 	// t.Errorf to avoid reporting uninteresting positions in the Go source of
@@ -418,6 +468,7 @@ var actionMarkerFuncs = map[string]func(marker){
 	"format":           actionMarkerFunc(formatMarker),
 	"highlight":        actionMarkerFunc(highlightMarker),
 	"hover":            actionMarkerFunc(hoverMarker),
+	"hovererr":         actionMarkerFunc(hoverErrMarker),
 	"implementation":   actionMarkerFunc(implementationMarker),
 	"incomingcalls":    actionMarkerFunc(incomingCallsMarker),
 	"inlayhints":       actionMarkerFunc(inlayhintsMarker),
@@ -459,14 +510,17 @@ type markerTest struct {
 	skipReason string   // the skip reason extracted from the "skip" archive file
 	flags      []string // flags extracted from the special "flags" archive file.
 
-	// Parsed flags values.
+	// Parsed flags values. See the flag definitions below for documentation.
 	minGoVersion     string
+	maxGoVersion     string
 	cgo              bool
-	writeGoSum       []string // comma separated dirs to write go sum for
-	skipGOOS         []string // comma separated GOOS values to skip
+	writeGoSum       []string
+	skipGOOS         []string
+	skipGOARCH       []string
 	ignoreExtraDiags bool
 	filterBuiltins   bool
 	filterKeywords   bool
+	errorsOK         bool
 }
 
 // flagSet returns the flagset used for parsing the special "flags" file in the
@@ -474,12 +528,15 @@ type markerTest struct {
 func (t *markerTest) flagSet() *flag.FlagSet {
 	flags := flag.NewFlagSet(t.name, flag.ContinueOnError)
 	flags.StringVar(&t.minGoVersion, "min_go", "", "if set, the minimum go1.X version required for this test")
+	flags.StringVar(&t.maxGoVersion, "max_go", "", "if set, the maximum go1.X version required for this test")
 	flags.BoolVar(&t.cgo, "cgo", false, "if set, requires cgo (both the cgo tool and CGO_ENABLED=1)")
 	flags.Var((*stringListValue)(&t.writeGoSum), "write_sumfile", "if set, write the sumfile for these directories")
 	flags.Var((*stringListValue)(&t.skipGOOS), "skip_goos", "if set, skip this test on these GOOS values")
+	flags.Var((*stringListValue)(&t.skipGOARCH), "skip_goarch", "if set, skip this test on these GOARCH values")
 	flags.BoolVar(&t.ignoreExtraDiags, "ignore_extra_diags", false, "if set, suppress errors for unmatched diagnostics")
 	flags.BoolVar(&t.filterBuiltins, "filter_builtins", true, "if set, filter builtins from completion results")
 	flags.BoolVar(&t.filterKeywords, "filter_keywords", true, "if set, filter keywords from completion results")
+	flags.BoolVar(&t.errorsOK, "errors_ok", false, "if set, Error level log messages are acceptable in this test")
 	return flags
 }
 
@@ -663,6 +720,15 @@ func loadMarkerTest(name string, content []byte) (*markerTest, error) {
 				return nil, fmt.Errorf("%s:%d: unwanted space before marker (// @)", file.Name, line)
 			}
 
+			// The 'go list' command doesn't work correct with modules named
+			// testdata", so don't allow it as a module name (golang/go#65406).
+			// (Otherwise files within it will end up in an ad hoc
+			// package, "command-line-arguments/$TMPDIR/...".)
+			if filepath.Base(file.Name) == "go.mod" &&
+				bytes.Contains(file.Data, []byte("module testdata")) {
+				return nil, fmt.Errorf("'testdata' is not a valid module name")
+			}
+
 			test.notes = append(test.notes, notes...)
 			test.files[file.Name] = file.Data
 		}
@@ -757,10 +823,10 @@ func newEnv(t *testing.T, cache *cache.Cache, files, proxyFiles map[string][]byt
 	// Put a debug instance in the context to prevent logging to stderr.
 	// See associated TODO in runner.go: we should revisit this pattern.
 	ctx := context.Background()
-	ctx = debug.WithInstance(ctx, "", "off")
+	ctx = debug.WithInstance(ctx, "off")
 
 	awaiter := integration.NewAwaiter(sandbox.Workdir)
-	ss := lsprpc.NewStreamServer(cache, false, hooks.Options)
+	ss := lsprpc.NewStreamServer(cache, false, nil)
 	server := servertest.NewPipeServer(ss, jsonrpc2.NewRawStream)
 	const skipApplyEdits = true // capture edits but don't apply them
 	editor, err := fake.NewEditor(sandbox, config).Connect(ctx, server, awaiter.Hooks(), skipApplyEdits)
@@ -912,14 +978,14 @@ func (run *markerTestRun) fmtLocDetails(loc protocol.Location, includeTxtPos boo
 
 // converter is the signature of argument converters.
 // A converter should return an error rather than calling marker.errorf().
-type converter func(marker, any) (any, error)
+//
+// type converter func(marker, any) (any, error)
 
 // Types with special conversions.
 var (
 	goldenType        = reflect.TypeOf(&Golden{})
 	locationType      = reflect.TypeOf(protocol.Location{})
 	markerType        = reflect.TypeOf(marker{})
-	regexpType        = reflect.TypeOf(&regexp.Regexp{})
 	stringMatcherType = reflect.TypeOf(stringMatcher{})
 )
 
@@ -1120,6 +1186,15 @@ func checkDiffs(mark marker, changed map[string][]byte, golden *Golden) {
 	for name, after := range changed {
 		before := mark.run.env.FileContent(name)
 		// TODO(golang/go#64023): switch back to diff.Strings.
+		// The attached issue is only one obstacle to switching.
+		// Another is that different diff algorithms produce
+		// different results, so if we commit diffs in test
+		// expectations, then we need to either (1) state
+		// which diff implementation they use and never change
+		// it, or (2) don't compare diffs, but instead apply
+		// the "want" diff and check that it produces the
+		// "got" output. Option 2 is more robust, as it allows
+		// the test expectation to use any valid diff.
 		edits := myers.ComputeEdits(before, string(after))
 		d, err := diff.ToUnified("before", "after", before, edits, 0)
 		if err != nil {
@@ -1185,19 +1260,35 @@ func completionItemMarker(mark marker, label string, other ...string) completion
 }
 
 func rankMarker(mark marker, src protocol.Location, items ...completionItem) {
+	// Separate positive and negative items (expectations).
+	var pos, neg []completionItem
+	for _, item := range items {
+		if strings.HasPrefix(item.Label, "!") {
+			neg = append(neg, item)
+		} else {
+			pos = append(pos, item)
+		}
+	}
+
+	// Collect results that are present in items, preserving their order.
 	list := mark.run.env.Completion(src)
 	var got []string
-	// Collect results that are present in items, preserving their order.
 	for _, g := range list.Items {
-		for _, w := range items {
+		for _, w := range pos {
 			if g.Label == w.Label {
 				got = append(got, g.Label)
 				break
 			}
 		}
+		for _, w := range neg {
+			if g.Label == w.Label[len("!"):] {
+				mark.errorf("got unwanted completion: %s", g.Label)
+				break
+			}
+		}
 	}
 	var want []string
-	for _, w := range items {
+	for _, w := range pos {
 		want = append(want, w.Label)
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
@@ -1206,18 +1297,27 @@ func rankMarker(mark marker, src protocol.Location, items ...completionItem) {
 }
 
 func ranklMarker(mark marker, src protocol.Location, labels ...string) {
-	list := mark.run.env.Completion(src)
-	var got []string
-	// Collect results that are present in items, preserving their order.
-	for _, g := range list.Items {
-		for _, label := range labels {
-			if g.Label == label {
-				got = append(got, g.Label)
-				break
-			}
+	// Separate positive and negative labels (expectations).
+	var pos, neg []string
+	for _, label := range labels {
+		if strings.HasPrefix(label, "!") {
+			neg = append(neg, label[len("!"):])
+		} else {
+			pos = append(pos, label)
 		}
 	}
-	if diff := cmp.Diff(labels, got); diff != "" {
+
+	// Collect results that are present in items, preserving their order.
+	list := mark.run.env.Completion(src)
+	var got []string
+	for _, g := range list.Items {
+		if slices.Contains(pos, g.Label) {
+			got = append(got, g.Label)
+		} else if slices.Contains(neg, g.Label) {
+			mark.errorf("got unwanted completion: %s", g.Label)
+		}
+	}
+	if diff := cmp.Diff(pos, got); diff != "" {
 		mark.errorf("completion rankings do not match (-want +got):\n%s", diff)
 	}
 }
@@ -1456,10 +1556,6 @@ func highlightMarker(mark marker, src protocol.Location, dsts ...protocol.Locati
 	}
 }
 
-// hoverMarker implements the @hover marker, running textDocument/hover at the
-// given src location and asserting that the resulting hover is over the dst
-// location (typically a span surrounding src), and that the markdown content
-// matches the golden content.
 func hoverMarker(mark marker, src, dst protocol.Location, sc stringMatcher) {
 	content, gotDst := mark.run.env.Hover(src)
 	if gotDst != dst {
@@ -1470,6 +1566,11 @@ func hoverMarker(mark marker, src, dst protocol.Location, sc stringMatcher) {
 		gotMD = content.Value
 	}
 	sc.check(mark, gotMD)
+}
+
+func hoverErrMarker(mark marker, src protocol.Location, em stringMatcher) {
+	_, _, err := mark.editor().Hover(mark.ctx(), src)
+	em.checkErr(mark, err)
 }
 
 // locMarker implements the @loc marker. It is executed before other
@@ -1650,7 +1751,7 @@ func applyDocumentChanges(env *integration.Env, changes []protocol.DocumentChang
 			if err != nil {
 				return err
 			}
-			patched, _, err := protocol.ApplyEdits(mapper, change.TextDocumentEdit.Edits)
+			patched, _, err := protocol.ApplyEdits(mapper, protocol.AsTextEdits(change.TextDocumentEdit.Edits))
 			if err != nil {
 				return err
 			}
@@ -1874,6 +1975,23 @@ func codeActionChanges(env *integration.Env, uri protocol.DocumentURI, rng proto
 	// applied in that order. But since applyDocumentChanges(env,
 	// action.Edit.DocumentChanges) doesn't compose, for now we
 	// assert that actions return one or the other.
+
+	// Resolve code action edits first if the client has resolve support
+	// and the code action has no edits.
+	if action.Edit == nil {
+		editSupport, err := env.Editor.EditResolveSupport()
+		if err != nil {
+			return nil, err
+		}
+		if editSupport {
+			resolved, err := env.Editor.Server.ResolveCodeAction(env.Ctx, &action)
+			if err != nil {
+				return nil, err
+			}
+			action.Edit = resolved.Edit
+		}
+	}
+
 	if action.Edit != nil {
 		if action.Edit.Changes != nil {
 			env.T.Errorf("internal error: discarding unexpected CodeAction{Kind=%s, Title=%q}.Edit.Changes", action.Kind, action.Title)

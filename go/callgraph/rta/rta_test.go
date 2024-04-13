@@ -23,7 +23,7 @@ import (
 	"golang.org/x/tools/go/loader"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
-	"golang.org/x/tools/internal/typeparams"
+	"golang.org/x/tools/internal/aliases"
 )
 
 // TestRTA runs RTA on each testdata/*.go file and compares the
@@ -38,10 +38,6 @@ func TestRTA(t *testing.T) {
 	}
 	for _, filename := range filenames {
 		t.Run(filename, func(t *testing.T) {
-			if !typeparams.Enabled && strings.HasSuffix(filename, "generics.go") {
-				t.Skip("TestRTAGenerics requires type parameters")
-			}
-
 			// Load main program and build SSA.
 			// TODO(adonovan): use go/packages instead.
 			conf := loader.Config{ParserMode: parser.ParseComments}
@@ -205,7 +201,7 @@ func check(t *testing.T, f *ast.File, pkg *ssa.Package, res *rta.Result) {
 		got := make(stringset)
 		res.RuntimeTypes.Iterate(func(key types.Type, value interface{}) {
 			if !value.(bool) { // accessible to reflection
-				typ := types.TypeString(key, types.RelativeTo(pkg.Pkg))
+				typ := types.TypeString(aliases.Unalias(key), types.RelativeTo(pkg.Pkg))
 				got[typ] = true
 			}
 		})

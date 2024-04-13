@@ -11,18 +11,18 @@ import (
 	"path/filepath"
 
 	"golang.org/x/mod/modfile"
+	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/file"
-	"golang.org/x/tools/gopls/internal/lsp/cache"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/internal/event"
 )
 
-func Diagnose(ctx context.Context, snapshot *cache.Snapshot) (map[protocol.DocumentURI][]*cache.Diagnostic, error) {
+func Diagnostics(ctx context.Context, snapshot *cache.Snapshot) (map[protocol.DocumentURI][]*cache.Diagnostic, error) {
 	ctx, done := event.Start(ctx, "work.Diagnostics", snapshot.Labels()...)
 	defer done()
 
 	reports := map[protocol.DocumentURI][]*cache.Diagnostic{}
-	uri := snapshot.WorkFile()
+	uri := snapshot.View().GoWork()
 	if uri == "" {
 		return nil, nil
 	}

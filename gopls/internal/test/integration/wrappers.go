@@ -8,8 +8,8 @@ import (
 	"encoding/json"
 	"path"
 
-	"golang.org/x/tools/gopls/internal/lsp/command"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
+	"golang.org/x/tools/gopls/internal/protocol/command"
 	"golang.org/x/tools/gopls/internal/test/integration/fake"
 	"golang.org/x/tools/internal/xcontext"
 )
@@ -318,10 +318,10 @@ func (e *Env) GoVersion() int {
 func (e *Env) DumpGoSum(dir string) {
 	e.T.Helper()
 
-	if err := e.Sandbox.RunGoCommand(e.Ctx, dir, "list", []string{"-mod=mod", "..."}, nil, true); err != nil {
+	if err := e.Sandbox.RunGoCommand(e.Ctx, dir, "list", []string{"-mod=mod", "./..."}, nil, true); err != nil {
 		e.T.Fatal(err)
 	}
-	sumFile := path.Join(dir, "/go.sum")
+	sumFile := path.Join(dir, "go.sum")
 	e.T.Log("\n\n-- " + sumFile + " --\n" + e.ReadWorkspaceFile(sumFile))
 	e.T.Fatal("see contents above")
 }
@@ -391,6 +391,20 @@ func (e *Env) ExecuteCommand(params *protocol.ExecuteCommandParams, result inter
 	if err := json.Unmarshal(data, result); err != nil {
 		e.T.Fatal(err)
 	}
+}
+
+// Views returns the server's views.
+func (e *Env) Views() []command.View {
+	var summaries []command.View
+	cmd, err := command.NewViewsCommand("")
+	if err != nil {
+		e.T.Fatal(err)
+	}
+	e.ExecuteCommand(&protocol.ExecuteCommandParams{
+		Command:   cmd.Command,
+		Arguments: cmd.Arguments,
+	}, &summaries)
+	return summaries
 }
 
 // StartProfile starts a CPU profile with the given name, using the

@@ -367,6 +367,32 @@ func TestLoadAbsolutePath(t *testing.T) {
 	}
 }
 
+func TestLoadArgumentListIsNotTooLong(t *testing.T) {
+	// NOTE: this test adds about 2s to the test suite running time
+
+	t.Parallel()
+
+	// using the real ARG_MAX for some platforms increases the running time of this test by a lot,
+	// 1_000_000 seems like enough to break Windows and macOS if Load doesn't split provided patterns
+	argMax := 1_000_000
+	exported := packagestest.Export(t, packagestest.GOPATH, []packagestest.Module{{
+		Name: "golang.org/mod",
+		Files: map[string]interface{}{
+			"main.go": `package main"`,
+		}}})
+	defer exported.Cleanup()
+	numOfPatterns := argMax/16 + 1 // the pattern below is approx. 16 chars
+	patterns := make([]string, numOfPatterns)
+	for i := 0; i < numOfPatterns; i++ {
+		patterns[i] = fmt.Sprintf("golang.org/mod/p%d", i)
+	} // patterns have more than argMax number of chars combined with whitespaces b/w patterns
+
+	_, err := packages.Load(exported.Config, patterns...)
+	if err != nil {
+		t.Fatalf("failed to load: %v", err)
+	}
+}
+
 func TestVendorImports(t *testing.T) {
 	t.Parallel()
 
@@ -1308,7 +1334,7 @@ func testNoPatterns(t *testing.T, exporter packagestest.Exporter) {
 
 func TestJSON(t *testing.T) { testAllOrModulesParallel(t, testJSON) }
 func testJSON(t *testing.T, exporter packagestest.Exporter) {
-	//TODO: add in some errors
+	// TODO: add in some errors
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
 		Files: map[string]interface{}{
@@ -2444,9 +2470,6 @@ func testIssue37098(t *testing.T, exporter packagestest.Exporter) {
 	// causes C++ sources to be inadvertently included in
 	// (*Package).CompiledGoFiles.
 
-	// This is fixed in Go 1.17, but not earlier.
-	testenv.NeedsGo1Point(t, 17)
-
 	if _, err := exec.LookPath("swig"); err != nil {
 		t.Skip("skipping test: swig not available")
 	}
@@ -2952,4 +2975,44 @@ func TestExportFile(t *testing.T) {
 	cfg := new(packages.Config)
 	cfg.Mode = packages.NeedTypes
 	packages.Load(cfg, "fmt")
+}
+
+// TestLoadEitherSucceedsOrFails is an attempt to reproduce a sporadic
+// failure observed on the Android emu builders in which Load would
+// return an empty list of packages but no error. We don't expect
+// packages.Load to succeed on that platform, and testenv.NeedsGoBuild
+// would ordinarily suppress the attempt if called early. But
+// regardless of whether the 'go' command is functional, Load should
+// never return an empty set of packages but no error.
+func TestLoadEitherSucceedsOrFails(t *testing.T) {
+	const src = `package p`
+	dir := t.TempDir()
+	cfg := &packages.Config{
+		Dir:  dir,
+		Mode: packages.LoadSyntax,
+		Overlay: map[string][]byte{
+			filepath.Join(dir, "p.go"): []byte(src),
+		},
+	}
+	initial, err := packages.Load(cfg, "./p.go")
+	if err != nil {
+		// If Load failed because it needed 'go' and the
+		// platform doesn't have it, silently skip the test.
+		testenv.NeedsGoBuild(t)
+
+		// Otherwise, it's a real failure.
+		t.Fatal(err)
+	}
+
+	// If Load returned without error,
+	// it had better give us error-free packages.
+	if packages.PrintErrors(initial) > 0 {
+		t.Errorf("packages contain errors")
+	}
+
+	// If Load returned without error,
+	// it had better give us the correct number packages.
+	if len(initial) != 1 {
+		t.Errorf("Load returned %d packages (want 1) and no error", len(initial))
+	}
 }

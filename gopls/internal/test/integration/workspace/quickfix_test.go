@@ -8,13 +8,15 @@ import (
 	"strings"
 	"testing"
 
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/test/compare"
 
 	. "golang.org/x/tools/gopls/internal/test/integration"
 )
 
 func TestQuickFix_UseModule(t *testing.T) {
+	t.Skip("temporary skip for golang/go#57979: with zero-config gopls these files are no longer orphaned")
+
 	const files = `
 -- go.work --
 go 1.20
@@ -98,6 +100,8 @@ use (
 }
 
 func TestQuickFix_AddGoWork(t *testing.T) {
+	t.Skip("temporary skip for golang/go#57979: with zero-config gopls these files are no longer orphaned")
+
 	const files = `
 -- a/go.mod --
 module mod.com/a
@@ -206,6 +210,8 @@ use (
 }
 
 func TestQuickFix_UnsavedGoWork(t *testing.T) {
+	t.Skip("temporary skip for golang/go#57979: with zero-config gopls these files are no longer orphaned")
+
 	const files = `
 -- go.work --
 go 1.21
@@ -269,6 +275,8 @@ func main() {}
 }
 
 func TestQuickFix_GOWORKOff(t *testing.T) {
+	t.Skip("temporary skip for golang/go#57979: with zero-config gopls these files are no longer orphaned")
+
 	const files = `
 -- go.work --
 go 1.21
@@ -336,6 +344,8 @@ func TestStubMethods64087(t *testing.T) {
 	// We can't use the @fix or @suggestedfixerr or @codeactionerr
 	// because the error now reported by the corrected logic
 	// is internal and silently causes no fix to be offered.
+	//
+	// See also the similar TestStubMethods64545 below.
 
 	const files = `
 This is a regression test for a panic (issue #64087) in stub methods.
@@ -379,6 +389,60 @@ type myerror struct{any}
 		}
 		if !found {
 			t.Fatalf("Expected WrongResultCount diagnostic not found.")
+		}
+
+		// GetQuickFixes should not panic (the original bug).
+		fixes := env.GetQuickFixes("a.go", d.Diagnostics)
+
+		// We should not be offered a "stub methods" fix.
+		for _, fix := range fixes {
+			if strings.Contains(fix.Title, "Implement error") {
+				t.Errorf("unexpected 'stub methods' fix: %#v", fix)
+			}
+		}
+	})
+}
+
+func TestStubMethods64545(t *testing.T) {
+	// We can't use the @fix or @suggestedfixerr or @codeactionerr
+	// because the error now reported by the corrected logic
+	// is internal and silently causes no fix to be offered.
+	//
+	// TODO(adonovan): we may need to generalize this test and
+	// TestStubMethods64087 if this happens a lot.
+
+	const files = `
+This is a regression test for a panic (issue #64545) in stub methods.
+
+The illegal expression int("") caused a "cannot convert" error that
+spuriously triggered the "stub methods" in a function whose var
+spec had no RHS values, leading to an out-of-bounds index.
+
+-- go.mod --
+module mod.com
+go 1.18
+
+-- a.go --
+package a
+
+var _ [int("")]byte
+`
+	Run(t, files, func(t *testing.T, env *Env) {
+		env.OpenFile("a.go")
+
+		// Expect a "cannot convert" diagnostic, and perhaps others.
+		var d protocol.PublishDiagnosticsParams
+		env.AfterChange(ReadDiagnostics("a.go", &d))
+
+		found := false
+		for i, diag := range d.Diagnostics {
+			t.Logf("Diagnostics[%d] = %q (%s)", i, diag.Message, diag.Source)
+			if strings.Contains(diag.Message, "cannot convert") {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("Expected 'cannot convert' diagnostic not found.")
 		}
 
 		// GetQuickFixes should not panic (the original bug).

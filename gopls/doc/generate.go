@@ -32,10 +32,10 @@ import (
 	"github.com/jba/printsrc"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/packages"
-	"golang.org/x/tools/gopls/internal/lsp/command"
-	"golang.org/x/tools/gopls/internal/lsp/command/commandmeta"
-	"golang.org/x/tools/gopls/internal/lsp/source"
+	"golang.org/x/tools/gopls/internal/golang"
 	"golang.org/x/tools/gopls/internal/mod"
+	"golang.org/x/tools/gopls/internal/protocol/command"
+	"golang.org/x/tools/gopls/internal/protocol/command/commandmeta"
 	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/gopls/internal/util/safetoken"
 )
@@ -108,12 +108,13 @@ func loadAPI() (*settings.APIJSON, error) {
 	}
 	pkg := pkgs[0]
 
-	api := &settings.APIJSON{
-		Options: map[string][]*settings.OptionJSON{},
-	}
 	defaults := settings.DefaultOptions()
+	api := &settings.APIJSON{
+		Options:   map[string][]*settings.OptionJSON{},
+		Analyzers: loadAnalyzers(settings.DefaultAnalyzers), // no staticcheck analyzers
+	}
 
-	api.Commands, err = loadCommands(pkg)
+	api.Commands, err = loadCommands()
 	if err != nil {
 		return nil, err
 	}
@@ -123,15 +124,7 @@ func loadAPI() (*settings.APIJSON, error) {
 	for _, c := range api.Commands {
 		c.Command = command.ID(c.Command)
 	}
-	for _, m := range []map[string]*settings.Analyzer{
-		defaults.DefaultAnalyzers,
-		defaults.TypeErrorAnalyzers,
-		defaults.ConvenienceAnalyzers,
-		// Don't yet add staticcheck analyzers.
-	} {
-		api.Analyzers = append(api.Analyzers, loadAnalyzers(m)...)
-	}
-	api.Hints = loadHints(source.AllInlayHints)
+	api.Hints = loadHints(golang.AllInlayHints)
 	for _, category := range []reflect.Value{
 		reflect.ValueOf(defaults.UserOptions),
 	} {
@@ -249,7 +242,7 @@ func loadOptions(category reflect.Value, optsType types.Object, pkg *packages.Pa
 		name := lowerFirst(typesField.Name())
 
 		var enumKeys settings.EnumKeys
-		if m, ok := typesField.Type().(*types.Map); ok {
+		if m, ok := typesField.Type().Underlying().(*types.Map); ok {
 			e, ok := enums[m.Key()]
 			if ok {
 				typ = strings.Replace(typ, m.Key().String(), m.Key().Underlying().String(), 1)
@@ -320,7 +313,7 @@ func collectEnumKeys(name string, m *types.Map, reflectField reflect.Value, enum
 	}
 	// We can get default values for enum -> bool maps.
 	var isEnumBoolMap bool
-	if basic, ok := m.Elem().(*types.Basic); ok && basic.Kind() == types.Bool {
+	if basic, ok := m.Elem().Underlying().(*types.Basic); ok && basic.Kind() == types.Bool {
 		isEnumBoolMap = true
 	}
 	for _, v := range enumValues {
@@ -410,7 +403,7 @@ func valueDoc(name, value, doc string) string {
 	return fmt.Sprintf("`%s`: %s", value, doc)
 }
 
-func loadCommands(pkg *packages.Package) ([]*settings.CommandJSON, error) {
+func loadCommands() ([]*settings.CommandJSON, error) {
 	var commands []*settings.CommandJSON
 
 	_, cmds, err := commandmeta.Load()
@@ -488,7 +481,7 @@ func structDoc(fields []*commandmeta.Field, level int) string {
 
 func loadLenses(commands []*settings.CommandJSON) []*settings.LensJSON {
 	all := map[command.Command]struct{}{}
-	for k := range source.LensFuncs() {
+	for k := range golang.LensFuncs() {
 		all[k] = struct{}{}
 	}
 	for k := range mod.LensFuncs() {
@@ -515,23 +508,23 @@ func loadLenses(commands []*settings.CommandJSON) []*settings.LensJSON {
 func loadAnalyzers(m map[string]*settings.Analyzer) []*settings.AnalyzerJSON {
 	var sorted []string
 	for _, a := range m {
-		sorted = append(sorted, a.Analyzer.Name)
+		sorted = append(sorted, a.Analyzer().Name)
 	}
 	sort.Strings(sorted)
 	var json []*settings.AnalyzerJSON
 	for _, name := range sorted {
 		a := m[name]
 		json = append(json, &settings.AnalyzerJSON{
-			Name:    a.Analyzer.Name,
-			Doc:     a.Analyzer.Doc,
-			URL:     a.Analyzer.URL,
-			Default: a.Enabled,
+			Name:    a.Analyzer().Name,
+			Doc:     a.Analyzer().Doc,
+			URL:     a.Analyzer().URL,
+			Default: a.EnabledByDefault(),
 		})
 	}
 	return json
 }
 
-func loadHints(m map[string]*source.Hint) []*settings.HintJSON {
+func loadHints(m map[string]*golang.Hint) []*settings.HintJSON {
 	var sorted []string
 	for _, h := range m {
 		sorted = append(sorted, h.Name)
@@ -748,7 +741,10 @@ func rewriteAnalyzers(doc []byte, api *settings.APIJSON) ([]byte, error) {
 	section := bytes.NewBuffer(nil)
 	for _, analyzer := range api.Analyzers {
 		fmt.Fprintf(section, "## **%v**\n\n", analyzer.Name)
-		fmt.Fprintf(section, "%s\n\n", analyzer.Doc)
+		fmt.Fprintf(section, "%s: %s\n\n", analyzer.Name, analyzer.Doc)
+		if analyzer.URL != "" {
+			fmt.Fprintf(section, "[Full documentation](%s)\n\n", analyzer.URL)
+		}
 		switch analyzer.Default {
 		case true:
 			fmt.Fprintf(section, "**Enabled by default.**\n\n")

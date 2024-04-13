@@ -40,9 +40,9 @@ import (
 
 	"golang.org/x/tools/gopls/internal/cmd"
 	"golang.org/x/tools/gopls/internal/debug"
-	"golang.org/x/tools/gopls/internal/hooks"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/util/bug"
+	"golang.org/x/tools/gopls/internal/version"
 	"golang.org/x/tools/internal/testenv"
 	"golang.org/x/tools/internal/tool"
 	"golang.org/x/tools/txtar"
@@ -55,13 +55,20 @@ func TestVersion(t *testing.T) {
 	tree := writeTree(t, "")
 
 	// There's not much we can robustly assert about the actual version.
-	want := debug.Version() // e.g. "master"
+	want := version.Version() // e.g. "master"
 
 	// basic
 	{
 		res := gopls(t, tree, "version")
 		res.checkExit(true)
 		res.checkStdout(want)
+	}
+
+	// basic, with version override
+	{
+		res := goplsWithEnv(t, tree, []string{"TEST_GOPLS_VERSION=v1.2.3"}, "version")
+		res.checkExit(true)
+		res.checkStdout(`v1\.2\.3`)
 	}
 
 	// -json flag
@@ -95,6 +102,12 @@ var _ = fmt.Sprintf("%s", 123)
 package a
 import "fmt"
 var _ = fmt.Sprintf("%d", "123")
+-- c/c.go --
+package c
+var C int
+-- c/c2.go --
+package c
+var C int
 `)
 
 	// no files
@@ -119,6 +132,14 @@ var _ = fmt.Sprintf("%d", "123")
 		res.checkExit(true)
 		res.checkStdout(`a.go:.* fmt.Sprintf format %s has arg 123 of wrong type int`)
 		res.checkStdout(`b.go:.* fmt.Sprintf format %d has arg "123" of wrong type string`)
+	}
+
+	// diagnostic with related information spanning files
+	{
+		res := gopls(t, tree, "check", "./c/c2.go")
+		res.checkExit(true)
+		res.checkStdout(`c2.go:2:5-6: C redeclared in this block`)
+		res.checkStdout(`c.go:2:5-6: - other declaration of C`)
 	}
 }
 
@@ -894,13 +915,13 @@ package foo
 		if got := len(stats2.BugReports); got > 0 {
 			t.Errorf("Got %d bug reports with -anon, want 0. Reports:%+v", got, stats2.BugReports)
 		}
-		var stats2AsMap map[string]interface{}
+		var stats2AsMap map[string]any
 		if err := json.Unmarshal([]byte(res2.stdout), &stats2AsMap); err != nil {
 			t.Fatalf("failed to unmarshal JSON output of stats command: %v", err)
 		}
 		// GOPACKAGESDRIVER is user information, but is ok to print zero value.
-		if v, ok := stats2AsMap["GOPACKAGESDRIVER"]; !ok || v != "" {
-			t.Errorf(`Got GOPACKAGESDRIVER=(%q, %v); want ("", true(found))`, v, ok)
+		if v, ok := stats2AsMap["GOPACKAGESDRIVER"]; ok && v != "" {
+			t.Errorf(`Got GOPACKAGESDRIVER=(%v, %v); want ("", true(found))`, v, ok)
 		}
 	}
 
@@ -978,7 +999,7 @@ var _ io.Reader = C{}
 type C struct{}
 
 // Read implements io.Reader.
-func (C) Read(p []byte) (n int, err error) {
+func (c C) Read(p []byte) (n int, err error) {
 	panic("unimplemented")
 }
 `[1:]
@@ -1034,7 +1055,11 @@ func goplsMain() {
 		bug.PanicOnBugs = true
 	}
 
-	tool.Main(context.Background(), cmd.New("gopls", "", nil, hooks.Options), os.Args[1:])
+	if v := os.Getenv("TEST_GOPLS_VERSION"); v != "" {
+		version.VersionOverride = v
+	}
+
+	tool.Main(context.Background(), cmd.New(), os.Args[1:])
 }
 
 // writeTree extracts a txtar archive into a new directory and returns its path.
@@ -1042,7 +1067,7 @@ func writeTree(t *testing.T, archive string) string {
 	root := t.TempDir()
 
 	// This unfortunate step is required because gopls output
-	// expands symbolic links it its input file names (arguably it
+	// expands symbolic links in its input file names (arguably it
 	// should not), and on macOS the temp dir is in /var -> private/var.
 	root, err := filepath.EvalSymlinks(root)
 	if err != nil {
@@ -1077,6 +1102,7 @@ func goplsWithEnv(t *testing.T, dir string, env []string, args ...string) *resul
 
 	goplsCmd := exec.Command(os.Args[0], args...)
 	goplsCmd.Env = append(os.Environ(), "ENTRYPOINT=goplsMain")
+	goplsCmd.Env = append(goplsCmd.Env, "GOPACKAGESDRIVER=off")
 	goplsCmd.Env = append(goplsCmd.Env, env...)
 	goplsCmd.Dir = dir
 	goplsCmd.Stdout = new(bytes.Buffer)

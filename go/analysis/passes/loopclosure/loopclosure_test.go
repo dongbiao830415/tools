@@ -13,17 +13,16 @@ import (
 	"golang.org/x/tools/go/analysis/analysistest"
 	"golang.org/x/tools/go/analysis/passes/loopclosure"
 	"golang.org/x/tools/internal/testenv"
-	"golang.org/x/tools/internal/typeparams"
 	"golang.org/x/tools/txtar"
 )
 
 func Test(t *testing.T) {
+	// legacy loopclosure test expectations are incorrect > 1.21.
+	testenv.SkipAfterGo1Point(t, 21)
+
 	testdata := analysistest.TestData()
-	tests := []string{"a", "golang.org/...", "subtests"}
-	if typeparams.Enabled {
-		tests = append(tests, "typeparams")
-	}
-	analysistest.Run(t, testdata, loopclosure.Analyzer, tests...)
+	analysistest.Run(t, testdata, loopclosure.Analyzer,
+		"a", "golang.org/...", "subtests", "typeparams")
 }
 
 func TestVersions22(t *testing.T) {
@@ -34,8 +33,6 @@ func TestVersions22(t *testing.T) {
 }
 
 func TestVersions18(t *testing.T) {
-	testenv.NeedsGo1Point(t, 18)
-
 	testfile := filepath.Join(analysistest.TestData(), "src", "versions", "go18.txtar")
 	runTxtarFile(t, testfile, loopclosure.Analyzer, "golang.org/fake/versions")
 }

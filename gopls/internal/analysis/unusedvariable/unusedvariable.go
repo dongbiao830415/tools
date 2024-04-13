@@ -18,10 +18,7 @@ import (
 	"golang.org/x/tools/go/ast/astutil"
 )
 
-const Doc = `check for unused variables
-
-The unusedvariable analyzer suggests fixes for unused variables errors.
-`
+const Doc = `check for unused variables and suggest fixes`
 
 var Analyzer = &analysis.Analyzer{
 	Name:             "unusedvariable",
@@ -29,6 +26,7 @@ var Analyzer = &analysis.Analyzer{
 	Requires:         []*analysis.Analyzer{},
 	Run:              run,
 	RunDespiteErrors: true, // an unusedvariable diagnostic is a compile error
+	URL:              "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/unusedvariable",
 }
 
 // The suffix for this error message changed in Go 1.20.
@@ -39,6 +37,9 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		for _, suffix := range unusedVariableSuffixes {
 			if strings.HasSuffix(typeErr.Msg, suffix) {
 				varName := strings.TrimSuffix(typeErr.Msg, suffix)
+				// Beginning in Go 1.23, go/types began quoting vars as `v'.
+				varName = strings.Trim(varName, "'`'")
+
 				err := runForError(pass, typeErr, varName)
 				if err != nil {
 					return nil, err
@@ -106,7 +107,7 @@ func runForError(pass *analysis.Pass, err types.Error, name string) error {
 				continue
 			}
 
-			fixes := removeVariableFromAssignment(pass, path, stmt, ident)
+			fixes := removeVariableFromAssignment(path, stmt, ident)
 			// fixes may be nil
 			if len(fixes) > 0 {
 				diag.SuggestedFixes = fixes
@@ -157,10 +158,14 @@ func removeVariableFromSpec(pass *analysis.Pass, path []ast.Node, stmt *ast.Valu
 		// Find parent DeclStmt and delete it
 		for _, node := range path {
 			if declStmt, ok := node.(*ast.DeclStmt); ok {
+				edits := deleteStmtFromBlock(path, declStmt)
+				if len(edits) == 0 {
+					return nil // can this happen?
+				}
 				return []analysis.SuggestedFix{
 					{
 						Message:   suggestedFixMessage(ident.Name),
-						TextEdits: deleteStmtFromBlock(path, declStmt),
+						TextEdits: edits,
 					},
 				}
 			}
@@ -187,7 +192,7 @@ func removeVariableFromSpec(pass *analysis.Pass, path []ast.Node, stmt *ast.Valu
 	}
 }
 
-func removeVariableFromAssignment(pass *analysis.Pass, path []ast.Node, stmt *ast.AssignStmt, ident *ast.Ident) []analysis.SuggestedFix {
+func removeVariableFromAssignment(path []ast.Node, stmt *ast.AssignStmt, ident *ast.Ident) []analysis.SuggestedFix {
 	// The only variable in the assignment is unused
 	if len(stmt.Lhs) == 1 {
 		// If LHS has only one expression to be valid it has to have 1 expression
@@ -210,10 +215,14 @@ func removeVariableFromAssignment(pass *analysis.Pass, path []ast.Node, stmt *as
 		}
 
 		// RHS does not have any side effects, delete the whole statement
+		edits := deleteStmtFromBlock(path, stmt)
+		if len(edits) == 0 {
+			return nil // can this happen?
+		}
 		return []analysis.SuggestedFix{
 			{
 				Message:   suggestedFixMessage(ident.Name),
-				TextEdits: deleteStmtFromBlock(path, stmt),
+				TextEdits: edits,
 			},
 		}
 	}

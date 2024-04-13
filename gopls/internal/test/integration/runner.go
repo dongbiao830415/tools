@@ -20,10 +20,10 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/debug"
-	"golang.org/x/tools/gopls/internal/lsp/cache"
-	"golang.org/x/tools/gopls/internal/lsp/lsprpc"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/lsprpc"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/gopls/internal/test/integration/fake"
 	"golang.org/x/tools/internal/jsonrpc2"
@@ -106,11 +106,10 @@ func (m Mode) String() string {
 // state.
 type Runner struct {
 	// Configuration
-	DefaultModes             Mode                    // modes to run for each test
-	Timeout                  time.Duration           // per-test timeout, if set
-	PrintGoroutinesOnFailure bool                    // whether to dump goroutines on test failure
-	SkipCleanup              bool                    // if set, don't delete test data directories when the test exits
-	OptionsHook              func(*settings.Options) // if set, use these options when creating gopls sessions
+	DefaultModes             Mode          // modes to run for each test
+	Timeout                  time.Duration // per-test timeout, if set
+	PrintGoroutinesOnFailure bool          // whether to dump goroutines on test failure
+	SkipCleanup              bool          // if set, don't delete test data directories when the test exits
 
 	// Immutable state shared across test invocations
 	goplsPath string         // path to the gopls executable (for SeparateProcess mode)
@@ -135,14 +134,19 @@ type TestFunc func(t *testing.T, env *Env)
 func (r *Runner) Run(t *testing.T, files string, test TestFunc, opts ...RunOption) {
 	// TODO(rfindley): this function has gotten overly complicated, and warrants
 	// refactoring.
-	t.Helper()
-	checkBuilder(t)
-	testenv.NeedsGoPackages(t)
+
+	if !runFromMain {
+		// Main performs various setup precondition checks.
+		// While it could theoretically be made OK for a Runner to be used outside
+		// of Main, it is simpler to enforce that we only use the Runner from
+		// integration test suites.
+		t.Fatal("integration.Runner.Run must be run from integration.Main")
+	}
 
 	tests := []struct {
 		name      string
 		mode      Mode
-		getServer func(func(*settings.Options)) jsonrpc2.StreamServer
+		getServer func() jsonrpc2.StreamServer
 	}{
 		{"default", Default, r.defaultServer},
 		{"forwarded", Forwarded, r.forwardedServer},
@@ -182,7 +186,7 @@ func (r *Runner) Run(t *testing.T, files string, test TestFunc, opts ...RunOptio
 			}
 
 			// TODO(rfindley): do we need an instance at all? Can it be removed?
-			ctx = debug.WithInstance(ctx, "", "off")
+			ctx = debug.WithInstance(ctx, "off")
 
 			rootDir := filepath.Join(r.tempDir, filepath.FromSlash(t.Name()))
 			if err := os.MkdirAll(rootDir, 0755); err != nil {
@@ -210,7 +214,14 @@ func (r *Runner) Run(t *testing.T, files string, test TestFunc, opts ...RunOptio
 				}
 			}()
 
-			ss := tc.getServer(r.OptionsHook)
+			// Write the go.sum file for the requested directories, before starting the server.
+			for _, dir := range config.writeGoSum {
+				if err := sandbox.RunGoCommand(context.Background(), dir, "list", []string{"-mod=mod", "./..."}, []string{"GOWORK=off"}, true); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			ss := tc.getServer()
 
 			framer := jsonrpc2.NewRawStream
 			ls := &loggingFramer{}
@@ -235,7 +246,7 @@ func (r *Runner) Run(t *testing.T, files string, test TestFunc, opts ...RunOptio
 				if t.Failed() && r.PrintGoroutinesOnFailure {
 					pprof.Lookup("goroutine").WriteTo(os.Stderr, 1)
 				}
-				if t.Failed() || *printLogs {
+				if (t.Failed() && !config.noLogsOnError) || *printLogs {
 					ls.printBuffers(t.Name(), os.Stderr)
 				}
 				// For tests that failed due to a timeout, don't fail to shutdown
@@ -259,28 +270,30 @@ func (r *Runner) Run(t *testing.T, files string, test TestFunc, opts ...RunOptio
 // longBuilders maps builders that are skipped when -short is set to a
 // (possibly empty) justification.
 var longBuilders = map[string]string{
-	"openbsd-amd64-64":        "golang.org/issues/42789",
-	"openbsd-386-64":          "golang.org/issues/42789",
-	"openbsd-386-68":          "golang.org/issues/42789",
-	"openbsd-amd64-68":        "golang.org/issues/42789",
+	"openbsd-amd64-64":        "go.dev/issue/42789",
+	"openbsd-386-64":          "go.dev/issue/42789",
+	"openbsd-386-68":          "go.dev/issue/42789",
+	"openbsd-amd64-68":        "go.dev/issue/42789",
 	"darwin-amd64-10_12":      "",
 	"freebsd-amd64-race":      "",
 	"illumos-amd64":           "",
 	"netbsd-arm-bsiegert":     "",
 	"solaris-amd64-oraclerel": "",
 	"windows-arm-zx2c4":       "",
+	"linux-ppc64le-power9osu": "go.dev/issue/66748",
 }
 
-func checkBuilder(t *testing.T) {
-	t.Helper()
+// TODO(rfindley): inline into Main.
+func checkBuilder() string {
 	builder := os.Getenv("GO_BUILDER_NAME")
 	if reason, ok := longBuilders[builder]; ok && testing.Short() {
 		if reason != "" {
-			t.Skipf("Skipping %s with -short due to %s", builder, reason)
+			return fmt.Sprintf("skipping %s with -short due to %s", builder, reason)
 		} else {
-			t.Skipf("Skipping %s with -short", builder)
+			return fmt.Sprintf("skipping %s with -short", builder)
 		}
 	}
+	return ""
 }
 
 type loggingFramer struct {
@@ -332,25 +345,24 @@ func (s *loggingFramer) printBuffers(testname string, w io.Writer) {
 }
 
 // defaultServer handles the Default execution mode.
-func (r *Runner) defaultServer(optsHook func(*settings.Options)) jsonrpc2.StreamServer {
-	return lsprpc.NewStreamServer(cache.New(r.store), false, optsHook)
+func (r *Runner) defaultServer() jsonrpc2.StreamServer {
+	return lsprpc.NewStreamServer(cache.New(r.store), false, nil)
 }
 
 // experimentalServer handles the Experimental execution mode.
-func (r *Runner) experimentalServer(optsHook func(*settings.Options)) jsonrpc2.StreamServer {
+func (r *Runner) experimentalServer() jsonrpc2.StreamServer {
 	options := func(o *settings.Options) {
-		optsHook(o)
 		o.EnableAllExperiments()
 	}
 	return lsprpc.NewStreamServer(cache.New(nil), false, options)
 }
 
 // forwardedServer handles the Forwarded execution mode.
-func (r *Runner) forwardedServer(optsHook func(*settings.Options)) jsonrpc2.StreamServer {
+func (r *Runner) forwardedServer() jsonrpc2.StreamServer {
 	r.tsOnce.Do(func() {
 		ctx := context.Background()
-		ctx = debug.WithInstance(ctx, "", "off")
-		ss := lsprpc.NewStreamServer(cache.New(nil), false, optsHook)
+		ctx = debug.WithInstance(ctx, "off")
+		ss := lsprpc.NewStreamServer(cache.New(nil), false, nil)
 		r.ts = servertest.NewTCPServer(ctx, ss, nil)
 	})
 	return newForwarder("tcp", r.ts.Addr)
@@ -362,7 +374,7 @@ func (r *Runner) forwardedServer(optsHook func(*settings.Options)) jsonrpc2.Stre
 const runTestAsGoplsEnvvar = "_GOPLS_TEST_BINARY_RUN_AS_GOPLS"
 
 // separateProcessServer handles the SeparateProcess execution mode.
-func (r *Runner) separateProcessServer(optsHook func(*settings.Options)) jsonrpc2.StreamServer {
+func (r *Runner) separateProcessServer() jsonrpc2.StreamServer {
 	if runtime.GOOS != "linux" {
 		panic("separate process execution mode is only supported on linux")
 	}
@@ -403,7 +415,7 @@ func (r *Runner) separateProcessServer(optsHook func(*settings.Options)) jsonrpc
 	return newForwarder("unix", r.remoteSocket)
 }
 
-func newForwarder(network, address string) *lsprpc.Forwarder {
+func newForwarder(network, address string) jsonrpc2.StreamServer {
 	server, err := lsprpc.NewForwarder(network+";"+address, nil)
 	if err != nil {
 		// This should never happen, as we are passing an explicit address.

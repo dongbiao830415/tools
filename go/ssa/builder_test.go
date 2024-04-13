@@ -25,8 +25,8 @@ import (
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
+	"golang.org/x/tools/internal/aliases"
 	"golang.org/x/tools/internal/testenv"
-	"golang.org/x/tools/internal/typeparams"
 	"golang.org/x/tools/txtar"
 )
 
@@ -689,10 +689,10 @@ func LoadPointer(addr *unsafe.Pointer) (val unsafe.Pointer)
 	p := prog.Package(lprog.Package("p").Pkg)
 	p.Build()
 
-	if load := p.Func("Load"); typeparams.ForSignature(load.Signature).Len() != 1 {
+	if load := p.Func("Load"); load.Signature.TypeParams().Len() != 1 {
 		t.Errorf("expected a single type param T for Load got %q", load.Signature)
 	}
-	if ptr := p.Type("Pointer"); typeparams.ForNamed(ptr.Type().(*types.Named)).Len() != 1 {
+	if ptr := p.Type("Pointer"); ptr.Type().(*types.Named).TypeParams().Len() != 1 {
 		t.Errorf("expected a single type param T for Pointer got %q", ptr.Type())
 	}
 }
@@ -822,8 +822,6 @@ var indirect = R[int].M
 // TestTypeparamTest builds SSA over compilable examples in $GOROOT/test/typeparam/*.go.
 
 func TestTypeparamTest(t *testing.T) {
-	testenv.NeedsGo1Point(t, 19) // fails with infinite recursion at 1.18 -- not investigated
-
 	// Tests use a fake goroot to stub out standard libraries with delcarations in
 	// testdata/src. Decreases runtime from ~80s to ~1s.
 
@@ -1000,7 +998,6 @@ func TestGenericFunctionSelector(t *testing.T) {
 
 func TestIssue58491(t *testing.T) {
 	// Test that a local type reaches type param in instantiation.
-	testenv.NeedsGo1Point(t, 18)
 	src := `
 		package p
 
@@ -1058,7 +1055,6 @@ func TestIssue58491(t *testing.T) {
 
 func TestIssue58491Rec(t *testing.T) {
 	// Roughly the same as TestIssue58491 but with a recursive type.
-	testenv.NeedsGo1Point(t, 18)
 	src := `
 		package p
 
@@ -1092,7 +1088,7 @@ func TestIssue58491Rec(t *testing.T) {
 	// Find the local type result instantiated with int.
 	var found bool
 	for _, rt := range p.Prog.RuntimeTypes() {
-		if n, ok := rt.(*types.Named); ok {
+		if n, ok := aliases.Unalias(rt).(*types.Named); ok {
 			if u, ok := n.Underlying().(*types.Struct); ok {
 				found = true
 				if got, want := n.String(), "p.result"; got != want {
@@ -1212,5 +1208,32 @@ func TestGo117Builtins(t *testing.T) {
 				t.Error(err)
 			}
 		})
+	}
+}
+
+// TestLabels just tests that anonymous labels are handled.
+func TestLabels(t *testing.T) {
+	tests := []string{
+		`package main
+		  func main() { _:println(1) }`,
+		`package main
+		  func main() { _:println(1); _:println(2)}`,
+	}
+	for _, test := range tests {
+		conf := loader.Config{Fset: token.NewFileSet()}
+		f, err := parser.ParseFile(conf.Fset, "<input>", test, 0)
+		if err != nil {
+			t.Errorf("parse error: %s", err)
+			return
+		}
+		conf.CreateFromFiles("main", f)
+		iprog, err := conf.Load()
+		if err != nil {
+			t.Error(err)
+			continue
+		}
+		prog := ssautil.CreateProgram(iprog, ssa.BuilderMode(0))
+		pkg := prog.Package(iprog.Created[0].Pkg)
+		pkg.Build()
 	}
 }

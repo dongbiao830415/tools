@@ -10,8 +10,7 @@ import (
 	"os/exec"
 	"testing"
 
-	"golang.org/x/tools/gopls/internal/hooks"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/server"
 	. "golang.org/x/tools/gopls/internal/test/integration"
 	"golang.org/x/tools/gopls/internal/test/integration/fake"
@@ -22,7 +21,7 @@ import (
 
 func TestMain(m *testing.M) {
 	bug.PanicOnBugs = true
-	Main(m, hooks.Options)
+	Main(m)
 }
 
 // Use mod.com for all go.mod files due to golang/go#35230.
@@ -554,8 +553,14 @@ func f() {
 	Run(t, noModule, func(t *testing.T, env *Env) {
 		env.OpenFile("a.go")
 		env.AfterChange(
-			// Expect the adHocPackagesWarning.
-			OutstandingWork(server.WorkspaceLoadFailure, "outside of a module"),
+			// AdHoc views are not critical errors, but their missing import
+			// diagnostics should specifically mention GOROOT or GOPATH (and not
+			// modules).
+			NoOutstandingWork(IgnoreTelemetryPromptWork),
+			Diagnostics(
+				env.AtRegexp("a.go", `"mod.com`),
+				WithMessage("GOROOT or GOPATH"),
+			),
 		)
 		// Deleting the import dismisses the warning.
 		env.RegexpReplace("a.go", `import "mod.com/hello"`, "")
@@ -1162,8 +1167,9 @@ func main() {}
 	})
 }
 
-// This tests the functionality of the "limitWorkspaceScope"
-func TestLimitWorkspaceScope(t *testing.T) {
+// This test verifies that the workspace scope is effectively limited to the
+// workspace folder, if expandWorkspaceToModule is set.
+func TestExpandWorkspaceToModule(t *testing.T) {
 	const mod = `
 -- go.mod --
 module mod.com
@@ -1195,6 +1201,55 @@ func main() {
 		env.OpenFile("a/main.go")
 		env.AfterChange(
 			NoDiagnostics(ForFile("main.go")),
+		)
+	})
+}
+
+// This test verifies that the workspace scope is effectively limited to the
+// set of active modules.
+//
+// We should not get diagnostics or file watching patterns for paths outside of
+// the active workspace.
+func TestWorkspaceModules(t *testing.T) {
+	const mod = `
+-- go.work --
+go 1.18
+
+use a
+-- a/go.mod --
+module mod.com/a
+
+go 1.12
+-- a/a.go --
+package a
+
+func _() {
+	var x int
+}
+-- b/go.mod --
+module mod.com/b
+
+go 1.18
+`
+	WithOptions(
+		Settings{
+			"subdirWatchPatterns": "on",
+		},
+	).Run(t, mod, func(t *testing.T, env *Env) {
+		env.OpenFile("a/a.go")
+		// Writing this file may cause the snapshot to 'know' about the file b, but
+		// that shouldn't cause it to watch the 'b' directory.
+		env.WriteWorkspaceFile("b/b.go", `package b
+
+func _() {
+	var x int
+}
+`)
+		env.AfterChange(
+			Diagnostics(env.AtRegexp("a/a.go", "x")),
+			NoDiagnostics(ForFile("b/b.go")),
+			FileWatchMatching("a$"),
+			NoFileWatchMatching("b$"),
 		)
 	})
 }
@@ -1616,12 +1671,17 @@ const B = a.B
 		env.OpenFile("b/b.go")
 		env.AfterChange(
 			// The Go command sometimes tells us about only one of the import cycle
-			// errors below. For robustness of this test, succeed if we get either.
+			// errors below. Also, sometimes we get an error during type checking
+			// instead of during list, due to missing metadata. This is likely due to
+			// a race.
+			// For robustness of this test, succeed if we get any reasonable error.
 			//
 			// TODO(golang/go#52904): we should get *both* of these errors.
+			// TODO(golang/go#64899): we should always get an import cycle error
+			// rather than a missing metadata error.
 			AnyOf(
-				Diagnostics(env.AtRegexp("a/a.go", `"mod.test/b"`), WithMessage("import cycle")),
-				Diagnostics(env.AtRegexp("b/b.go", `"mod.test/a"`), WithMessage("import cycle")),
+				Diagnostics(env.AtRegexp("a/a.go", `"mod.test/b"`)),
+				Diagnostics(env.AtRegexp("b/b.go", `"mod.test/a"`)),
 			),
 		)
 		env.RegexpReplace("b/b.go", `const B = a\.B`, "")
@@ -1719,9 +1779,13 @@ func helloHelper() {}
 		// Expect a diagnostic in a nested module.
 		env.OpenFile("nested/hello/hello.go")
 		env.AfterChange(
-			Diagnostics(env.AtRegexp("nested/hello/hello.go", "helloHelper")),
-			Diagnostics(env.AtRegexp("nested/hello/hello.go", "package (hello)"), WithMessage("not included in your workspace")),
+			NoDiagnostics(ForFile("nested/hello/hello.go")),
 		)
+		loc := env.GoToDefinition(env.RegexpSearch("nested/hello/hello.go", "helloHelper"))
+		want := "nested/hello/hello_helper.go"
+		if got := env.Sandbox.Workdir.URIToPath(loc.URI); got != want {
+			t.Errorf("Definition() returned %q, want %q", got, want)
+		}
 	})
 }
 
@@ -2108,6 +2172,18 @@ func (B) New() {}
 }
 
 func TestDiagnosticsOnlyOnSaveFile(t *testing.T) {
+	// This functionality is broken because the new orphaned file diagnostics
+	// logic wants to publish diagnostics for changed files, independent of any
+	// snapshot diagnostics pass, and this causes stale diagnostics to be
+	// invalidated.
+	//
+	// We can fix this behavior more correctly by also honoring the
+	// diagnosticsTrigger in DiagnoseOrphanedFiles, but that would require
+	// resolving configuration that is independent of the snapshot. In other
+	// words, we need to figure out which cache.Folder.Options applies to the
+	// changed file, even if it does not have a snapshot.
+	t.Skip("temporary skip for golang/go#57979: revisit after zero-config logic is in place")
+
 	const onlyMod = `
 -- go.mod --
 module mod.com

@@ -10,14 +10,17 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 
+	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/file"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/source"
+	"golang.org/x/tools/gopls/internal/golang"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/event/tag"
 	"golang.org/x/tools/internal/jsonrpc2"
+	"golang.org/x/tools/internal/xcontext"
 )
 
 // ModificationSource identifies the origin of a change.
@@ -57,6 +60,10 @@ const (
 	// FromResetGoModDiagnostics refers to state changes resulting from the
 	// ResetGoModDiagnostics command.
 	FromResetGoModDiagnostics
+
+	// FromToggleGCDetails refers to state changes resulting from toggling
+	// gc_details on or off for a package.
+	FromToggleGCDetails
 )
 
 func (m ModificationSource) String() string {
@@ -92,13 +99,12 @@ func (s *server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocume
 	// There may not be any matching view in the current session. If that's
 	// the case, try creating a new view based on the opened file path.
 	//
-	// TODO(rstambler): This seems like it would continuously add new
-	// views, but it won't because ViewOf only returns an error when there
-	// are no views in the session. I don't know if that logic should go
-	// here, or if we can continue to rely on that implementation detail.
-	//
-	// TODO(golang/go#57979): this will be generalized to a different view calculation.
-	if _, err := s.session.ViewOf(uri); err != nil {
+	// TODO(golang/go#57979): revisit creating a folder here. We should separate
+	// the logic for managing folders from the logic for managing views. But it
+	// does make sense to ensure at least one workspace folder the first time a
+	// file is opened, and we can't do that inside didModifyFiles because we
+	// don't want to request configuration while holding a lock.
+	if len(s.session.Views()) == 0 {
 		dir := filepath.Dir(uri.Path())
 		s.addFolders(ctx, []protocol.WorkspaceFolder{{
 			URI:  string(protocol.URIFromPath(dir)),
@@ -153,15 +159,11 @@ func (s *server) warnAboutModifyingGeneratedFiles(ctx context.Context, uri proto
 	// Ideally, we should be able to specify that a generated file should
 	// be opened as read-only. Tell the user that they should not be
 	// editing a generated file.
-	view, err := s.session.ViewOf(uri)
+	snapshot, release, err := s.session.SnapshotOf(ctx, uri)
 	if err != nil {
 		return err
 	}
-	snapshot, release, err := view.Snapshot()
-	if err != nil {
-		return err
-	}
-	isGenerated := source.IsGenerated(ctx, snapshot, uri)
+	isGenerated := golang.IsGenerated(ctx, snapshot, uri)
 	release()
 
 	if isGenerated {
@@ -251,22 +253,21 @@ func (s *server) didModifyFiles(ctx context.Context, modifications []file.Modifi
 	// to their files.
 	modifications = s.session.ExpandModificationsToDirectories(ctx, modifications)
 
-	snapshots, release, err := s.session.DidModifyFiles(ctx, modifications)
+	viewsToDiagnose, err := s.session.DidModifyFiles(ctx, modifications)
 	if err != nil {
 		return err
 	}
 
 	// golang/go#50267: diagnostics should be re-sent after each change.
-	for _, uris := range snapshots {
-		for _, uri := range uris {
-			s.mustPublishDiagnostics(uri)
-		}
+	for _, mod := range modifications {
+		s.mustPublishDiagnostics(mod.URI)
 	}
+
+	modCtx, modID := s.needsDiagnosis(ctx, viewsToDiagnose)
 
 	wg.Add(1)
 	go func() {
-		s.diagnoseSnapshots(snapshots, cause)
-		release()
+		s.diagnoseChangedViews(modCtx, modID, viewsToDiagnose, cause)
 		wg.Done()
 	}()
 
@@ -274,6 +275,29 @@ func (s *server) didModifyFiles(ctx context.Context, modifications []file.Modifi
 	// in case something changed. Compute the new set of directories to watch,
 	// and if it differs from the current set, send updated registrations.
 	return s.updateWatchedDirectories(ctx)
+}
+
+// needsDiagnosis records the given views as needing diagnosis, returning the
+// context and modification id to use for said diagnosis.
+//
+// Only the keys of viewsToDiagnose are used; the changed files are irrelevant.
+func (s *server) needsDiagnosis(ctx context.Context, viewsToDiagnose map[*cache.View][]protocol.DocumentURI) (context.Context, uint64) {
+	s.modificationMu.Lock()
+	defer s.modificationMu.Unlock()
+	if s.cancelPrevDiagnostics != nil {
+		s.cancelPrevDiagnostics()
+	}
+	modCtx := xcontext.Detach(ctx)
+	modCtx, s.cancelPrevDiagnostics = context.WithCancel(modCtx)
+	s.lastModificationID++
+	modID := s.lastModificationID
+
+	for v := range viewsToDiagnose {
+		if needs, ok := s.viewsToDiagnose[v]; !ok || needs < modID {
+			s.viewsToDiagnose[v] = modID
+		}
+	}
+	return modCtx, modID
 }
 
 // DiagnosticWorkTitle returns the title of the diagnostic work resulting from a
@@ -290,6 +314,7 @@ func (s *server) changedText(ctx context.Context, uri protocol.DocumentURI, chan
 	// Check if the client sent the full content of the file.
 	// We accept a full content change even if the server expected incremental changes.
 	if len(changes) == 1 && changes[0].Range == nil && changes[0].RangeLength == 0 {
+		changeFull.Inc()
 		return []byte(changes[0].Text), nil
 	}
 	return s.applyIncrementalChanges(ctx, uri, changes)
@@ -304,7 +329,7 @@ func (s *server) applyIncrementalChanges(ctx context.Context, uri protocol.Docum
 	if err != nil {
 		return nil, fmt.Errorf("%w: file not found (%v)", jsonrpc2.ErrInternal, err)
 	}
-	for _, change := range changes {
+	for i, change := range changes {
 		// TODO(adonovan): refactor to use diff.Apply, which is robust w.r.t.
 		// out-of-order or overlapping changes---and much more efficient.
 
@@ -325,8 +350,50 @@ func (s *server) applyIncrementalChanges(ctx context.Context, uri protocol.Docum
 		buf.WriteString(change.Text)
 		buf.Write(content[end:])
 		content = buf.Bytes()
+		if i == 0 { // only look at the first change if there are seversl
+			// TODO(pjw): understand multi-change)
+			s.checkEfficacy(fh.URI(), fh.Version(), change)
+		}
 	}
 	return content, nil
+}
+
+// increment counters if any of the completions look like there were used
+func (s *server) checkEfficacy(uri protocol.DocumentURI, version int32, change protocol.TextDocumentContentChangePartial) {
+	s.efficacyMu.Lock()
+	defer s.efficacyMu.Unlock()
+	if s.efficacyURI != uri {
+		return
+	}
+	// gopls increments the version, the test client does not
+	if version != s.efficacyVersion && version != s.efficacyVersion+1 {
+		return
+	}
+	// does any change at pos match a proposed completion item?
+	for _, item := range s.efficacyItems {
+		if item.TextEdit == nil {
+			continue
+		}
+		if item.TextEdit.Range.Start == change.Range.Start {
+			// the change and the proposed completion start at the same
+			if change.RangeLength == 0 && len(change.Text) == 1 {
+				// a single character added it does not count as a completion
+				continue
+			}
+			ix := strings.Index(item.TextEdit.NewText, "$")
+			if ix < 0 && strings.HasPrefix(change.Text, item.TextEdit.NewText) {
+				// not a snippet, suggested completion is a prefix of the change
+				complUsed.Inc()
+				return
+			}
+			if ix > 1 && strings.HasPrefix(change.Text, item.TextEdit.NewText[:ix]) {
+				// a snippet, suggested completion up to $ marker is a prefix of the change
+				complUsed.Inc()
+				return
+			}
+		}
+	}
+	complUnused.Inc()
 }
 
 func changeTypeToFileAction(ct protocol.FileChangeType) file.Action {

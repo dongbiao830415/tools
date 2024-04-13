@@ -10,15 +10,15 @@ import (
 	"fmt"
 
 	"golang.org/x/mod/modfile"
+	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/file"
-	"golang.org/x/tools/gopls/internal/lsp/cache"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/internal/event"
 )
 
 func Hover(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, position protocol.Position) (*protocol.Hover, error) {
 	// We only provide hover information for the view's go.work file.
-	if fh.URI() != snapshot.WorkFile() {
+	if fh.URI() != snapshot.View().GoWork() {
 		return nil, nil
 	}
 

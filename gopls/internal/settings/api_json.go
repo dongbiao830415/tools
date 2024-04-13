@@ -34,24 +34,17 @@ var GeneratedAPIJSON = &APIJSON{
 				Hierarchy: "build",
 			},
 			{
-				Name: "memoryMode",
-				Type: "enum",
-				Doc:  "memoryMode controls the tradeoff `gopls` makes between memory usage and\ncorrectness.\n\nValues other than `Normal` are untested and may break in surprising ways.\n",
-				EnumValues: []EnumValue{
-					{
-						Value: "\"DegradeClosed\"",
-						Doc:   "`\"DegradeClosed\"`: In DegradeClosed mode, `gopls` will collect less information about\npackages without open files. As a result, features like Find\nReferences and Rename will miss results in such packages.\n",
-					},
-					{Value: "\"Normal\""},
-				},
-				Default:   "\"Normal\"",
+				Name:      "memoryMode",
+				Type:      "string",
+				Doc:       "obsolete, no effect\n",
+				Default:   "\"\"",
 				Status:    "experimental",
 				Hierarchy: "build",
 			},
 			{
 				Name:      "expandWorkspaceToModule",
 				Type:      "bool",
-				Doc:       "expandWorkspaceToModule instructs `gopls` to adjust the scope of the\nworkspace to find the best available module root. `gopls` first looks for\na go.mod file in any parent directory of the workspace folder, expanding\nthe scope to that directory if it exists. If no viable parent directory is\nfound, gopls will check if there is exactly one child directory containing\na go.mod file, narrowing the scope to that directory if it exists.\n",
+				Doc:       "expandWorkspaceToModule determines which packages are considered\n\"workspace packages\" when the workspace is using modules.\n\nWorkspace packages affect the scope of workspace-wide operations. Notably,\ngopls diagnoses all packages considered to be part of the workspace after\nevery keystroke, so by setting \"ExpandWorkspaceToModule\" to false, and\nopening a nested workspace directory, you can reduce the amount of work\ngopls has to do to keep your workspace up to date.\n",
 				Default:   "true",
 				Status:    "experimental",
 				Hierarchy: "build",
@@ -221,7 +214,7 @@ var GeneratedAPIJSON = &APIJSON{
 			{
 				Name: "analyses",
 				Type: "map[string]bool",
-				Doc:  "analyses specify analyses that the user would like to enable or disable.\nA map of the names of analysis passes that should be enabled/disabled.\nA full list of analyzers that gopls uses can be found in\n[analyzers.md](https://github.com/golang/tools/blob/master/gopls/doc/analyzers.md).\n\nExample Usage:\n\n```json5\n...\n\"analyses\": {\n  \"unreachable\": false, // Disable the unreachable analyzer.\n  \"unusedparams\": true  // Enable the unusedparams analyzer.\n}\n...\n```\n",
+				Doc:  "analyses specify analyses that the user would like to enable or disable.\nA map of the names of analysis passes that should be enabled/disabled.\nA full list of analyzers that gopls uses can be found in\n[analyzers.md](https://github.com/golang/tools/blob/master/gopls/doc/analyzers.md).\n\nExample Usage:\n\n```json5\n...\n\"analyses\": {\n  \"unreachable\": false, // Disable the unreachable analyzer.\n  \"unusedvariable\": true  // Enable the unusedvariable analyzer.\n}\n...\n```\n",
 				EnumKeys: EnumKeys{
 					ValueType: "bool",
 					Keys: []EnumKey{
@@ -287,7 +280,7 @@ var GeneratedAPIJSON = &APIJSON{
 						},
 						{
 							Name:    "\"deprecated\"",
-							Doc:     "check for use of deprecated identifiers\n\nThe deprecated analyzer looks for deprecated symbols and package imports.\n\nSee https://go.dev/wiki/Deprecated to learn about Go's convention\nfor documenting and signaling deprecated identifiers.",
+							Doc:     "check for use of deprecated identifiers\n\nThe deprecated analyzer looks for deprecated symbols and package\nimports.\n\nSee https://go.dev/wiki/Deprecated to learn about Go's convention\nfor documenting and signaling deprecated identifiers.",
 							Default: "true",
 						},
 						{
@@ -311,6 +304,11 @@ var GeneratedAPIJSON = &APIJSON{
 							Default: "false",
 						},
 						{
+							Name:    "\"fillreturns\"",
+							Doc:     "suggest fixes for errors due to an incorrect number of return values\n\nThis checker provides suggested fixes for type errors of the\ntype \"wrong number of return values (want %d, got %d)\". For example:\n\n\tfunc m() (int, string, *bool, error) {\n\t\treturn\n\t}\n\nwill turn into\n\n\tfunc m() (int, string, *bool, error) {\n\t\treturn 0, \"\", nil, nil\n\t}\n\nThis functionality is similar to https://github.com/sqs/goreturns.",
+							Default: "true",
+						},
+						{
 							Name:    "\"httpresponse\"",
 							Doc:     "check for mistakes using HTTP responses\n\nA common mistake when using the net/http package is to defer a function\ncall to close the http.Response Body before checking the error that\ndetermines whether the response is valid:\n\n\tresp, err := http.Head(url)\n\tdefer resp.Body.Close()\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\t// (defer statement belongs here)\n\nThis checker helps uncover latent nil dereference bugs by reporting a\ndiagnostic for such mistakes.",
 							Default: "true",
@@ -318,6 +316,11 @@ var GeneratedAPIJSON = &APIJSON{
 						{
 							Name:    "\"ifaceassert\"",
 							Doc:     "detect impossible interface-to-interface type assertions\n\nThis checker flags type assertions v.(T) and corresponding type-switch cases\nin which the static type V of v is an interface that cannot possibly implement\nthe target interface T. This occurs when V and T contain methods with the same\nname but different signatures. Example:\n\n\tvar v interface {\n\t\tRead()\n\t}\n\t_ = v.(io.Reader)\n\nThe Read method in v has a different signature than the Read method in\nio.Reader, so this assertion cannot succeed.",
+							Default: "true",
+						},
+						{
+							Name:    "\"infertypeargs\"",
+							Doc:     "check for unnecessary type arguments in call expressions\n\nExplicit type arguments may be omitted from call expressions if they can be\ninferred from function arguments, or from other type arguments:\n\n\tfunc f[T any](T) {}\n\t\n\tfunc _() {\n\t\tf[string](\"foo\") // string could be inferred\n\t}\n",
 							Default: "true",
 						},
 						{
@@ -337,12 +340,22 @@ var GeneratedAPIJSON = &APIJSON{
 						},
 						{
 							Name:    "\"nilness\"",
-							Doc:     "check for redundant or impossible nil comparisons\n\nThe nilness checker inspects the control-flow graph of each function in\na package and reports nil pointer dereferences, degenerate nil\npointers, and panics with nil values. A degenerate comparison is of the form\nx==nil or x!=nil where x is statically known to be nil or non-nil. These are\noften a mistake, especially in control flow related to errors. Panics with nil\nvalues are checked because they are not detectable by\n\n\tif r := recover(); r != nil {\n\nThis check reports conditions such as:\n\n\tif f == nil { // impossible condition (f is a function)\n\t}\n\nand:\n\n\tp := &v\n\t...\n\tif p != nil { // tautological condition\n\t}\n\nand:\n\n\tif p == nil {\n\t\tprint(*p) // nil dereference\n\t}\n\nand:\n\n\tif p == nil {\n\t\tpanic(p)\n\t}",
+							Doc:     "check for redundant or impossible nil comparisons\n\nThe nilness checker inspects the control-flow graph of each function in\na package and reports nil pointer dereferences, degenerate nil\npointers, and panics with nil values. A degenerate comparison is of the form\nx==nil or x!=nil where x is statically known to be nil or non-nil. These are\noften a mistake, especially in control flow related to errors. Panics with nil\nvalues are checked because they are not detectable by\n\n\tif r := recover(); r != nil {\n\nThis check reports conditions such as:\n\n\tif f == nil { // impossible condition (f is a function)\n\t}\n\nand:\n\n\tp := &v\n\t...\n\tif p != nil { // tautological condition\n\t}\n\nand:\n\n\tif p == nil {\n\t\tprint(*p) // nil dereference\n\t}\n\nand:\n\n\tif p == nil {\n\t\tpanic(p)\n\t}\n\nSometimes the control flow may be quite complex, making bugs hard\nto spot. In the example below, the err.Error expression is\nguaranteed to panic because, after the first return, err must be\nnil. The intervening loop is just a distraction.\n\n\t...\n\terr := g.Wait()\n\tif err != nil {\n\t\treturn err\n\t}\n\tpartialSuccess := false\n\tfor _, err := range errs {\n\t\tif err == nil {\n\t\t\tpartialSuccess = true\n\t\t\tbreak\n\t\t}\n\t}\n\tif partialSuccess {\n\t\treportStatus(StatusMessage{\n\t\t\tCode:   code.ERROR,\n\t\t\tDetail: err.Error(), // \"nil dereference in dynamic method call\"\n\t\t})\n\t\treturn nil\n\t}\n\n...",
+							Default: "true",
+						},
+						{
+							Name:    "\"nonewvars\"",
+							Doc:     "suggested fixes for \"no new vars on left side of :=\"\n\nThis checker provides suggested fixes for type errors of the\ntype \"no new vars on left side of :=\". For example:\n\n\tz := 1\n\tz := 2\n\nwill turn into\n\n\tz := 1\n\tz = 2",
+							Default: "true",
+						},
+						{
+							Name:    "\"noresultvalues\"",
+							Doc:     "suggested fixes for unexpected return values\n\nThis checker provides suggested fixes for type errors of the\ntype \"no result values expected\" or \"too many return values\".\nFor example:\n\n\tfunc z() { return nil }\n\nwill turn into\n\n\tfunc z() { return }",
 							Default: "true",
 						},
 						{
 							Name:    "\"printf\"",
-							Doc:     "check consistency of Printf format strings and arguments\n\nThe check applies to calls of the formatting functions such as\n[fmt.Printf] and [fmt.Sprintf], as well as any detected wrappers of\nthose functions.\n\nIn this example, the %d format operator requires an integer operand:\n\n\tfmt.Printf(\"%d\", \"hello\") // fmt.Printf format %d has arg \"hello\" of wrong type string\n\nSee the documentation of the fmt package for the complete set of\nformat operators and their operand types.\n\nTo enable printf checking on a function that is not found by this\nanalyzer's heuristics (for example, because control is obscured by\ndynamic method calls), insert a bogus call:\n\n\tfunc MyPrintf(format string, args ...any) {\n\t\tif false {\n\t\t\t_ = fmt.Sprintf(format, args...) // enable printf checker\n\t\t}\n\t\t...\n\t}\n\nThe -funcs flag specifies a comma-separated list of names of additional\nknown formatting functions or methods. If the name contains a period,\nit must denote a specific function using one of the following forms:\n\n\tdir/pkg.Function\n\tdir/pkg.Type.Method\n\t(*dir/pkg.Type).Method\n\nOtherwise the name is interpreted as a case-insensitive unqualified\nidentifier such as \"errorf\". Either way, if a listed name ends in f, the\nfunction is assumed to be Printf-like, taking a format string before the\nargument list. Otherwise it is assumed to be Print-like, taking a list\nof arguments with no format string.",
+							Doc:     "check consistency of Printf format strings and arguments\n\nThe check applies to calls of the formatting functions such as\n[fmt.Printf] and [fmt.Sprintf], as well as any detected wrappers of\nthose functions such as [log.Printf]. It reports a variety of\nmistakes such as syntax errors in the format string and mismatches\n(of number and type) between the verbs and their arguments.\n\nSee the documentation of the fmt package for the complete set of\nformat operators and their operand types.",
 							Default: "true",
 						},
 						{
@@ -357,17 +370,17 @@ var GeneratedAPIJSON = &APIJSON{
 						},
 						{
 							Name:    "\"simplifycompositelit\"",
-							Doc:     "check for composite literal simplifications\n\nAn array, slice, or map composite literal of the form:\n\t[]T{T{}, T{}}\nwill be simplified to:\n\t[]T{{}, {}}\n\nThis is one of the simplifications that \"gofmt -s\" applies.",
+							Doc:     "check for composite literal simplifications\n\nAn array, slice, or map composite literal of the form:\n\n\t[]T{T{}, T{}}\n\nwill be simplified to:\n\n\t[]T{{}, {}}\n\nThis is one of the simplifications that \"gofmt -s\" applies.",
 							Default: "true",
 						},
 						{
 							Name:    "\"simplifyrange\"",
-							Doc:     "check for range statement simplifications\n\nA range of the form:\n\tfor x, _ = range v {...}\nwill be simplified to:\n\tfor x = range v {...}\n\nA range of the form:\n\tfor _ = range v {...}\nwill be simplified to:\n\tfor range v {...}\n\nThis is one of the simplifications that \"gofmt -s\" applies.",
+							Doc:     "check for range statement simplifications\n\nA range of the form:\n\n\tfor x, _ = range v {...}\n\nwill be simplified to:\n\n\tfor x = range v {...}\n\nA range of the form:\n\n\tfor _ = range v {...}\n\nwill be simplified to:\n\n\tfor range v {...}\n\nThis is one of the simplifications that \"gofmt -s\" applies.",
 							Default: "true",
 						},
 						{
 							Name:    "\"simplifyslice\"",
-							Doc:     "check for slice simplifications\n\nA slice expression of the form:\n\ts[a:len(s)]\nwill be simplified to:\n\ts[a:]\n\nThis is one of the simplifications that \"gofmt -s\" applies.",
+							Doc:     "check for slice simplifications\n\nA slice expression of the form:\n\n\ts[a:len(s)]\n\nwill be simplified to:\n\n\ts[a:]\n\nThis is one of the simplifications that \"gofmt -s\" applies.",
 							Default: "true",
 						},
 						{
@@ -386,6 +399,11 @@ var GeneratedAPIJSON = &APIJSON{
 							Default: "true",
 						},
 						{
+							Name:    "\"stdversion\"",
+							Doc:     "report uses of too-new standard library symbols\n\nThe stdversion analyzer reports references to symbols in the standard\nlibrary that were introduced by a Go release higher than the one in\nforce in the referring file. (Recall that the file's Go version is\ndefined by the 'go' directive its module's go.mod file, or by a\n\"//go:build go1.X\" build tag at the top of the file.)\n\nThe analyzer does not report a diagnostic for a reference to a \"too\nnew\" field or method of a type that is itself \"too new\", as this may\nhave false positives, for example if fields or methods are accessed\nthrough a type alias that is guarded by a Go version constraint.\n",
+							Default: "true",
+						},
+						{
 							Name:    "\"stringintconv\"",
 							Doc:     "check for string(int) conversions\n\nThis checker flags conversions of the form string(x) where x is an integer\n(but not byte or rune) type. Such conversions are discouraged because they\nreturn the UTF-8 representation of the Unicode code point x, and not a decimal\nstring representation of x as one might expect. Furthermore, if x denotes an\ninvalid code point, the conversion cannot be statically rejected.\n\nFor conversions that intend on using the code point, consider replacing them\nwith string(rune(x)). Otherwise, strconv.Itoa and its equivalents return the\nstring representation of the value in the desired base.",
 							Default: "true",
@@ -393,6 +411,11 @@ var GeneratedAPIJSON = &APIJSON{
 						{
 							Name:    "\"structtag\"",
 							Doc:     "check that struct field tags conform to reflect.StructTag.Get\n\nAlso report certain struct tags (json, xml) used with unexported fields.",
+							Default: "true",
+						},
+						{
+							Name:    "\"stubmethods\"",
+							Doc:     "detect missing methods and fix with stub implementations\n\nThis analyzer detects type-checking errors due to missing methods\nin assignments from concrete types to interface types, and offers\na suggested fix that will create a set of stub methods so that\nthe concrete type satisfies the interface.\n\nFor example, this function will not compile because the value\nNegativeErr{} does not implement the \"error\" interface:\n\n\tfunc sqrt(x float64) (float64, error) {\n\t\tif x < 0 {\n\t\t\treturn 0, NegativeErr{} // error: missing method\n\t\t}\n\t\t...\n\t}\n\n\ttype NegativeErr struct{}\n\nThis analyzer will suggest a fix to declare this method:\n\n\t// Error implements error.Error.\n\tfunc (NegativeErr) Error() string {\n\t\tpanic(\"unimplemented\")\n\t}\n\n(At least, it appears to behave that way, but technically it\ndoesn't use the SuggestedFix mechanism and the stub is created by\nlogic in gopls's golang.stub function.)",
 							Default: "true",
 						},
 						{
@@ -408,6 +431,11 @@ var GeneratedAPIJSON = &APIJSON{
 						{
 							Name:    "\"timeformat\"",
 							Doc:     "check for calls of (time.Time).Format or time.Parse with 2006-02-01\n\nThe timeformat checker looks for time formats with the 2006-02-01 (yyyy-dd-mm)\nformat. Internationally, \"yyyy-dd-mm\" does not occur in common calendar date\nstandards, and so it is more likely that 2006-01-02 (yyyy-mm-dd) was intended.",
+							Default: "true",
+						},
+						{
+							Name:    "\"undeclaredname\"",
+							Doc:     "suggested fixes for \"undeclared name: <>\"\n\nThis checker provides suggested fixes for type errors of the\ntype \"undeclared name: <>\". It will either insert a new statement,\nsuch as:\n\n\t<> :=\n\nor a new function declaration, such as:\n\n\tfunc <>(inferred parameters) {\n\t\tpanic(\"implement me!\")\n\t}",
 							Default: "true",
 						},
 						{
@@ -427,8 +455,8 @@ var GeneratedAPIJSON = &APIJSON{
 						},
 						{
 							Name:    "\"unusedparams\"",
-							Doc:     "check for unused parameters of functions\n\nThe unusedparams analyzer checks functions to see if there are\nany parameters that are not being used.\n\nTo reduce false positives it ignores:\n- methods\n- parameters that do not have a name or have the name '_' (the blank identifier)\n- functions in test files\n- functions with empty bodies or those with just a return stmt",
-							Default: "false",
+							Doc:     "check for unused parameters of functions\n\nThe unusedparams analyzer checks functions to see if there are\nany parameters that are not being used.\n\nTo ensure soundness, it ignores:\n  - \"address-taken\" functions, that is, functions that are used as\n    a value rather than being called directly; their signatures may\n    be required to conform to a func type.\n  - exported functions or methods, since they may be address-taken\n    in another package.\n  - unexported methods whose name matches an interface method\n    declared in the same package, since the method's signature\n    may be required to conform to the interface type.\n  - functions with empty bodies, or containing just a call to panic.\n  - parameters that are unnamed, or named \"_\", the blank identifier.\n\nThe analyzer suggests a fix of replacing the parameter name by \"_\",\nbut in such cases a deeper fix can be obtained by invoking the\n\"Refactor: remove unused parameter\" code action, which will\neliminate the parameter entirely, along with all corresponding\narguments at call sites, while taking care to preserve any side\neffects in the argument expressions; see\nhttps://github.com/golang/tools/releases/tag/gopls%2Fv0.14.",
+							Default: "true",
 						},
 						{
 							Name:    "\"unusedresult\"",
@@ -436,54 +464,19 @@ var GeneratedAPIJSON = &APIJSON{
 							Default: "true",
 						},
 						{
+							Name:    "\"unusedvariable\"",
+							Doc:     "check for unused variables and suggest fixes",
+							Default: "false",
+						},
+						{
 							Name:    "\"unusedwrite\"",
 							Doc:     "checks for unused writes\n\nThe analyzer reports instances of writes to struct fields and\narrays that are never read. Specifically, when a struct object\nor an array is copied, its elements are copied implicitly by\nthe compiler, and any element write to this copy does nothing\nwith the original object.\n\nFor example:\n\n\ttype T struct { x int }\n\n\tfunc f(input []T) {\n\t\tfor i, v := range input {  // v is a copy\n\t\t\tv.x = i  // unused write to field x\n\t\t}\n\t}\n\nAnother example is about non-pointer receiver:\n\n\ttype T struct { x int }\n\n\tfunc (t T) f() {  // t is a copy\n\t\tt.x = i  // unused write to field x\n\t}",
-							Default: "false",
+							Default: "true",
 						},
 						{
 							Name:    "\"useany\"",
 							Doc:     "check for constraints that could be simplified to \"any\"",
 							Default: "false",
-						},
-						{
-							Name:    "\"fillreturns\"",
-							Doc:     "suggest fixes for errors due to an incorrect number of return values\n\nThis checker provides suggested fixes for type errors of the\ntype \"wrong number of return values (want %d, got %d)\". For example:\n\tfunc m() (int, string, *bool, error) {\n\t\treturn\n\t}\nwill turn into\n\tfunc m() (int, string, *bool, error) {\n\t\treturn 0, \"\", nil, nil\n\t}\n\nThis functionality is similar to https://github.com/sqs/goreturns.\n",
-							Default: "true",
-						},
-						{
-							Name:    "\"nonewvars\"",
-							Doc:     "suggested fixes for \"no new vars on left side of :=\"\n\nThis checker provides suggested fixes for type errors of the\ntype \"no new vars on left side of :=\". For example:\n\tz := 1\n\tz := 2\nwill turn into\n\tz := 1\n\tz = 2\n",
-							Default: "true",
-						},
-						{
-							Name:    "\"noresultvalues\"",
-							Doc:     "suggested fixes for unexpected return values\n\nThis checker provides suggested fixes for type errors of the\ntype \"no result values expected\" or \"too many return values\".\nFor example:\n\tfunc z() { return nil }\nwill turn into\n\tfunc z() { return }\n",
-							Default: "true",
-						},
-						{
-							Name:    "\"undeclaredname\"",
-							Doc:     "suggested fixes for \"undeclared name: <>\"\n\nThis checker provides suggested fixes for type errors of the\ntype \"undeclared name: <>\". It will either insert a new statement,\nsuch as:\n\n\"<> := \"\n\nor a new function declaration, such as:\n\nfunc <>(inferred parameters) {\n\tpanic(\"implement me!\")\n}\n",
-							Default: "true",
-						},
-						{
-							Name:    "\"unusedvariable\"",
-							Doc:     "check for unused variables\n\nThe unusedvariable analyzer suggests fixes for unused variables errors.\n",
-							Default: "false",
-						},
-						{
-							Name:    "\"fillstruct\"",
-							Doc:     "note incomplete struct initializations\n\nThis analyzer provides diagnostics for any struct literals that do not have\nany fields initialized. Because the suggested fix for this analysis is\nexpensive to compute, callers should compute it separately, using the\nSuggestedFix function below.\n",
-							Default: "true",
-						},
-						{
-							Name:    "\"infertypeargs\"",
-							Doc:     "check for unnecessary type arguments in call expressions\n\nExplicit type arguments may be omitted from call expressions if they can be\ninferred from function arguments, or from other type arguments:\n\n\tfunc f[T any](T) {}\n\t\n\tfunc _() {\n\t\tf[string](\"foo\") // string could be inferred\n\t}\n",
-							Default: "true",
-						},
-						{
-							Name:    "\"stubmethods\"",
-							Doc:     "stub methods analyzer\n\nThis analyzer generates method stubs for concrete types\nin order to implement a target interface",
-							Default: "true",
 						},
 					},
 				},
@@ -746,22 +739,36 @@ var GeneratedAPIJSON = &APIJSON{
 			ArgDoc:  "{\n\t// Names and Values must have the same length.\n\t\"Names\": []string,\n\t\"Values\": []int64,\n}",
 		},
 		{
-			Command: "gopls.apply_fix",
-			Title:   "Apply a fix",
-			Doc:     "Applies a fix to a region of source code.",
-			ArgDoc:  "{\n\t// The fix to apply.\n\t\"Fix\": string,\n\t// The file URI for the document to fix.\n\t\"URI\": string,\n\t// The document range to scan for fixes.\n\t\"Range\": {\n\t\t\"start\": {\n\t\t\t\"line\": uint32,\n\t\t\t\"character\": uint32,\n\t\t},\n\t\t\"end\": {\n\t\t\t\"line\": uint32,\n\t\t\t\"character\": uint32,\n\t\t},\n\t},\n}",
+			Command:   "gopls.apply_fix",
+			Title:     "Apply a fix",
+			Doc:       "Applies a fix to a region of source code.",
+			ArgDoc:    "{\n\t// The name of the fix to apply.\n\t//\n\t// For fixes suggested by analyzers, this is a string constant\n\t// advertised by the analyzer that matches the Category of\n\t// the analysis.Diagnostic with a SuggestedFix containing no edits.\n\t//\n\t// For fixes suggested by code actions, this is a string agreed\n\t// upon by the code action and golang.ApplyFix.\n\t\"Fix\": string,\n\t// The file URI for the document to fix.\n\t\"URI\": string,\n\t// The document range to scan for fixes.\n\t\"Range\": {\n\t\t\"start\": {\n\t\t\t\"line\": uint32,\n\t\t\t\"character\": uint32,\n\t\t},\n\t\t\"end\": {\n\t\t\t\"line\": uint32,\n\t\t\t\"character\": uint32,\n\t\t},\n\t},\n\t// Whether to resolve and return the edits.\n\t\"ResolveEdits\": bool,\n}",
+			ResultDoc: "{\n\t// Holds changes to existing resources.\n\t\"changes\": map[golang.org/x/tools/gopls/internal/protocol.DocumentURI][]golang.org/x/tools/gopls/internal/protocol.TextEdit,\n\t// Depending on the client capability `workspace.workspaceEdit.resourceOperations` document changes\n\t// are either an array of `TextDocumentEdit`s to express changes to n different text documents\n\t// where each text document edit addresses a specific version of a text document. Or it can contain\n\t// above `TextDocumentEdit`s mixed with create, rename and delete file / folder operations.\n\t//\n\t// Whether a client supports versioned document edits is expressed via\n\t// `workspace.workspaceEdit.documentChanges` client capability.\n\t//\n\t// If a client neither supports `documentChanges` nor `workspace.workspaceEdit.resourceOperations` then\n\t// only plain `TextEdit`s using the `changes` property are supported.\n\t\"documentChanges\": []{\n\t\t\"TextDocumentEdit\": {\n\t\t\t\"textDocument\": { ... },\n\t\t\t\"edits\": { ... },\n\t\t},\n\t\t\"RenameFile\": {\n\t\t\t\"kind\": string,\n\t\t\t\"oldUri\": string,\n\t\t\t\"newUri\": string,\n\t\t\t\"options\": { ... },\n\t\t\t\"ResourceOperation\": { ... },\n\t\t},\n\t},\n\t// A map of change annotations that can be referenced in `AnnotatedTextEdit`s or create, rename and\n\t// delete file / folder operations.\n\t//\n\t// Whether clients honor this property depends on the client capability `workspace.changeAnnotationSupport`.\n\t//\n\t// @since 3.16.0\n\t\"changeAnnotations\": map[string]golang.org/x/tools/gopls/internal/protocol.ChangeAnnotation,\n}",
 		},
 		{
-			Command: "gopls.change_signature",
-			Title:   "Perform a \"change signature\" refactoring",
-			Doc:     "This command is experimental, currently only supporting parameter removal.\nIts signature will certainly change in the future (pun intended).",
-			ArgDoc:  "{\n\t\"RemoveParameter\": {\n\t\t\"uri\": string,\n\t\t\"range\": {\n\t\t\t\"start\": { ... },\n\t\t\t\"end\": { ... },\n\t\t},\n\t},\n}",
+			Command:   "gopls.change_signature",
+			Title:     "Perform a \"change signature\" refactoring",
+			Doc:       "This command is experimental, currently only supporting parameter removal.\nIts signature will certainly change in the future (pun intended).",
+			ArgDoc:    "{\n\t\"RemoveParameter\": {\n\t\t\"uri\": string,\n\t\t\"range\": {\n\t\t\t\"start\": { ... },\n\t\t\t\"end\": { ... },\n\t\t},\n\t},\n\t// Whether to resolve and return the edits.\n\t\"ResolveEdits\": bool,\n}",
+			ResultDoc: "{\n\t// Holds changes to existing resources.\n\t\"changes\": map[golang.org/x/tools/gopls/internal/protocol.DocumentURI][]golang.org/x/tools/gopls/internal/protocol.TextEdit,\n\t// Depending on the client capability `workspace.workspaceEdit.resourceOperations` document changes\n\t// are either an array of `TextDocumentEdit`s to express changes to n different text documents\n\t// where each text document edit addresses a specific version of a text document. Or it can contain\n\t// above `TextDocumentEdit`s mixed with create, rename and delete file / folder operations.\n\t//\n\t// Whether a client supports versioned document edits is expressed via\n\t// `workspace.workspaceEdit.documentChanges` client capability.\n\t//\n\t// If a client neither supports `documentChanges` nor `workspace.workspaceEdit.resourceOperations` then\n\t// only plain `TextEdit`s using the `changes` property are supported.\n\t\"documentChanges\": []{\n\t\t\"TextDocumentEdit\": {\n\t\t\t\"textDocument\": { ... },\n\t\t\t\"edits\": { ... },\n\t\t},\n\t\t\"RenameFile\": {\n\t\t\t\"kind\": string,\n\t\t\t\"oldUri\": string,\n\t\t\t\"newUri\": string,\n\t\t\t\"options\": { ... },\n\t\t\t\"ResourceOperation\": { ... },\n\t\t},\n\t},\n\t// A map of change annotations that can be referenced in `AnnotatedTextEdit`s or create, rename and\n\t// delete file / folder operations.\n\t//\n\t// Whether clients honor this property depends on the client capability `workspace.changeAnnotationSupport`.\n\t//\n\t// @since 3.16.0\n\t\"changeAnnotations\": map[string]golang.org/x/tools/gopls/internal/protocol.ChangeAnnotation,\n}",
 		},
 		{
 			Command: "gopls.check_upgrades",
 			Title:   "Check for upgrades",
 			Doc:     "Checks for module upgrades.",
 			ArgDoc:  "{\n\t// The go.mod file URI.\n\t\"URI\": string,\n\t// The modules to check.\n\t\"Modules\": []string,\n}",
+		},
+		{
+			Command: "gopls.diagnose_files",
+			Title:   "Cause server to publish diagnostics for the specified files.",
+			Doc:     "This command is needed by the 'gopls {check,fix}' CLI subcommands.",
+			ArgDoc:  "{\n\t\"Files\": []string,\n}",
+		},
+		{
+			Command: "gopls.doc",
+			Title:   "View package documentation.",
+			Doc:     "Opens the Go package documentation page for the current\npackage in a browser.",
+			ArgDoc:  "{\n\t\"uri\": string,\n\t\"range\": {\n\t\t\"start\": {\n\t\t\t\"line\": uint32,\n\t\t\t\"character\": uint32,\n\t\t},\n\t\t\"end\": {\n\t\t\t\"line\": uint32,\n\t\t\t\"character\": uint32,\n\t\t},\n\t},\n}",
 		},
 		{
 			Command: "gopls.edit_go_directive",
@@ -774,7 +781,7 @@ var GeneratedAPIJSON = &APIJSON{
 			Title:     "Get known vulncheck result",
 			Doc:       "Fetch the result of latest vulnerability check (`govulncheck`).",
 			ArgDoc:    "{\n\t// The file URI.\n\t\"URI\": string,\n}",
-			ResultDoc: "map[golang.org/x/tools/gopls/internal/lsp/protocol.DocumentURI]*golang.org/x/tools/gopls/internal/vulncheck.Result",
+			ResultDoc: "map[golang.org/x/tools/gopls/internal/protocol.DocumentURI]*golang.org/x/tools/gopls/internal/vulncheck.Result",
 		},
 		{
 			Command: "gopls.gc_details",
@@ -914,6 +921,12 @@ var GeneratedAPIJSON = &APIJSON{
 			ArgDoc:  "{\n\t// The file URI.\n\t\"URI\": string,\n}",
 		},
 		{
+			Command:   "gopls.views",
+			Title:     "List current Views on the server.",
+			Doc:       "This command is intended for use by gopls tests only.",
+			ResultDoc: "[]{\n\t\"ID\": string,\n\t\"Type\": string,\n\t\"Root\": string,\n\t\"Folder\": string,\n\t\"EnvOverlay\": []string,\n}",
+		},
+		{
 			Command:   "gopls.workspace_stats",
 			Title:     "Fetch workspace statistics",
 			Doc:       "Query statistics about workspace builds, modules, packages, and files.\n\nThis command is intended for internal use only, by the gopls stats\ncommand.",
@@ -1037,7 +1050,8 @@ var GeneratedAPIJSON = &APIJSON{
 		},
 		{
 			Name:    "deprecated",
-			Doc:     "check for use of deprecated identifiers\n\nThe deprecated analyzer looks for deprecated symbols and package imports.\n\nSee https://go.dev/wiki/Deprecated to learn about Go's convention\nfor documenting and signaling deprecated identifiers.",
+			Doc:     "check for use of deprecated identifiers\n\nThe deprecated analyzer looks for deprecated symbols and package\nimports.\n\nSee https://go.dev/wiki/Deprecated to learn about Go's convention\nfor documenting and signaling deprecated identifiers.",
+			URL:     "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/deprecated",
 			Default: true,
 		},
 		{
@@ -1049,6 +1063,7 @@ var GeneratedAPIJSON = &APIJSON{
 		{
 			Name:    "embed",
 			Doc:     "check //go:embed directive usage\n\nThis analyzer checks that the embed package is imported if //go:embed\ndirectives are present, providing a suggested fix to add the import if\nit is missing.\n\nThis analyzer also checks that //go:embed directives precede the\ndeclaration of a single variable.",
+			URL:     "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/embeddirective",
 			Default: true,
 		},
 		{
@@ -1063,6 +1078,12 @@ var GeneratedAPIJSON = &APIJSON{
 			URL:  "https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/fieldalignment",
 		},
 		{
+			Name:    "fillreturns",
+			Doc:     "suggest fixes for errors due to an incorrect number of return values\n\nThis checker provides suggested fixes for type errors of the\ntype \"wrong number of return values (want %d, got %d)\". For example:\n\n\tfunc m() (int, string, *bool, error) {\n\t\treturn\n\t}\n\nwill turn into\n\n\tfunc m() (int, string, *bool, error) {\n\t\treturn 0, \"\", nil, nil\n\t}\n\nThis functionality is similar to https://github.com/sqs/goreturns.",
+			URL:     "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/fillreturns",
+			Default: true,
+		},
+		{
 			Name:    "httpresponse",
 			Doc:     "check for mistakes using HTTP responses\n\nA common mistake when using the net/http package is to defer a function\ncall to close the http.Response Body before checking the error that\ndetermines whether the response is valid:\n\n\tresp, err := http.Head(url)\n\tdefer resp.Body.Close()\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\t// (defer statement belongs here)\n\nThis checker helps uncover latent nil dereference bugs by reporting a\ndiagnostic for such mistakes.",
 			URL:     "https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/httpresponse",
@@ -1072,6 +1093,12 @@ var GeneratedAPIJSON = &APIJSON{
 			Name:    "ifaceassert",
 			Doc:     "detect impossible interface-to-interface type assertions\n\nThis checker flags type assertions v.(T) and corresponding type-switch cases\nin which the static type V of v is an interface that cannot possibly implement\nthe target interface T. This occurs when V and T contain methods with the same\nname but different signatures. Example:\n\n\tvar v interface {\n\t\tRead()\n\t}\n\t_ = v.(io.Reader)\n\nThe Read method in v has a different signature than the Read method in\nio.Reader, so this assertion cannot succeed.",
 			URL:     "https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/ifaceassert",
+			Default: true,
+		},
+		{
+			Name:    "infertypeargs",
+			Doc:     "check for unnecessary type arguments in call expressions\n\nExplicit type arguments may be omitted from call expressions if they can be\ninferred from function arguments, or from other type arguments:\n\n\tfunc f[T any](T) {}\n\t\n\tfunc _() {\n\t\tf[string](\"foo\") // string could be inferred\n\t}\n",
+			URL:     "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/infertypeargs",
 			Default: true,
 		},
 		{
@@ -1094,13 +1121,25 @@ var GeneratedAPIJSON = &APIJSON{
 		},
 		{
 			Name:    "nilness",
-			Doc:     "check for redundant or impossible nil comparisons\n\nThe nilness checker inspects the control-flow graph of each function in\na package and reports nil pointer dereferences, degenerate nil\npointers, and panics with nil values. A degenerate comparison is of the form\nx==nil or x!=nil where x is statically known to be nil or non-nil. These are\noften a mistake, especially in control flow related to errors. Panics with nil\nvalues are checked because they are not detectable by\n\n\tif r := recover(); r != nil {\n\nThis check reports conditions such as:\n\n\tif f == nil { // impossible condition (f is a function)\n\t}\n\nand:\n\n\tp := &v\n\t...\n\tif p != nil { // tautological condition\n\t}\n\nand:\n\n\tif p == nil {\n\t\tprint(*p) // nil dereference\n\t}\n\nand:\n\n\tif p == nil {\n\t\tpanic(p)\n\t}",
+			Doc:     "check for redundant or impossible nil comparisons\n\nThe nilness checker inspects the control-flow graph of each function in\na package and reports nil pointer dereferences, degenerate nil\npointers, and panics with nil values. A degenerate comparison is of the form\nx==nil or x!=nil where x is statically known to be nil or non-nil. These are\noften a mistake, especially in control flow related to errors. Panics with nil\nvalues are checked because they are not detectable by\n\n\tif r := recover(); r != nil {\n\nThis check reports conditions such as:\n\n\tif f == nil { // impossible condition (f is a function)\n\t}\n\nand:\n\n\tp := &v\n\t...\n\tif p != nil { // tautological condition\n\t}\n\nand:\n\n\tif p == nil {\n\t\tprint(*p) // nil dereference\n\t}\n\nand:\n\n\tif p == nil {\n\t\tpanic(p)\n\t}\n\nSometimes the control flow may be quite complex, making bugs hard\nto spot. In the example below, the err.Error expression is\nguaranteed to panic because, after the first return, err must be\nnil. The intervening loop is just a distraction.\n\n\t...\n\terr := g.Wait()\n\tif err != nil {\n\t\treturn err\n\t}\n\tpartialSuccess := false\n\tfor _, err := range errs {\n\t\tif err == nil {\n\t\t\tpartialSuccess = true\n\t\t\tbreak\n\t\t}\n\t}\n\tif partialSuccess {\n\t\treportStatus(StatusMessage{\n\t\t\tCode:   code.ERROR,\n\t\t\tDetail: err.Error(), // \"nil dereference in dynamic method call\"\n\t\t})\n\t\treturn nil\n\t}\n\n...",
 			URL:     "https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/nilness",
 			Default: true,
 		},
 		{
+			Name:    "nonewvars",
+			Doc:     "suggested fixes for \"no new vars on left side of :=\"\n\nThis checker provides suggested fixes for type errors of the\ntype \"no new vars on left side of :=\". For example:\n\n\tz := 1\n\tz := 2\n\nwill turn into\n\n\tz := 1\n\tz = 2",
+			URL:     "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/nonewvars",
+			Default: true,
+		},
+		{
+			Name:    "noresultvalues",
+			Doc:     "suggested fixes for unexpected return values\n\nThis checker provides suggested fixes for type errors of the\ntype \"no result values expected\" or \"too many return values\".\nFor example:\n\n\tfunc z() { return nil }\n\nwill turn into\n\n\tfunc z() { return }",
+			URL:     "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/noresultvars",
+			Default: true,
+		},
+		{
 			Name:    "printf",
-			Doc:     "check consistency of Printf format strings and arguments\n\nThe check applies to calls of the formatting functions such as\n[fmt.Printf] and [fmt.Sprintf], as well as any detected wrappers of\nthose functions.\n\nIn this example, the %d format operator requires an integer operand:\n\n\tfmt.Printf(\"%d\", \"hello\") // fmt.Printf format %d has arg \"hello\" of wrong type string\n\nSee the documentation of the fmt package for the complete set of\nformat operators and their operand types.\n\nTo enable printf checking on a function that is not found by this\nanalyzer's heuristics (for example, because control is obscured by\ndynamic method calls), insert a bogus call:\n\n\tfunc MyPrintf(format string, args ...any) {\n\t\tif false {\n\t\t\t_ = fmt.Sprintf(format, args...) // enable printf checker\n\t\t}\n\t\t...\n\t}\n\nThe -funcs flag specifies a comma-separated list of names of additional\nknown formatting functions or methods. If the name contains a period,\nit must denote a specific function using one of the following forms:\n\n\tdir/pkg.Function\n\tdir/pkg.Type.Method\n\t(*dir/pkg.Type).Method\n\nOtherwise the name is interpreted as a case-insensitive unqualified\nidentifier such as \"errorf\". Either way, if a listed name ends in f, the\nfunction is assumed to be Printf-like, taking a format string before the\nargument list. Otherwise it is assumed to be Print-like, taking a list\nof arguments with no format string.",
+			Doc:     "check consistency of Printf format strings and arguments\n\nThe check applies to calls of the formatting functions such as\n[fmt.Printf] and [fmt.Sprintf], as well as any detected wrappers of\nthose functions such as [log.Printf]. It reports a variety of\nmistakes such as syntax errors in the format string and mismatches\n(of number and type) between the verbs and their arguments.\n\nSee the documentation of the fmt package for the complete set of\nformat operators and their operand types.",
 			URL:     "https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/printf",
 			Default: true,
 		},
@@ -1117,17 +1156,20 @@ var GeneratedAPIJSON = &APIJSON{
 		},
 		{
 			Name:    "simplifycompositelit",
-			Doc:     "check for composite literal simplifications\n\nAn array, slice, or map composite literal of the form:\n\t[]T{T{}, T{}}\nwill be simplified to:\n\t[]T{{}, {}}\n\nThis is one of the simplifications that \"gofmt -s\" applies.",
+			Doc:     "check for composite literal simplifications\n\nAn array, slice, or map composite literal of the form:\n\n\t[]T{T{}, T{}}\n\nwill be simplified to:\n\n\t[]T{{}, {}}\n\nThis is one of the simplifications that \"gofmt -s\" applies.",
+			URL:     "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/simplifycompositelit",
 			Default: true,
 		},
 		{
 			Name:    "simplifyrange",
-			Doc:     "check for range statement simplifications\n\nA range of the form:\n\tfor x, _ = range v {...}\nwill be simplified to:\n\tfor x = range v {...}\n\nA range of the form:\n\tfor _ = range v {...}\nwill be simplified to:\n\tfor range v {...}\n\nThis is one of the simplifications that \"gofmt -s\" applies.",
+			Doc:     "check for range statement simplifications\n\nA range of the form:\n\n\tfor x, _ = range v {...}\n\nwill be simplified to:\n\n\tfor x = range v {...}\n\nA range of the form:\n\n\tfor _ = range v {...}\n\nwill be simplified to:\n\n\tfor range v {...}\n\nThis is one of the simplifications that \"gofmt -s\" applies.",
+			URL:     "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/simplifyrange",
 			Default: true,
 		},
 		{
 			Name:    "simplifyslice",
-			Doc:     "check for slice simplifications\n\nA slice expression of the form:\n\ts[a:len(s)]\nwill be simplified to:\n\ts[a:]\n\nThis is one of the simplifications that \"gofmt -s\" applies.",
+			Doc:     "check for slice simplifications\n\nA slice expression of the form:\n\n\ts[a:len(s)]\n\nwill be simplified to:\n\n\ts[a:]\n\nThis is one of the simplifications that \"gofmt -s\" applies.",
+			URL:     "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/simplifyslice",
 			Default: true,
 		},
 		{
@@ -1149,6 +1191,12 @@ var GeneratedAPIJSON = &APIJSON{
 			Default: true,
 		},
 		{
+			Name:    "stdversion",
+			Doc:     "report uses of too-new standard library symbols\n\nThe stdversion analyzer reports references to symbols in the standard\nlibrary that were introduced by a Go release higher than the one in\nforce in the referring file. (Recall that the file's Go version is\ndefined by the 'go' directive its module's go.mod file, or by a\n\"//go:build go1.X\" build tag at the top of the file.)\n\nThe analyzer does not report a diagnostic for a reference to a \"too\nnew\" field or method of a type that is itself \"too new\", as this may\nhave false positives, for example if fields or methods are accessed\nthrough a type alias that is guarded by a Go version constraint.\n",
+			URL:     "https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/stdversion",
+			Default: true,
+		},
+		{
 			Name:    "stringintconv",
 			Doc:     "check for string(int) conversions\n\nThis checker flags conversions of the form string(x) where x is an integer\n(but not byte or rune) type. Such conversions are discouraged because they\nreturn the UTF-8 representation of the Unicode code point x, and not a decimal\nstring representation of x as one might expect. Furthermore, if x denotes an\ninvalid code point, the conversion cannot be statically rejected.\n\nFor conversions that intend on using the code point, consider replacing them\nwith string(rune(x)). Otherwise, strconv.Itoa and its equivalents return the\nstring representation of the value in the desired base.",
 			URL:     "https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/stringintconv",
@@ -1158,6 +1206,12 @@ var GeneratedAPIJSON = &APIJSON{
 			Name:    "structtag",
 			Doc:     "check that struct field tags conform to reflect.StructTag.Get\n\nAlso report certain struct tags (json, xml) used with unexported fields.",
 			URL:     "https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/structtag",
+			Default: true,
+		},
+		{
+			Name:    "stubmethods",
+			Doc:     "detect missing methods and fix with stub implementations\n\nThis analyzer detects type-checking errors due to missing methods\nin assignments from concrete types to interface types, and offers\na suggested fix that will create a set of stub methods so that\nthe concrete type satisfies the interface.\n\nFor example, this function will not compile because the value\nNegativeErr{} does not implement the \"error\" interface:\n\n\tfunc sqrt(x float64) (float64, error) {\n\t\tif x < 0 {\n\t\t\treturn 0, NegativeErr{} // error: missing method\n\t\t}\n\t\t...\n\t}\n\n\ttype NegativeErr struct{}\n\nThis analyzer will suggest a fix to declare this method:\n\n\t// Error implements error.Error.\n\tfunc (NegativeErr) Error() string {\n\t\tpanic(\"unimplemented\")\n\t}\n\n(At least, it appears to behave that way, but technically it\ndoesn't use the SuggestedFix mechanism and the stub is created by\nlogic in gopls's golang.stub function.)",
+			URL:     "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/stubmethods",
 			Default: true,
 		},
 		{
@@ -1179,6 +1233,12 @@ var GeneratedAPIJSON = &APIJSON{
 			Default: true,
 		},
 		{
+			Name:    "undeclaredname",
+			Doc:     "suggested fixes for \"undeclared name: <>\"\n\nThis checker provides suggested fixes for type errors of the\ntype \"undeclared name: <>\". It will either insert a new statement,\nsuch as:\n\n\t<> :=\n\nor a new function declaration, such as:\n\n\tfunc <>(inferred parameters) {\n\t\tpanic(\"implement me!\")\n\t}",
+			URL:     "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/undeclaredname",
+			Default: true,
+		},
+		{
 			Name:    "unmarshal",
 			Doc:     "report passing non-pointer or non-interface values to unmarshal\n\nThe unmarshal analysis reports calls to functions such as json.Unmarshal\nin which the argument type is not a pointer or an interface.",
 			URL:     "https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/unmarshal",
@@ -1197,8 +1257,10 @@ var GeneratedAPIJSON = &APIJSON{
 			Default: true,
 		},
 		{
-			Name: "unusedparams",
-			Doc:  "check for unused parameters of functions\n\nThe unusedparams analyzer checks functions to see if there are\nany parameters that are not being used.\n\nTo reduce false positives it ignores:\n- methods\n- parameters that do not have a name or have the name '_' (the blank identifier)\n- functions in test files\n- functions with empty bodies or those with just a return stmt",
+			Name:    "unusedparams",
+			Doc:     "check for unused parameters of functions\n\nThe unusedparams analyzer checks functions to see if there are\nany parameters that are not being used.\n\nTo ensure soundness, it ignores:\n  - \"address-taken\" functions, that is, functions that are used as\n    a value rather than being called directly; their signatures may\n    be required to conform to a func type.\n  - exported functions or methods, since they may be address-taken\n    in another package.\n  - unexported methods whose name matches an interface method\n    declared in the same package, since the method's signature\n    may be required to conform to the interface type.\n  - functions with empty bodies, or containing just a call to panic.\n  - parameters that are unnamed, or named \"_\", the blank identifier.\n\nThe analyzer suggests a fix of replacing the parameter name by \"_\",\nbut in such cases a deeper fix can be obtained by invoking the\n\"Refactor: remove unused parameter\" code action, which will\neliminate the parameter entirely, along with all corresponding\narguments at call sites, while taking care to preserve any side\neffects in the argument expressions; see\nhttps://github.com/golang/tools/releases/tag/gopls%2Fv0.14.",
+			URL:     "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/unusedparams",
+			Default: true,
 		},
 		{
 			Name:    "unusedresult",
@@ -1207,52 +1269,20 @@ var GeneratedAPIJSON = &APIJSON{
 			Default: true,
 		},
 		{
-			Name: "unusedwrite",
-			Doc:  "checks for unused writes\n\nThe analyzer reports instances of writes to struct fields and\narrays that are never read. Specifically, when a struct object\nor an array is copied, its elements are copied implicitly by\nthe compiler, and any element write to this copy does nothing\nwith the original object.\n\nFor example:\n\n\ttype T struct { x int }\n\n\tfunc f(input []T) {\n\t\tfor i, v := range input {  // v is a copy\n\t\t\tv.x = i  // unused write to field x\n\t\t}\n\t}\n\nAnother example is about non-pointer receiver:\n\n\ttype T struct { x int }\n\n\tfunc (t T) f() {  // t is a copy\n\t\tt.x = i  // unused write to field x\n\t}",
-			URL:  "https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/unusedwrite",
+			Name: "unusedvariable",
+			Doc:  "check for unused variables and suggest fixes",
+			URL:  "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/unusedvariable",
+		},
+		{
+			Name:    "unusedwrite",
+			Doc:     "checks for unused writes\n\nThe analyzer reports instances of writes to struct fields and\narrays that are never read. Specifically, when a struct object\nor an array is copied, its elements are copied implicitly by\nthe compiler, and any element write to this copy does nothing\nwith the original object.\n\nFor example:\n\n\ttype T struct { x int }\n\n\tfunc f(input []T) {\n\t\tfor i, v := range input {  // v is a copy\n\t\t\tv.x = i  // unused write to field x\n\t\t}\n\t}\n\nAnother example is about non-pointer receiver:\n\n\ttype T struct { x int }\n\n\tfunc (t T) f() {  // t is a copy\n\t\tt.x = i  // unused write to field x\n\t}",
+			URL:     "https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/unusedwrite",
+			Default: true,
 		},
 		{
 			Name: "useany",
 			Doc:  "check for constraints that could be simplified to \"any\"",
-		},
-		{
-			Name:    "fillreturns",
-			Doc:     "suggest fixes for errors due to an incorrect number of return values\n\nThis checker provides suggested fixes for type errors of the\ntype \"wrong number of return values (want %d, got %d)\". For example:\n\tfunc m() (int, string, *bool, error) {\n\t\treturn\n\t}\nwill turn into\n\tfunc m() (int, string, *bool, error) {\n\t\treturn 0, \"\", nil, nil\n\t}\n\nThis functionality is similar to https://github.com/sqs/goreturns.\n",
-			Default: true,
-		},
-		{
-			Name:    "nonewvars",
-			Doc:     "suggested fixes for \"no new vars on left side of :=\"\n\nThis checker provides suggested fixes for type errors of the\ntype \"no new vars on left side of :=\". For example:\n\tz := 1\n\tz := 2\nwill turn into\n\tz := 1\n\tz = 2\n",
-			Default: true,
-		},
-		{
-			Name:    "noresultvalues",
-			Doc:     "suggested fixes for unexpected return values\n\nThis checker provides suggested fixes for type errors of the\ntype \"no result values expected\" or \"too many return values\".\nFor example:\n\tfunc z() { return nil }\nwill turn into\n\tfunc z() { return }\n",
-			Default: true,
-		},
-		{
-			Name:    "undeclaredname",
-			Doc:     "suggested fixes for \"undeclared name: <>\"\n\nThis checker provides suggested fixes for type errors of the\ntype \"undeclared name: <>\". It will either insert a new statement,\nsuch as:\n\n\"<> := \"\n\nor a new function declaration, such as:\n\nfunc <>(inferred parameters) {\n\tpanic(\"implement me!\")\n}\n",
-			Default: true,
-		},
-		{
-			Name: "unusedvariable",
-			Doc:  "check for unused variables\n\nThe unusedvariable analyzer suggests fixes for unused variables errors.\n",
-		},
-		{
-			Name:    "fillstruct",
-			Doc:     "note incomplete struct initializations\n\nThis analyzer provides diagnostics for any struct literals that do not have\nany fields initialized. Because the suggested fix for this analysis is\nexpensive to compute, callers should compute it separately, using the\nSuggestedFix function below.\n",
-			Default: true,
-		},
-		{
-			Name:    "infertypeargs",
-			Doc:     "check for unnecessary type arguments in call expressions\n\nExplicit type arguments may be omitted from call expressions if they can be\ninferred from function arguments, or from other type arguments:\n\n\tfunc f[T any](T) {}\n\t\n\tfunc _() {\n\t\tf[string](\"foo\") // string could be inferred\n\t}\n",
-			Default: true,
-		},
-		{
-			Name:    "stubmethods",
-			Doc:     "stub methods analyzer\n\nThis analyzer generates method stubs for concrete types\nin order to implement a target interface",
-			Default: true,
+			URL:  "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/useany",
 		},
 	},
 	Hints: []*HintJSON{

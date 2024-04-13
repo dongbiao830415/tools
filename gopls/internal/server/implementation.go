@@ -8,8 +8,8 @@ import (
 	"context"
 
 	"golang.org/x/tools/gopls/internal/file"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/source"
+	"golang.org/x/tools/gopls/internal/golang"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/telemetry"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/event/tag"
@@ -24,10 +24,13 @@ func (s *server) Implementation(ctx context.Context, params *protocol.Implementa
 	ctx, done := event.Start(ctx, "lsp.Server.implementation", tag.URI.Of(params.TextDocument.URI))
 	defer done()
 
-	snapshot, fh, ok, release, err := s.beginFileRequest(ctx, params.TextDocument.URI, file.Go)
-	defer release()
-	if !ok {
+	fh, snapshot, release, err := s.fileOf(ctx, params.TextDocument.URI)
+	if err != nil {
 		return nil, err
 	}
-	return source.Implementation(ctx, snapshot, fh, params.Position)
+	defer release()
+	if snapshot.FileKind(fh) != file.Go {
+		return nil, nil // empty result
+	}
+	return golang.Implementation(ctx, snapshot, fh, params.Position)
 }

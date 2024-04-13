@@ -2,9 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build go1.18
-// +build go1.18
-
 package scan
 
 import (
@@ -18,7 +15,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
-	"golang.org/x/tools/gopls/internal/lsp/cache"
+	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/vulncheck"
 	"golang.org/x/tools/gopls/internal/vulncheck/govulncheck"
 	"golang.org/x/tools/gopls/internal/vulncheck/osv"
@@ -116,7 +113,6 @@ func RunGovulncheck(ctx context.Context, pattern string, snapshot *cache.Snapsho
 
 type govulncheckHandler struct {
 	logger io.Writer // forward progress reports to logger.
-	err    error
 
 	osvs     map[string]*osv.Entry
 	findings []*govulncheck.Finding

@@ -8,8 +8,8 @@ import (
 	"context"
 
 	"golang.org/x/tools/gopls/internal/file"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/source"
+	"golang.org/x/tools/gopls/internal/golang"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/event/tag"
 )
@@ -18,15 +18,28 @@ func (s *server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 	ctx, done := event.Start(ctx, "lsp.Server.signatureHelp", tag.URI.Of(params.TextDocument.URI))
 	defer done()
 
-	snapshot, fh, ok, release, err := s.beginFileRequest(ctx, params.TextDocument.URI, file.Go)
-	defer release()
-	if !ok {
+	fh, snapshot, release, err := s.fileOf(ctx, params.TextDocument.URI)
+	if err != nil {
 		return nil, err
 	}
-	info, activeParameter, err := source.SignatureHelp(ctx, snapshot, fh, params.Position)
+	defer release()
+
+	if snapshot.FileKind(fh) != file.Go {
+		return nil, nil // empty result
+	}
+
+	info, activeParameter, err := golang.SignatureHelp(ctx, snapshot, fh, params.Position)
 	if err != nil {
-		event.Error(ctx, "no signature help", err, tag.Position.Of(params.Position))
-		return nil, nil // sic? There could be many reasons for failure.
+		// TODO(rfindley): is this correct? Apparently, returning an error from
+		// signatureHelp is distracting in some editors, though I haven't confirmed
+		// that recently.
+		//
+		// It's unclear whether we still need to avoid returning this error result.
+		event.Error(ctx, "signature help failed", err, tag.Position.Of(params.Position))
+		return nil, nil
+	}
+	if info == nil {
+		return nil, nil
 	}
 	return &protocol.SignatureHelp{
 		Signatures:      []protocol.SignatureInformation{*info},

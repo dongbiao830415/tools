@@ -13,7 +13,10 @@ import (
 )
 
 func TestStaticcheckGenerics(t *testing.T) {
-	testenv.NeedsGo1Point(t, 19) // generics were introduced in Go 1.18, staticcheck requires go1.19+
+	testenv.NeedsGo1Point(t, 20) // staticcheck requires go1.20+
+
+	// TODO(golang/go#65249): re-enable and fix this test with gotypesalias=1.
+	testenv.SkipMaterializedAliases(t, "staticcheck needs updates for materialized aliases")
 
 	const files = `
 -- go.mod --
@@ -78,7 +81,11 @@ var FooErr error = errors.New("foo")
 // Test for golang/go#56270: an analysis with related info should not panic if
 // analysis.RelatedInformation.End is not set.
 func TestStaticcheckRelatedInfo(t *testing.T) {
-	testenv.NeedsGo1Point(t, 19) // staticcheck is only supported at Go 1.19+
+	testenv.NeedsGo1Point(t, 20) // staticcheck is only supported at Go 1.20+
+
+	// TODO(golang/go#65249): re-enable and fix this test with gotypesalias=1.
+	testenv.SkipMaterializedAliases(t, "staticcheck needs updates for materialized aliases")
+
 	const files = `
 -- go.mod --
 module mod.test

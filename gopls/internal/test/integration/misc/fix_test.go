@@ -7,14 +7,24 @@ package misc
 import (
 	"testing"
 
-	. "golang.org/x/tools/gopls/internal/test/integration"
 	"golang.org/x/tools/gopls/internal/test/compare"
+	. "golang.org/x/tools/gopls/internal/test/integration"
 
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
 )
 
-// A basic test for fillstruct, now that it uses a command.
+// A basic test for fillstruct, now that it uses a command and supports resolve edits.
 func TestFillStruct(t *testing.T) {
+	tc := []struct {
+		name         string
+		capabilities string
+		wantCommand  bool
+	}{
+		{"default", "{}", true},
+		{"no data", `{ "textDocument": {"codeAction": {	"resolveSupport": { "properties": ["edit"] } } } }`, true},
+		{"resolve support", `{ "textDocument": {"codeAction": {	"dataSupport": true, "resolveSupport": { "properties": ["edit"] } } } }`, false},
+	}
+
 	const basic = `
 -- go.mod --
 module mod.com
@@ -32,12 +42,36 @@ func Foo() {
 	_ = Info{}
 }
 `
-	Run(t, basic, func(t *testing.T, env *Env) {
-		env.OpenFile("main.go")
-		if err := env.Editor.RefactorRewrite(env.Ctx, env.RegexpSearch("main.go", "Info{}")); err != nil {
-			t.Fatal(err)
-		}
-		want := `package main
+
+	for _, tt := range tc {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := WithOptions(CapabilitiesJSON([]byte(tt.capabilities)))
+
+			runner.Run(t, basic, func(t *testing.T, env *Env) {
+				env.OpenFile("main.go")
+				fixes, err := env.Editor.CodeActions(env.Ctx, env.RegexpSearch("main.go", "Info{}"), nil, protocol.RefactorRewrite)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if len(fixes) != 1 {
+					t.Fatalf("expected 1 code action, got %v", len(fixes))
+				}
+				if tt.wantCommand {
+					if fixes[0].Command == nil || fixes[0].Data != nil {
+						t.Errorf("expected code action to have command not data, got %v", fixes[0])
+					}
+				} else {
+					if fixes[0].Command != nil || fixes[0].Data == nil {
+						t.Errorf("expected code action to have command not data, got %v", fixes[0])
+					}
+				}
+
+				// Apply the code action (handles resolving the code action), and check that the result is correct.
+				if err := env.Editor.RefactorRewrite(env.Ctx, env.RegexpSearch("main.go", "Info{}")); err != nil {
+					t.Fatal(err)
+				}
+				want := `package main
 
 type Info struct {
 	WordCounts map[string]int
@@ -51,10 +85,12 @@ func Foo() {
 	}
 }
 `
-		if got := env.BufferText("main.go"); got != want {
-			t.Fatalf("TestFillStruct failed:\n%s", compare.Text(want, got))
-		}
-	})
+				if got := env.BufferText("main.go"); got != want {
+					t.Fatalf("TestFillStruct failed:\n%s", compare.Text(want, got))
+				}
+			})
+		})
+	}
 }
 
 func TestFillReturns(t *testing.T) {
@@ -78,24 +114,15 @@ func Foo() error {
 			Diagnostics(env.AtRegexp("main.go", `return`), WithMessage("return values")),
 			ReadDiagnostics("main.go", &d),
 		)
-		codeActions := env.CodeAction("main.go", d.Diagnostics)
-		if len(codeActions) != 2 {
-			t.Fatalf("expected 2 code actions, got %v", len(codeActions))
-		}
-		var foundQuickFix, foundFixAll bool
-		for _, a := range codeActions {
-			if a.Kind == protocol.QuickFix {
-				foundQuickFix = true
-			}
-			if a.Kind == protocol.SourceFixAll {
-				foundFixAll = true
+		var quickFixes []*protocol.CodeAction
+		for _, act := range env.CodeAction("main.go", d.Diagnostics) {
+			if act.Kind == protocol.QuickFix {
+				act := act // remove in go1.22
+				quickFixes = append(quickFixes, &act)
 			}
 		}
-		if !foundQuickFix {
-			t.Fatalf("expected quickfix code action, got none")
-		}
-		if !foundFixAll {
-			t.Fatalf("expected fixall code action, got none")
+		if len(quickFixes) != 1 {
+			t.Fatalf("expected 1 quick fix, got %d:\n%v", len(quickFixes), quickFixes)
 		}
 		env.ApplyQuickFixes("main.go", d.Diagnostics)
 		env.AfterChange(NoDiagnostics(ForFile("main.go")))
@@ -117,7 +144,7 @@ go 1.18
 -- external.go --
 package external
 
-func External(z int) //@codeaction("refactor.rewrite", "z", "z", recursive)
+func External(z int)
 
 func _() {
 	External(1)
@@ -125,12 +152,10 @@ func _() {
 	`
 	Run(t, files, func(t *testing.T, env *Env) {
 		env.OpenFile("external.go")
-		actions, err := env.Editor.CodeAction(env.Ctx, env.RegexpSearch("external.go", "z"), nil)
+		_, err := env.Editor.CodeAction(env.Ctx, env.RegexpSearch("external.go", "z"), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(actions) > 0 {
-			t.Errorf("CodeAction(): got %d code actions, want 0", len(actions))
-		}
+		// yay, no panic
 	})
 }

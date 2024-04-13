@@ -1,7 +1,8 @@
-This is a minimal test of the refactor.inline code action.
+This is a minimal test of the refactor.inline code action, without resolve support.
+See inline_resolve.txt for same test with resolve support.
 
 -- go.mod --
-module testdata/codeaction
+module example.com/codeaction
 go 1.18
 
 -- a/a.go --

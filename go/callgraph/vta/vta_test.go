@@ -13,7 +13,6 @@ import (
 	"golang.org/x/tools/go/callgraph/cha"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
-	"golang.org/x/tools/internal/typeparams"
 )
 
 func TestVTACallGraph(t *testing.T) {
@@ -27,6 +26,7 @@ func TestVTACallGraph(t *testing.T) {
 		"testdata/src/callgraph_field_funcs.go",
 		"testdata/src/callgraph_recursive_types.go",
 		"testdata/src/callgraph_issue_57756.go",
+		"testdata/src/callgraph_comma_maps.go",
 	} {
 		t.Run(file, func(t *testing.T) {
 			prog, want, err := testProg(file, ssa.BuilderMode(0))
@@ -119,10 +119,6 @@ func TestVTAPanicMissingDefinitions(t *testing.T) {
 }
 
 func TestVTACallGraphGenerics(t *testing.T) {
-	if !typeparams.Enabled {
-		t.Skip("TestVTACallGraphGenerics requires type parameters")
-	}
-
 	// TODO(zpavlinovic): add more tests
 	files := []string{
 		"testdata/src/arrays_generics.go",
@@ -146,5 +142,22 @@ func TestVTACallGraphGenerics(t *testing.T) {
 				logFns(t, prog)
 			}
 		})
+	}
+}
+
+func TestVTACallGraphGo117(t *testing.T) {
+	file := "testdata/src/go117.go"
+	prog, want, err := testProg(file, ssa.BuilderMode(0))
+	if err != nil {
+		t.Fatalf("couldn't load test file '%s': %s", file, err)
+	}
+	if len(want) == 0 {
+		t.Fatalf("couldn't find want in `%s`", file)
+	}
+
+	g, _ := typePropGraph(ssautil.AllFunctions(prog), cha.CallGraph(prog))
+	got := vtaGraphStr(g)
+	if diff := setdiff(want, got); len(diff) != 0 {
+		t.Errorf("`%s`: want superset of %v;\n got %v", file, want, got)
 	}
 }

@@ -18,9 +18,8 @@ import (
 
 	"golang.org/x/telemetry/counter"
 	"golang.org/x/telemetry/counter/countertest" // requires go1.21+
-	"golang.org/x/tools/gopls/internal/hooks"
-	"golang.org/x/tools/gopls/internal/lsp/command"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
+	"golang.org/x/tools/gopls/internal/protocol/command"
 	"golang.org/x/tools/gopls/internal/telemetry"
 	. "golang.org/x/tools/gopls/internal/test/integration"
 	"golang.org/x/tools/gopls/internal/util/bug"
@@ -33,7 +32,7 @@ func TestMain(m *testing.M) {
 	}
 	countertest.Open(tmp)
 	defer os.RemoveAll(tmp)
-	Main(m, hooks.Options)
+	Main(m)
 }
 
 func TestTelemetry(t *testing.T) {
@@ -59,7 +58,7 @@ func TestTelemetry(t *testing.T) {
 	for i, c := range sessionCounters {
 		count, err := countertest.ReadCounter(c)
 		if err != nil {
-			t.Fatalf("ReadCounter(%s): %v", c.Name(), err)
+			continue // counter db not open, or counter not found
 		}
 		initialCounts[i] = count
 	}
@@ -74,7 +73,19 @@ func TestTelemetry(t *testing.T) {
 		goversion = strconv.Itoa(env.GoVersion())
 		addForwardedCounters(env, []string{"vscode/linter:a"}, []int64{1})
 		const desc = "got a bug"
+
+		// This will increment a counter named something like:
+		//
+		// `gopls/bug
+		// golang.org/x/tools/gopls/internal/util/bug.report:+35
+		// golang.org/x/tools/gopls/internal/util/bug.Report:=68
+		// golang.org/x/tools/gopls/internal/telemetry_test.TestTelemetry.func2:+4
+		// golang.org/x/tools/gopls/internal/test/integration.(*Runner).Run.func1:+87
+		// testing.tRunner:+150
+		// runtime.goexit:+0`
+		//
 		bug.Report(desc) // want a stack counter with the trace starting from here.
+
 		env.Await(ShownMessage(desc))
 	})
 
@@ -113,7 +124,7 @@ func addForwardedCounters(env *Env, names []string, values []int64) {
 	env.ExecuteCommand(&protocol.ExecuteCommandParams{
 		Command:   command.AddTelemetryCounters.ID(),
 		Arguments: args,
-	}, res)
+	}, &res)
 	if res != nil {
 		env.T.Errorf("%v failed - %v", command.AddTelemetryCounters.ID(), res)
 	}

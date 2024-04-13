@@ -13,9 +13,9 @@ import (
 
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
+	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/file"
-	"golang.org/x/tools/gopls/internal/lsp/cache"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/gopls/internal/vulncheck"
 	"golang.org/x/tools/gopls/internal/vulncheck/govulncheck"
@@ -25,7 +25,7 @@ import (
 
 func Hover(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, position protocol.Position) (*protocol.Hover, error) {
 	var found bool
-	for _, uri := range snapshot.ModFiles() {
+	for _, uri := range snapshot.View().ModFiles() {
 		if fh.URI() == uri {
 			found = true
 			break

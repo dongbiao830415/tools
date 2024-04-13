@@ -20,14 +20,15 @@ import (
 	"strings"
 	"sync"
 
+	"golang.org/x/telemetry/counter"
+	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/debug"
 	"golang.org/x/tools/gopls/internal/file"
-	"golang.org/x/tools/gopls/internal/lsp/cache"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/settings"
-	"golang.org/x/tools/gopls/internal/telemetry"
 	"golang.org/x/tools/gopls/internal/util/bug"
 	"golang.org/x/tools/gopls/internal/util/goversion"
+	"golang.org/x/tools/gopls/internal/util/maps"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/jsonrpc2"
 )
@@ -36,7 +37,11 @@ func (s *server) Initialize(ctx context.Context, params *protocol.ParamInitializ
 	ctx, done := event.Start(ctx, "lsp.Server.initialize")
 	defer done()
 
-	telemetry.RecordClientInfo(params)
+	var clientName string
+	if params != nil && params.ClientInfo != nil {
+		clientName = params.ClientInfo.Name
+	}
+	recordClientInfo(clientName)
 
 	s.stateMu.Lock()
 	if s.state >= serverInitializing {
@@ -114,6 +119,7 @@ func (s *server) Initialize(ctx context.Context, params *protocol.ParamInitializ
 		// Using CodeActionOptions is only valid if codeActionLiteralSupport is set.
 		codeActionProvider = &protocol.CodeActionOptions{
 			CodeActionKinds: s.getSupportedCodeActions(),
+			ResolveProvider: true,
 		}
 	}
 	var renameOpts interface{} = true
@@ -124,21 +130,6 @@ func (s *server) Initialize(ctx context.Context, params *protocol.ParamInitializ
 	}
 
 	versionInfo := debug.VersionInfo()
-
-	// golang/go#45732: Warn users who've installed sergi/go-diff@v1.2.0, since
-	// it will corrupt the formatting of their files.
-	for _, dep := range versionInfo.Deps {
-		if dep.Path == "github.com/sergi/go-diff" && dep.Version == "v1.2.0" {
-			if err := s.eventuallyShowMessage(ctx, &protocol.ShowMessageParams{
-				Message: `It looks like you have a bad gopls installation.
-Please reinstall gopls by running 'GO111MODULE=on go install golang.org/x/tools/gopls@latest'.
-See https://github.com/golang/go/issues/45732 for more information.`,
-				Type: protocol.Error,
-			}); err != nil {
-				return nil, err
-			}
-		}
-	}
 
 	goplsVersion, err := json.Marshal(versionInfo)
 	if err != nil {
@@ -258,7 +249,9 @@ func (s *server) checkViewGoVersions() {
 		if oldestVersion == -1 || viewVersion < oldestVersion {
 			oldestVersion, fromBuild = viewVersion, false
 		}
-		telemetry.RecordViewGoVersion(viewVersion)
+		if viewVersion >= 0 {
+			counter.Inc(fmt.Sprintf("gopls/goversion:1.%d", viewVersion))
+		}
 	}
 
 	if msg, isError := goversion.Message(oldestVersion, fromBuild); msg != "" {
@@ -339,7 +332,7 @@ func (s *server) addFolders(ctx context.Context, folders []protocol.WorkspaceFol
 		// Diagnose the newly created view asynchronously.
 		ndiagnose.Add(1)
 		go func() {
-			s.diagnoseSnapshot(snapshot, nil, 0)
+			s.diagnoseSnapshot(snapshot.BackgroundContext(), snapshot, nil, 0)
 			<-initialized
 			release()
 			ndiagnose.Done()
@@ -376,7 +369,7 @@ func (s *server) updateWatchedDirectories(ctx context.Context) error {
 	defer s.watchedGlobPatternsMu.Unlock()
 
 	// Nothing to do if the set of workspace directories is unchanged.
-	if equalURISet(s.watchedGlobPatterns, patterns) {
+	if maps.SameKeys(s.watchedGlobPatterns, patterns) {
 		return nil
 	}
 
@@ -404,32 +397,32 @@ func watchedFilesCapabilityID(id int) string {
 	return fmt.Sprintf("workspace/didChangeWatchedFiles-%d", id)
 }
 
-func equalURISet(m1, m2 map[string]struct{}) bool {
-	if len(m1) != len(m2) {
-		return false
-	}
-	for k := range m1 {
-		_, ok := m2[k]
-		if !ok {
-			return false
-		}
-	}
-	return true
-}
-
 // registerWatchedDirectoriesLocked sends the workspace/didChangeWatchedFiles
 // registrations to the client and updates s.watchedDirectories.
 // The caller must not subsequently mutate patterns.
-func (s *server) registerWatchedDirectoriesLocked(ctx context.Context, patterns map[string]struct{}) error {
+func (s *server) registerWatchedDirectoriesLocked(ctx context.Context, patterns map[protocol.RelativePattern]unit) error {
 	if !s.Options().DynamicWatchedFilesSupported {
 		return nil
 	}
+
+	supportsRelativePatterns := s.Options().RelativePatternsSupported
+
 	s.watchedGlobPatterns = patterns
 	watchers := make([]protocol.FileSystemWatcher, 0, len(patterns)) // must be a slice
 	val := protocol.WatchChange | protocol.WatchDelete | protocol.WatchCreate
 	for pattern := range patterns {
+		var value any
+		if supportsRelativePatterns && pattern.BaseURI != "" {
+			value = pattern
+		} else {
+			p := pattern.Pattern
+			if pattern.BaseURI != "" {
+				p = path.Join(filepath.ToSlash(pattern.BaseURI.Path()), p)
+			}
+			value = p
+		}
 		watchers = append(watchers, protocol.FileSystemWatcher{
-			GlobPattern: pattern,
+			GlobPattern: protocol.GlobPattern{Value: value},
 			Kind:        &val,
 		})
 	}
@@ -467,14 +460,36 @@ func (s *server) SetOptions(opts *settings.Options) {
 	s.options = opts
 }
 
+func (s *server) newFolder(ctx context.Context, folder protocol.DocumentURI, name string, opts *settings.Options) (*cache.Folder, error) {
+	env, err := cache.FetchGoEnv(ctx, folder, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &cache.Folder{
+		Dir:     folder,
+		Name:    name,
+		Options: opts,
+		Env:     *env,
+	}, nil
+}
+
+// fetchFolderOptions makes a workspace/configuration request for the given
+// folder, and populates options with the result.
+//
+// If folder is "", fetchFolderOptions makes an unscoped request.
 func (s *server) fetchFolderOptions(ctx context.Context, folder protocol.DocumentURI) (*settings.Options, error) {
-	if opts := s.Options(); !opts.ConfigurationSupported {
+	opts := s.Options()
+	if !opts.ConfigurationSupported {
 		return opts, nil
 	}
-	scope := string(folder)
+	var scopeURI *string
+	if folder != "" {
+		scope := string(folder)
+		scopeURI = &scope
+	}
 	configs, err := s.client.Configuration(ctx, &protocol.ParamConfiguration{
 		Items: []protocol.ConfigurationItem{{
-			ScopeURI: &scope,
+			ScopeURI: scopeURI,
 			Section:  "gopls",
 		}},
 	},
@@ -483,13 +498,13 @@ func (s *server) fetchFolderOptions(ctx context.Context, folder protocol.Documen
 		return nil, fmt.Errorf("failed to get workspace configuration from client (%s): %v", folder, err)
 	}
 
-	folderOpts := s.Options().Clone()
+	opts = opts.Clone()
 	for _, config := range configs {
-		if err := s.handleOptionResults(ctx, settings.SetOptions(folderOpts, config)); err != nil {
+		if err := s.handleOptionResults(ctx, settings.SetOptions(opts, config)); err != nil {
 			return nil, err
 		}
 	}
-	return folderOpts, nil
+	return opts, nil
 }
 
 func (s *server) eventuallyShowMessage(ctx context.Context, msg *protocol.ShowMessageParams) error {
@@ -546,31 +561,19 @@ func (s *server) handleOptionResults(ctx context.Context, results settings.Optio
 	return nil
 }
 
-// beginFileRequest checks preconditions for a file-oriented request and routes
-// it to a snapshot.
-// We don't want to return errors for benign conditions like wrong file type,
-// so callers should do if !ok { return err } rather than if err != nil.
-// The returned cleanup function is non-nil even in case of false/error result.
-func (s *server) beginFileRequest(ctx context.Context, uri protocol.DocumentURI, expectKind file.Kind) (*cache.Snapshot, file.Handle, bool, func(), error) {
-	view, err := s.session.ViewOf(uri)
+// fileOf returns the file for a given URI and its snapshot.
+// On success, the returned function must be called to release the snapshot.
+func (s *server) fileOf(ctx context.Context, uri protocol.DocumentURI) (file.Handle, *cache.Snapshot, func(), error) {
+	snapshot, release, err := s.session.SnapshotOf(ctx, uri)
 	if err != nil {
-		return nil, nil, false, func() {}, err
-	}
-	snapshot, release, err := view.Snapshot()
-	if err != nil {
-		return nil, nil, false, func() {}, err
+		return nil, nil, nil, err
 	}
 	fh, err := snapshot.ReadFile(ctx, uri)
 	if err != nil {
 		release()
-		return nil, nil, false, func() {}, err
+		return nil, nil, nil, err
 	}
-	if expectKind != file.UnknownKind && snapshot.FileKind(fh) != expectKind {
-		// Wrong kind of file. Nothing to do.
-		release()
-		return nil, nil, false, func() {}, nil
-	}
-	return snapshot, fh, true, release, nil
+	return fh, snapshot, release, nil
 }
 
 // shutdown implements the 'shutdown' LSP handler. It releases resources
@@ -585,6 +588,11 @@ func (s *server) Shutdown(ctx context.Context) error {
 		event.Log(ctx, "server shutdown without initialization")
 	}
 	if s.state != serverShutDown {
+		// Wait for the webserver (if any) to finish.
+		if s.web != nil {
+			s.web.server.Shutdown(ctx)
+		}
+
 		// drop all the active views
 		s.session.Shutdown(ctx)
 		s.state = serverShutDown
@@ -613,4 +621,43 @@ func (s *server) Exit(ctx context.Context) error {
 	// We don't terminate the process on a normal exit, we just allow it to
 	// close naturally if needed after the connection is closed.
 	return nil
+}
+
+// recordClientInfo records gopls client info.
+func recordClientInfo(clientName string) {
+	key := "gopls/client:other"
+	switch clientName {
+	case "Visual Studio Code":
+		key = "gopls/client:vscode"
+	case "Visual Studio Code - Insiders":
+		key = "gopls/client:vscode-insiders"
+	case "VSCodium":
+		key = "gopls/client:vscodium"
+	case "code-server":
+		// https://github.com/coder/code-server/blob/3cb92edc76ecc2cfa5809205897d93d4379b16a6/ci/build/build-vscode.sh#L19
+		key = "gopls/client:code-server"
+	case "Eglot":
+		// https://lists.gnu.org/archive/html/bug-gnu-emacs/2023-03/msg00954.html
+		key = "gopls/client:eglot"
+	case "govim":
+		// https://github.com/govim/govim/pull/1189
+		key = "gopls/client:govim"
+	case "Neovim":
+		// https://github.com/neovim/neovim/blob/42333ea98dfcd2994ee128a3467dfe68205154cd/runtime/lua/vim/lsp.lua#L1361
+		key = "gopls/client:neovim"
+	case "coc.nvim":
+		// https://github.com/neoclide/coc.nvim/blob/3dc6153a85ed0f185abec1deb972a66af3fbbfb4/src/language-client/client.ts#L994
+		key = "gopls/client:coc.nvim"
+	case "Sublime Text LSP":
+		// https://github.com/sublimelsp/LSP/blob/e608f878e7e9dd34aabe4ff0462540fadcd88fcc/plugin/core/sessions.py#L493
+		key = "gopls/client:sublimetext"
+	default:
+		// Accumulate at least a local counter for an unknown
+		// client name, but also fall through to count it as
+		// ":other" for collection.
+		if clientName != "" {
+			counter.New(fmt.Sprintf("gopls/client-other:%s", clientName)).Inc()
+		}
+	}
+	counter.Inc(key)
 }

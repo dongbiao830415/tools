@@ -35,7 +35,7 @@ L: // unpack receiver type
 
 	// unpack type parameters, if any
 	switch rtyp.(type) {
-	case *ast.IndexExpr, *typeparams.IndexListExpr:
+	case *ast.IndexExpr, *ast.IndexListExpr:
 		var indices []ast.Expr
 		rtyp, _, indices, _ = typeparams.UnpackIndexExpr(rtyp)
 		for _, arg := range indices {
@@ -62,6 +62,8 @@ L: // unpack receiver type
 }
 
 // NodeContains returns true if a node encloses a given position pos.
+// The end point will also be inclusive, which will to allow hovering when the
+// cursor is behind some nodes.
 //
 // Precondition: n must not be nil.
 func NodeContains(n ast.Node, pos token.Pos) bool {

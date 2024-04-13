@@ -6,11 +6,12 @@ package server
 
 import (
 	"context"
+	"fmt"
 
 	"golang.org/x/tools/go/ast/astutil"
+	"golang.org/x/tools/gopls/internal/cache/parsego"
 	"golang.org/x/tools/gopls/internal/file"
-	"golang.org/x/tools/gopls/internal/lsp/cache/parsego"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/internal/event"
 )
 
@@ -29,13 +30,17 @@ func (s *server) SelectionRange(ctx context.Context, params *protocol.SelectionR
 	ctx, done := event.Start(ctx, "lsp.Server.selectionRange")
 	defer done()
 
-	snapshot, fh, ok, release, err := s.beginFileRequest(ctx, params.TextDocument.URI, file.UnknownKind)
-	defer release()
-	if !ok {
+	fh, snapshot, release, err := s.fileOf(ctx, params.TextDocument.URI)
+	if err != nil {
 		return nil, err
 	}
+	defer release()
 
-	pgf, err := snapshot.ParseGo(ctx, fh, parsego.ParseFull)
+	if kind := snapshot.FileKind(fh); kind != file.Go {
+		return nil, fmt.Errorf("SelectionRange not supported for file of type %s", kind)
+	}
+
+	pgf, err := snapshot.ParseGo(ctx, fh, parsego.Full)
 	if err != nil {
 		return nil, err
 	}

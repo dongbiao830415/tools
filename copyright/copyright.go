@@ -2,9 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build go1.18
-// +build go1.18
-
 // Package copyright checks that files have the correct copyright notices.
 package copyright
 
@@ -94,7 +91,7 @@ func checkFile(toolsDir, filename string) (bool, error) {
 	return shouldAddCopyright, nil
 }
 
-// Copied from golang.org/x/tools/gopls/internal/lsp/source/util.go.
+// Copied from golang.org/x/tools/gopls/internal/golang/util.go.
 // Matches cgo generated comment as well as the proposed standard:
 //
 //	https://golang.org/s/generatedcode

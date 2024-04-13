@@ -9,9 +9,8 @@ import (
 	"time"
 
 	"golang.org/x/tools/gopls/internal/file"
-	"golang.org/x/tools/gopls/internal/lsp/command"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/internal/diff/myers"
+	"golang.org/x/tools/gopls/internal/protocol"
+	"golang.org/x/tools/gopls/internal/protocol/command"
 )
 
 var (
@@ -48,6 +47,7 @@ func DefaultOptions(overrides ...func(*Options)) *Options {
 						protocol.RefactorRewrite:       true,
 						protocol.RefactorInline:        true,
 						protocol.RefactorExtract:       true,
+						protocol.GoDoc:                 true,
 					},
 					file.Mod: {
 						protocol.SourceOrganizeImports: true,
@@ -62,7 +62,6 @@ func DefaultOptions(overrides ...func(*Options)) *Options {
 			UserOptions: UserOptions{
 				BuildOptions: BuildOptions{
 					ExpandWorkspaceToModule: true,
-					MemoryMode:              ModeNormal,
 					DirectoryFilters:        []string{"-**/node_modules"},
 					TemplateExtensions:      []string{},
 					StandaloneTags:          []string{"ignore"},
@@ -113,21 +112,12 @@ func DefaultOptions(overrides ...func(*Options)) *Options {
 				CompleteUnimported:          true,
 				CompletionDocumentation:     true,
 				DeepCompletion:              true,
-				NewDiff:                     "new",
 				SubdirWatchPatterns:         SubdirWatchPatternsAuto,
 				ReportAnalysisProgressAfter: 5 * time.Second,
 				TelemetryPrompt:             false,
 				LinkifyShowMessage:          false,
-			},
-			Hooks: Hooks{
-				// TODO(adonovan): switch to new diff.Strings implementation.
-				ComputeEdits:         myers.ComputeEdits,
-				URLRegexp:            urlRegexp(),
-				DefaultAnalyzers:     defaultAnalyzers(),
-				TypeErrorAnalyzers:   typeErrorAnalyzers(),
-				ConvenienceAnalyzers: convenienceAnalyzers(),
-				StaticcheckAnalyzers: map[string]*Analyzer{},
-				GoDiff:               true,
+				IncludeReplaceInWorkspace:   false,
+				ZeroConfig:                  true,
 			},
 		}
 	})

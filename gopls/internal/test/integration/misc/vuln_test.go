@@ -2,9 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build go1.18
-// +build go1.18
-
 package misc
 
 import (
@@ -17,11 +14,11 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
-	"golang.org/x/tools/gopls/internal/lsp/cache"
-	"golang.org/x/tools/gopls/internal/lsp/command"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	. "golang.org/x/tools/gopls/internal/test/integration"
+	"golang.org/x/tools/gopls/internal/cache"
+	"golang.org/x/tools/gopls/internal/protocol"
+	"golang.org/x/tools/gopls/internal/protocol/command"
 	"golang.org/x/tools/gopls/internal/test/compare"
+	. "golang.org/x/tools/gopls/internal/test/integration"
 	"golang.org/x/tools/gopls/internal/vulncheck"
 	"golang.org/x/tools/gopls/internal/vulncheck/vulntest"
 )
@@ -167,7 +164,7 @@ func TestRunGovulncheckStd(t *testing.T) {
 -- go.mod --
 module mod.com
 
-go 1.18
+go 1.19
 -- main.go --
 package main
 
@@ -192,9 +189,9 @@ func main() {
 			// Let the analyzer read vulnerabilities data from the testdata/vulndb.
 			"GOVULNDB": db.URI(),
 			// When fetchinging stdlib package vulnerability info,
-			// behave as if our go version is go1.18 for this testing.
+			// behave as if our go version is go1.19 for this testing.
 			// The default behavior is to run `go env GOVERSION` (which isn't mutable env var).
-			cache.GoVersionForVulnTest:        "go1.18",
+			cache.GoVersionForVulnTest:        "go1.19",
 			"_GOPLS_TEST_BINARY_RUN_AS_GOPLS": "true", // needed to run `gopls vulncheck`.
 		},
 		Settings{
@@ -434,7 +431,7 @@ func (v VulnData) Vuln1() {}
 func (v VulnData) Vuln2() {}
 `
 
-func vulnTestEnv(vulnsDB, proxyData string) (*vulntest.DB, []RunOption, error) {
+func vulnTestEnv(proxyData string) (*vulntest.DB, []RunOption, error) {
 	db, err := vulntest.NewDatabase(context.Background(), []byte(vulnsData))
 	if err != nil {
 		return nil, nil, nil
@@ -458,7 +455,7 @@ func vulnTestEnv(vulnsDB, proxyData string) (*vulntest.DB, []RunOption, error) {
 }
 
 func TestRunVulncheckPackageDiagnostics(t *testing.T) {
-	db, opts0, err := vulnTestEnv(vulnsData, proxy1)
+	db, opts0, err := vulnTestEnv(proxy1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -606,7 +603,7 @@ func TestRunGovulncheck_Expiry(t *testing.T) {
 	}(cache.MaxGovulncheckResultAge)
 	cache.MaxGovulncheckResultAge = 99 * time.Millisecond
 
-	db, opts0, err := vulnTestEnv(vulnsData, proxy1)
+	db, opts0, err := vulnTestEnv(proxy1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -638,7 +635,7 @@ func stringify(a interface{}) string {
 }
 
 func TestRunVulncheckWarning(t *testing.T) {
-	db, opts, err := vulnTestEnv(vulnsData, proxy1)
+	db, opts, err := vulnTestEnv(proxy1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -660,7 +657,8 @@ func TestRunVulncheckWarning(t *testing.T) {
 		)
 
 		testFetchVulncheckResult(t, env, map[string]fetchVulncheckResult{
-			"go.mod": {IDs: []string{"GO-2022-01", "GO-2022-02", "GO-2022-03"}, Mode: vulncheck.ModeGovulncheck},
+			// All vulnerabilities (symbol-level, import-level, module-level) are reported.
+			"go.mod": {IDs: []string{"GO-2022-01", "GO-2022-02", "GO-2022-03", "GO-2022-04"}, Mode: vulncheck.ModeGovulncheck},
 		})
 		env.OpenFile("x/x.go")
 		env.OpenFile("y/y.go")
@@ -793,7 +791,7 @@ func OK() {} // ok.
 `
 
 func TestGovulncheckInfo(t *testing.T) {
-	db, opts, err := vulnTestEnv(vulnsData, proxy2)
+	db, opts, err := vulnTestEnv(proxy2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -814,7 +812,7 @@ func TestGovulncheckInfo(t *testing.T) {
 			ReadDiagnostics("go.mod", gotDiagnostics),
 		)
 
-		testFetchVulncheckResult(t, env, map[string]fetchVulncheckResult{"go.mod": {IDs: []string{"GO-2022-02"}, Mode: vulncheck.ModeGovulncheck}})
+		testFetchVulncheckResult(t, env, map[string]fetchVulncheckResult{"go.mod": {IDs: []string{"GO-2022-02", "GO-2022-04"}, Mode: vulncheck.ModeGovulncheck}})
 		// wantDiagnostics maps a module path in the require
 		// section of a go.mod to diagnostics that will be returned
 		// when running vulncheck.
@@ -927,16 +925,6 @@ type vulnDiag struct {
 	relatedInfo []vulnRelatedInfo
 	// diagnostic source.
 	source string
-}
-
-func (i vulnRelatedInfo) less(j vulnRelatedInfo) bool {
-	if i.Filename != j.Filename {
-		return i.Filename < j.Filename
-	}
-	if i.Line != j.Line {
-		return i.Line < j.Line
-	}
-	return i.Message < j.Message
 }
 
 // vulnDiagExpectation maps a module path in the require

@@ -5,71 +5,16 @@
 package settings
 
 import (
-	"context"
 	"fmt"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"time"
 
-	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/appends"
-	"golang.org/x/tools/go/analysis/passes/asmdecl"
-	"golang.org/x/tools/go/analysis/passes/assign"
-	"golang.org/x/tools/go/analysis/passes/atomic"
-	"golang.org/x/tools/go/analysis/passes/atomicalign"
-	"golang.org/x/tools/go/analysis/passes/bools"
-	"golang.org/x/tools/go/analysis/passes/buildtag"
-	"golang.org/x/tools/go/analysis/passes/cgocall"
-	"golang.org/x/tools/go/analysis/passes/composite"
-	"golang.org/x/tools/go/analysis/passes/copylock"
-	"golang.org/x/tools/go/analysis/passes/deepequalerrors"
-	"golang.org/x/tools/go/analysis/passes/defers"
-	"golang.org/x/tools/go/analysis/passes/directive"
-	"golang.org/x/tools/go/analysis/passes/errorsas"
-	"golang.org/x/tools/go/analysis/passes/fieldalignment"
-	"golang.org/x/tools/go/analysis/passes/httpresponse"
-	"golang.org/x/tools/go/analysis/passes/ifaceassert"
-	"golang.org/x/tools/go/analysis/passes/loopclosure"
-	"golang.org/x/tools/go/analysis/passes/lostcancel"
-	"golang.org/x/tools/go/analysis/passes/nilfunc"
-	"golang.org/x/tools/go/analysis/passes/nilness"
-	"golang.org/x/tools/go/analysis/passes/printf"
-	"golang.org/x/tools/go/analysis/passes/shadow"
-	"golang.org/x/tools/go/analysis/passes/shift"
-	"golang.org/x/tools/go/analysis/passes/slog"
-	"golang.org/x/tools/go/analysis/passes/sortslice"
-	"golang.org/x/tools/go/analysis/passes/stdmethods"
-	"golang.org/x/tools/go/analysis/passes/stringintconv"
-	"golang.org/x/tools/go/analysis/passes/structtag"
-	"golang.org/x/tools/go/analysis/passes/testinggoroutine"
-	"golang.org/x/tools/go/analysis/passes/tests"
-	"golang.org/x/tools/go/analysis/passes/timeformat"
-	"golang.org/x/tools/go/analysis/passes/unmarshal"
-	"golang.org/x/tools/go/analysis/passes/unreachable"
-	"golang.org/x/tools/go/analysis/passes/unsafeptr"
-	"golang.org/x/tools/go/analysis/passes/unusedresult"
-	"golang.org/x/tools/go/analysis/passes/unusedwrite"
-	"golang.org/x/tools/gopls/internal/analysis/deprecated"
-	"golang.org/x/tools/gopls/internal/analysis/embeddirective"
-	"golang.org/x/tools/gopls/internal/analysis/fillreturns"
-	"golang.org/x/tools/gopls/internal/analysis/fillstruct"
-	"golang.org/x/tools/gopls/internal/analysis/infertypeargs"
-	"golang.org/x/tools/gopls/internal/analysis/nonewvars"
-	"golang.org/x/tools/gopls/internal/analysis/noresultvalues"
-	"golang.org/x/tools/gopls/internal/analysis/simplifycompositelit"
-	"golang.org/x/tools/gopls/internal/analysis/simplifyrange"
-	"golang.org/x/tools/gopls/internal/analysis/simplifyslice"
-	"golang.org/x/tools/gopls/internal/analysis/stubmethods"
-	"golang.org/x/tools/gopls/internal/analysis/undeclaredname"
-	"golang.org/x/tools/gopls/internal/analysis/unusedparams"
 	"golang.org/x/tools/gopls/internal/analysis/unusedvariable"
-	"golang.org/x/tools/gopls/internal/analysis/useany"
 	"golang.org/x/tools/gopls/internal/file"
-	"golang.org/x/tools/gopls/internal/lsp/command"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/internal/diff"
+	"golang.org/x/tools/gopls/internal/protocol"
+	"golang.org/x/tools/gopls/internal/protocol/command"
 )
 
 type Annotation string
@@ -90,32 +35,19 @@ const (
 
 // Options holds various configuration that affects Gopls execution, organized
 // by the nature or origin of the settings.
+//
+// Options must be comparable with reflect.DeepEqual.
 type Options struct {
 	ClientOptions
 	ServerOptions
 	UserOptions
 	InternalOptions
-	Hooks
-}
-
-// IsAnalyzerEnabled reports whether an analyzer with the given name is
-// enabled.
-//
-// TODO(rfindley): refactor to simplify this function. We no longer need the
-// different categories of analyzer.
-func (opts *Options) IsAnalyzerEnabled(name string) bool {
-	for _, amap := range []map[string]*Analyzer{opts.DefaultAnalyzers, opts.TypeErrorAnalyzers, opts.ConvenienceAnalyzers, opts.StaticcheckAnalyzers} {
-		for _, analyzer := range amap {
-			if analyzer.Analyzer.Name == name && analyzer.IsEnabled(opts) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // ClientOptions holds LSP-specific configuration that is provided by the
 // client.
+//
+// ClientOptions must be comparable with reflect.DeepEqual.
 type ClientOptions struct {
 	ClientInfo                                 *protocol.ClientInfo
 	InsertTextFormat                           protocol.InsertTextFormat
@@ -123,6 +55,7 @@ type ClientOptions struct {
 	DynamicConfigurationSupported              bool
 	DynamicRegistrationSemanticTokensSupported bool
 	DynamicWatchedFilesSupported               bool
+	RelativePatternsSupported                  bool
 	PreferredContentFormat                     protocol.MarkupKind
 	LineFoldingOnly                            bool
 	HierarchicalDocumentSymbolSupport          bool
@@ -132,15 +65,19 @@ type ClientOptions struct {
 	CompletionTags                             bool
 	CompletionDeprecated                       bool
 	SupportedResourceOperations                []protocol.ResourceOperationKind
+	CodeActionResolveOptions                   []string
 }
 
 // ServerOptions holds LSP-specific configuration that is provided by the
 // server.
+//
+// ServerOptions must be comparable with reflect.DeepEqual.
 type ServerOptions struct {
 	SupportedCodeActions map[file.Kind]map[protocol.CodeActionKind]bool
 	SupportedCommands    []string
 }
 
+// Note: BuildOptions must be comparable with reflect.DeepEqual.
 type BuildOptions struct {
 	// BuildFlags is the set of flags passed on to the build system when invoked.
 	// It is applied to queries like `go list`, which is used when discovering files.
@@ -175,18 +112,17 @@ type BuildOptions struct {
 	// is the part of the file name after the final dot.)
 	TemplateExtensions []string
 
-	// MemoryMode controls the tradeoff `gopls` makes between memory usage and
-	// correctness.
-	//
-	// Values other than `Normal` are untested and may break in surprising ways.
-	MemoryMode MemoryMode `status:"experimental"`
+	// obsolete, no effect
+	MemoryMode string `status:"experimental"`
 
-	// ExpandWorkspaceToModule instructs `gopls` to adjust the scope of the
-	// workspace to find the best available module root. `gopls` first looks for
-	// a go.mod file in any parent directory of the workspace folder, expanding
-	// the scope to that directory if it exists. If no viable parent directory is
-	// found, gopls will check if there is exactly one child directory containing
-	// a go.mod file, narrowing the scope to that directory if it exists.
+	// ExpandWorkspaceToModule determines which packages are considered
+	// "workspace packages" when the workspace is using modules.
+	//
+	// Workspace packages affect the scope of workspace-wide operations. Notably,
+	// gopls diagnoses all packages considered to be part of the workspace after
+	// every keystroke, so by setting "ExpandWorkspaceToModule" to false, and
+	// opening a nested workspace directory, you can reduce the amount of work
+	// gopls has to do to keep your workspace up to date.
 	ExpandWorkspaceToModule bool `status:"experimental"`
 
 	// AllowModfileModifications disables -mod=readonly, allowing imports from
@@ -219,6 +155,7 @@ type BuildOptions struct {
 	StandaloneTags []string
 }
 
+// Note: UIOptions must be comparable with reflect.DeepEqual.
 type UIOptions struct {
 	DocumentationOptions
 	CompletionOptions
@@ -256,6 +193,7 @@ type UIOptions struct {
 	NoSemanticNumber bool `status:"experimental"`
 }
 
+// Note: CompletionOptions must be comparable with reflect.DeepEqual.
 type CompletionOptions struct {
 	// Placeholders enables placeholders for function parameters or struct
 	// fields in completion responses.
@@ -284,6 +222,7 @@ type CompletionOptions struct {
 	CompleteFunctionCalls bool
 }
 
+// Note: DocumentationOptions must be comparable with reflect.DeepEqual.
 type DocumentationOptions struct {
 	// HoverKind controls the information that appears in the hover text.
 	// SingleLine and Structured are intended for use only by authors of editor plugins.
@@ -305,6 +244,7 @@ type DocumentationOptions struct {
 	LinksInHover bool
 }
 
+// Note: FormattingOptions must be comparable with reflect.DeepEqual.
 type FormattingOptions struct {
 	// Local is the equivalent of the `goimports -local` flag, which puts
 	// imports beginning with this string after third-party packages. It should
@@ -316,6 +256,7 @@ type FormattingOptions struct {
 	Gofumpt bool
 }
 
+// Note: DiagnosticOptions must be comparable with reflect.DeepEqual.
 type DiagnosticOptions struct {
 	// Analyses specify analyses that the user would like to enable or disable.
 	// A map of the names of analysis passes that should be enabled/disabled.
@@ -328,7 +269,7 @@ type DiagnosticOptions struct {
 	// ...
 	// "analyses": {
 	//   "unreachable": false, // Disable the unreachable analyzer.
-	//   "unusedparams": true  // Enable the unusedparams analyzer.
+	//   "unusedvariable": true  // Enable the unusedvariable analyzer.
 	// }
 	// ...
 	// ```
@@ -407,6 +348,8 @@ type NavigationOptions struct {
 
 // UserOptions holds custom Gopls configuration (not part of the LSP) that is
 // modified by the client.
+//
+// UserOptions must be comparable with reflect.DeepEqual.
 type UserOptions struct {
 	BuildOptions
 	UIOptions
@@ -435,42 +378,6 @@ func (u *UserOptions) SetEnvSlice(env []string) {
 		}
 		u.Env[split[0]] = split[1]
 	}
-}
-
-// DiffFunction is the type for a function that produces a set of edits that
-// convert from the before content to the after content.
-type DiffFunction func(before, after string) []diff.Edit
-
-// Hooks contains configuration that is provided to the Gopls command by the
-// main package.
-type Hooks struct {
-	// LicensesText holds third party licenses for software used by gopls.
-	LicensesText string
-
-	// GoDiff is used in gopls/hooks to get Myers' diff
-	GoDiff bool
-
-	// Whether staticcheck is supported.
-	StaticcheckSupported bool
-
-	// ComputeEdits is used to compute edits between file versions.
-	ComputeEdits DiffFunction
-
-	// URLRegexp is used to find potential URLs in comments/strings.
-	//
-	// Not all matches are shown to the user: if the matched URL is not detected
-	// as valid, it will be skipped.
-	URLRegexp *regexp.Regexp
-
-	// GofumptFormat allows the gopls module to wire-in a call to
-	// gofumpt/format.Source. langVersion and modulePath are used for some
-	// Gofumpt formatting rules -- see the Gofumpt documentation for details.
-	GofumptFormat func(ctx context.Context, langVersion, modulePath string, src []byte) ([]byte, error)
-
-	DefaultAnalyzers     map[string]*Analyzer
-	TypeErrorAnalyzers   map[string]*Analyzer
-	ConvenienceAnalyzers map[string]*Analyzer
-	StaticcheckAnalyzers map[string]*Analyzer
 }
 
 // InternalOptions contains settings that are not intended for use by the
@@ -525,12 +432,6 @@ type InternalOptions struct {
 	// This option applies only during initialization.
 	ShowBugReports bool
 
-	// NewDiff controls the choice of the new diff implementation. It can be
-	// 'new', 'old', or 'both', which is the default. 'both' computes diffs with
-	// both algorithms, checks that the new algorithm has worked, and write some
-	// summary statistics to a file in os.TmpDir().
-	NewDiff string
-
 	// SubdirWatchPatterns configures the file watching glob patterns registered
 	// by gopls.
 	//
@@ -572,6 +473,17 @@ type InternalOptions struct {
 	// LinkifyShowMessage controls whether the client wants gopls
 	// to linkify links in showMessage. e.g. [go.dev](https://go.dev).
 	LinkifyShowMessage bool
+
+	// IncludeReplaceInWorkspace controls whether locally replaced modules in a
+	// go.mod file are treated like workspace modules.
+	// Or in other words, if a go.mod file with local replaces behaves like a
+	// go.work file.
+	IncludeReplaceInWorkspace bool
+
+	// ZeroConfig enables the zero-config algorithm for workspace layout,
+	// dynamically creating build configurations for different modules,
+	// directories, and GOOS/GOARCH combinations to cover open files.
+	ZeroConfig bool
 }
 
 type SubdirWatchPatterns string
@@ -661,16 +573,6 @@ const (
 	Structured HoverKind = "Structured"
 )
 
-type MemoryMode string
-
-const (
-	ModeNormal MemoryMode = "Normal"
-	// In DegradeClosed mode, `gopls` will collect less information about
-	// packages without open files. As a result, features like Find
-	// References and Rename will miss results in such packages.
-	ModeDegradeClosed MemoryMode = "DegradeClosed"
-)
-
 type VulncheckMode string
 
 const (
@@ -698,15 +600,15 @@ type OptionResults []OptionResult
 
 type OptionResult struct {
 	Name  string
-	Value interface{}
+	Value any
 	Error error
 }
 
-func SetOptions(options *Options, opts interface{}) OptionResults {
+func SetOptions(options *Options, opts any) OptionResults {
 	var results OptionResults
 	switch opts := opts.(type) {
 	case nil:
-	case map[string]interface{}:
+	case map[string]any:
 		// If the user's settings contains "allExperiments", set that first,
 		// and then let them override individual settings independently.
 		var enableExperiments bool
@@ -748,6 +650,7 @@ func (o *Options) ForClientCapabilities(clientName *protocol.ClientInfo, caps pr
 	o.DynamicConfigurationSupported = caps.Workspace.DidChangeConfiguration.DynamicRegistration
 	o.DynamicRegistrationSemanticTokensSupported = caps.TextDocument.SemanticTokens.DynamicRegistration
 	o.DynamicWatchedFilesSupported = caps.Workspace.DidChangeWatchedFiles.DynamicRegistration
+	o.RelativePatternsSupported = caps.Workspace.DidChangeWatchedFiles.RelativePatternSupport
 
 	// Check which types of content format are supported by this client.
 	if hover := caps.TextDocument.Hover; hover != nil && len(hover.ContentFormat) > 0 {
@@ -776,6 +679,11 @@ func (o *Options) ForClientCapabilities(clientName *protocol.ClientInfo, caps pr
 	} else if caps.TextDocument.Completion.CompletionItem.DeprecatedSupport {
 		o.CompletionDeprecated = true
 	}
+
+	// Check if the client supports code actions resolving.
+	if caps.TextDocument.CodeAction.DataSupport && caps.TextDocument.CodeAction.ResolveSupport != nil {
+		o.CodeActionResolveOptions = caps.TextDocument.CodeAction.ResolveSupport.Properties
+	}
 }
 
 func (o *Options) Clone() *Options {
@@ -784,15 +692,8 @@ func (o *Options) Clone() *Options {
 	result := &Options{
 		ClientOptions:   o.ClientOptions,
 		InternalOptions: o.InternalOptions,
-		Hooks: Hooks{
-			GoDiff:               o.GoDiff,
-			StaticcheckSupported: o.StaticcheckSupported,
-			ComputeEdits:         o.ComputeEdits,
-			GofumptFormat:        o.GofumptFormat,
-			URLRegexp:            o.URLRegexp,
-		},
-		ServerOptions: o.ServerOptions,
-		UserOptions:   o.UserOptions,
+		ServerOptions:   o.ServerOptions,
+		UserOptions:     o.UserOptions,
 	}
 	// Fully clone any slice or map fields. Only Hooks, ExperimentalOptions,
 	// and UserOptions can be modified.
@@ -816,26 +717,7 @@ func (o *Options) Clone() *Options {
 	result.DirectoryFilters = copySlice(o.DirectoryFilters)
 	result.StandaloneTags = copySlice(o.StandaloneTags)
 
-	copyAnalyzerMap := func(src map[string]*Analyzer) map[string]*Analyzer {
-		dst := make(map[string]*Analyzer)
-		for k, v := range src {
-			dst[k] = v
-		}
-		return dst
-	}
-	result.DefaultAnalyzers = copyAnalyzerMap(o.DefaultAnalyzers)
-	result.TypeErrorAnalyzers = copyAnalyzerMap(o.TypeErrorAnalyzers)
-	result.ConvenienceAnalyzers = copyAnalyzerMap(o.ConvenienceAnalyzers)
-	result.StaticcheckAnalyzers = copyAnalyzerMap(o.StaticcheckAnalyzers)
 	return result
-}
-
-func (o *Options) AddStaticcheckAnalyzer(a *analysis.Analyzer, enabled bool, severity protocol.DiagnosticSeverity) {
-	o.StaticcheckAnalyzers[a.Name] = &Analyzer{
-		Analyzer: a,
-		Enabled:  enabled,
-		Severity: severity,
-	}
 }
 
 // EnableAllExperiments turns on all of the experimental "off-by-default"
@@ -851,9 +733,6 @@ func (o *Options) enableAllExperimentMaps() {
 	}
 	if _, ok := o.Codelenses[string(command.RunGovulncheck)]; !ok {
 		o.Codelenses[string(command.RunGovulncheck)] = true
-	}
-	if _, ok := o.Analyses[unusedparams.Analyzer.Name]; !ok {
-		o.Analyses[unusedparams.Analyzer.Name] = true
 	}
 	if _, ok := o.Analyses[unusedvariable.Analyzer.Name]; !ok {
 		o.Analyses[unusedvariable.Analyzer.Name] = true
@@ -941,12 +820,7 @@ func (o *Options) set(name string, value interface{}, seen map[string]struct{}) 
 		o.DirectoryFilters = filters
 
 	case "memoryMode":
-		if s, ok := result.asOneOf(
-			string(ModeNormal),
-			string(ModeDegradeClosed),
-		); ok {
-			o.MemoryMode = MemoryMode(s)
-		}
+		result.deprecated("")
 	case "completionDocumentation":
 		result.setBool(&o.CompletionDocumentation)
 	case "usePlaceholders":
@@ -1053,7 +927,7 @@ func (o *Options) set(name string, value interface{}, seen map[string]struct{}) 
 	case "staticcheck":
 		if v, ok := result.asBool(); ok {
 			o.Staticcheck = v
-			if v && !o.StaticcheckSupported {
+			if v && !StaticcheckSupported {
 				result.Error = fmt.Errorf("applying setting %q: staticcheck is not supported at %s;"+
 					" rebuild gopls with a more recent version of Go", result.Name, runtime.Version())
 			}
@@ -1077,7 +951,7 @@ func (o *Options) set(name string, value interface{}, seen map[string]struct{}) 
 	case "gofumpt":
 		if v, ok := result.asBool(); ok {
 			o.Gofumpt = v
-			if v && o.GofumptFormat == nil {
+			if v && !GofumptSupported {
 				result.Error = fmt.Errorf("applying setting %q: gofumpt is not supported at %s;"+
 					" rebuild gopls with a more recent version of Go", result.Name, runtime.Version())
 			}
@@ -1095,7 +969,9 @@ func (o *Options) set(name string, value interface{}, seen map[string]struct{}) 
 		result.setBool(&o.NoSemanticNumber)
 
 	case "expandWorkspaceToModule":
-		result.softErrorf("gopls setting \"expandWorkspaceToModule\" is deprecated.\nPlease comment on https://go.dev/issue/63536 if this impacts your workflow.")
+		// See golang/go#63536: we can consider deprecating
+		// expandWorkspaceToModule, but probably need to change the default
+		// behavior in that case to *not* expand to the module.
 		result.setBool(&o.ExpandWorkspaceToModule)
 
 	case "experimentalPostfixCompletions":
@@ -1146,6 +1022,7 @@ func (o *Options) set(name string, value interface{}, seen map[string]struct{}) 
 		result.deprecated("")
 
 	case "allowModfileModifications":
+		result.softErrorf("gopls setting \"allowModfileModifications\" is deprecated.\nPlease comment on https://go.dev/issue/65546 if this impacts your workflow.")
 		result.setBool(&o.AllowModfileModifications)
 
 	case "allowImplicitNetworkAccess":
@@ -1162,7 +1039,7 @@ func (o *Options) set(name string, value interface{}, seen map[string]struct{}) 
 		// processed, so do nothing here.
 
 	case "newDiff":
-		result.setString(&o.NewDiff)
+		result.deprecated("")
 
 	case "subdirWatchPatterns":
 		if s, ok := result.asOneOf(
@@ -1178,8 +1055,15 @@ func (o *Options) set(name string, value interface{}, seen map[string]struct{}) 
 
 	case "telemetryPrompt":
 		result.setBool(&o.TelemetryPrompt)
+
 	case "linkifyShowMessage":
 		result.setBool(&o.LinkifyShowMessage)
+
+	case "includeReplaceInWorkspace":
+		result.setBool(&o.IncludeReplaceInWorkspace)
+
+	case "zeroConfig":
+		result.setBool(&o.ZeroConfig)
 
 	// Replaced settings.
 	case "experimentalDisabledAnalyses":
@@ -1408,132 +1292,4 @@ func (r *OptionResult) setStringSlice(s *[]string) {
 	if v, ok := r.asStringSlice(); ok {
 		*s = v
 	}
-}
-
-func typeErrorAnalyzers() map[string]*Analyzer {
-	return map[string]*Analyzer{
-		fillreturns.Analyzer.Name: {
-			Analyzer: fillreturns.Analyzer,
-			// TODO(rfindley): is SourceFixAll even necessary here? Is that not implied?
-			ActionKind: []protocol.CodeActionKind{protocol.SourceFixAll, protocol.QuickFix},
-			Enabled:    true,
-		},
-		nonewvars.Analyzer.Name: {
-			Analyzer: nonewvars.Analyzer,
-			Enabled:  true,
-		},
-		noresultvalues.Analyzer.Name: {
-			Analyzer: noresultvalues.Analyzer,
-			Enabled:  true,
-		},
-		undeclaredname.Analyzer.Name: {
-			Analyzer: undeclaredname.Analyzer,
-			Fix:      UndeclaredName,
-			Enabled:  true,
-		},
-		unusedvariable.Analyzer.Name: {
-			Analyzer: unusedvariable.Analyzer,
-			Enabled:  false,
-		},
-	}
-}
-
-// TODO(golang/go#61559): remove convenience analyzers now that they are not
-// used from the analysis framework.
-func convenienceAnalyzers() map[string]*Analyzer {
-	return map[string]*Analyzer{
-		fillstruct.Analyzer.Name: {
-			Analyzer:   fillstruct.Analyzer,
-			Fix:        FillStruct,
-			Enabled:    true,
-			ActionKind: []protocol.CodeActionKind{protocol.RefactorRewrite},
-		},
-		stubmethods.Analyzer.Name: {
-			Analyzer: stubmethods.Analyzer,
-			Fix:      StubMethods,
-			Enabled:  true,
-		},
-		infertypeargs.Analyzer.Name: {
-			Analyzer:   infertypeargs.Analyzer,
-			Enabled:    true,
-			ActionKind: []protocol.CodeActionKind{protocol.RefactorRewrite},
-		},
-	}
-}
-
-func defaultAnalyzers() map[string]*Analyzer {
-	return map[string]*Analyzer{
-		// The traditional vet suite:
-		appends.Analyzer.Name:       {Analyzer: appends.Analyzer, Enabled: true},
-		asmdecl.Analyzer.Name:       {Analyzer: asmdecl.Analyzer, Enabled: true},
-		assign.Analyzer.Name:        {Analyzer: assign.Analyzer, Enabled: true},
-		atomic.Analyzer.Name:        {Analyzer: atomic.Analyzer, Enabled: true},
-		bools.Analyzer.Name:         {Analyzer: bools.Analyzer, Enabled: true},
-		buildtag.Analyzer.Name:      {Analyzer: buildtag.Analyzer, Enabled: true},
-		cgocall.Analyzer.Name:       {Analyzer: cgocall.Analyzer, Enabled: true},
-		composite.Analyzer.Name:     {Analyzer: composite.Analyzer, Enabled: true},
-		copylock.Analyzer.Name:      {Analyzer: copylock.Analyzer, Enabled: true},
-		defers.Analyzer.Name:        {Analyzer: defers.Analyzer, Enabled: true},
-		deprecated.Analyzer.Name:    {Analyzer: deprecated.Analyzer, Enabled: true, Severity: protocol.SeverityHint, Tag: []protocol.DiagnosticTag{protocol.Deprecated}},
-		directive.Analyzer.Name:     {Analyzer: directive.Analyzer, Enabled: true},
-		errorsas.Analyzer.Name:      {Analyzer: errorsas.Analyzer, Enabled: true},
-		httpresponse.Analyzer.Name:  {Analyzer: httpresponse.Analyzer, Enabled: true},
-		ifaceassert.Analyzer.Name:   {Analyzer: ifaceassert.Analyzer, Enabled: true},
-		loopclosure.Analyzer.Name:   {Analyzer: loopclosure.Analyzer, Enabled: true},
-		lostcancel.Analyzer.Name:    {Analyzer: lostcancel.Analyzer, Enabled: true},
-		nilfunc.Analyzer.Name:       {Analyzer: nilfunc.Analyzer, Enabled: true},
-		printf.Analyzer.Name:        {Analyzer: printf.Analyzer, Enabled: true},
-		shift.Analyzer.Name:         {Analyzer: shift.Analyzer, Enabled: true},
-		slog.Analyzer.Name:          {Analyzer: slog.Analyzer, Enabled: true},
-		stdmethods.Analyzer.Name:    {Analyzer: stdmethods.Analyzer, Enabled: true},
-		stringintconv.Analyzer.Name: {Analyzer: stringintconv.Analyzer, Enabled: true},
-		structtag.Analyzer.Name:     {Analyzer: structtag.Analyzer, Enabled: true},
-		tests.Analyzer.Name:         {Analyzer: tests.Analyzer, Enabled: true},
-		unmarshal.Analyzer.Name:     {Analyzer: unmarshal.Analyzer, Enabled: true},
-		unreachable.Analyzer.Name:   {Analyzer: unreachable.Analyzer, Enabled: true},
-		unsafeptr.Analyzer.Name:     {Analyzer: unsafeptr.Analyzer, Enabled: true},
-		unusedresult.Analyzer.Name:  {Analyzer: unusedresult.Analyzer, Enabled: true},
-
-		// Non-vet analyzers:
-		atomicalign.Analyzer.Name:      {Analyzer: atomicalign.Analyzer, Enabled: true},
-		deepequalerrors.Analyzer.Name:  {Analyzer: deepequalerrors.Analyzer, Enabled: true},
-		fieldalignment.Analyzer.Name:   {Analyzer: fieldalignment.Analyzer, Enabled: false},
-		nilness.Analyzer.Name:          {Analyzer: nilness.Analyzer, Enabled: true},
-		shadow.Analyzer.Name:           {Analyzer: shadow.Analyzer, Enabled: false},
-		sortslice.Analyzer.Name:        {Analyzer: sortslice.Analyzer, Enabled: true},
-		testinggoroutine.Analyzer.Name: {Analyzer: testinggoroutine.Analyzer, Enabled: true},
-		unusedparams.Analyzer.Name:     {Analyzer: unusedparams.Analyzer, Enabled: false},
-		unusedwrite.Analyzer.Name:      {Analyzer: unusedwrite.Analyzer, Enabled: false},
-		useany.Analyzer.Name:           {Analyzer: useany.Analyzer, Enabled: false},
-		timeformat.Analyzer.Name:       {Analyzer: timeformat.Analyzer, Enabled: true},
-		embeddirective.Analyzer.Name: {
-			Analyzer: embeddirective.Analyzer,
-			Enabled:  true,
-			Fix:      AddEmbedImport,
-		},
-
-		// gofmt -s suite:
-		simplifycompositelit.Analyzer.Name: {
-			Analyzer:   simplifycompositelit.Analyzer,
-			Enabled:    true,
-			ActionKind: []protocol.CodeActionKind{protocol.SourceFixAll, protocol.QuickFix},
-		},
-		simplifyrange.Analyzer.Name: {
-			Analyzer:   simplifyrange.Analyzer,
-			Enabled:    true,
-			ActionKind: []protocol.CodeActionKind{protocol.SourceFixAll, protocol.QuickFix},
-		},
-		simplifyslice.Analyzer.Name: {
-			Analyzer:   simplifyslice.Analyzer,
-			Enabled:    true,
-			ActionKind: []protocol.CodeActionKind{protocol.SourceFixAll, protocol.QuickFix},
-		},
-	}
-}
-
-func urlRegexp() *regexp.Regexp {
-	// Ensure links are matched as full words, not anywhere.
-	re := regexp.MustCompile(`\b(http|ftp|https)://([\w_-]+(?:(?:\.[\w_-]+)+))([\w.,@?^=%&:/~+#-]*[\w@?^=%&/~+#-])?\b`)
-	re.Longest()
-	return re
 }

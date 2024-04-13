@@ -15,7 +15,6 @@ import (
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
-	"golang.org/x/tools/internal/typeparams"
 )
 
 const Doc = `check for constraints that could be simplified to "any"`
@@ -25,16 +24,13 @@ var Analyzer = &analysis.Analyzer{
 	Doc:      Doc,
 	Requires: []*analysis.Analyzer{inspect.Analyzer},
 	Run:      run,
+	URL:      "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/useany",
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	universeAny := types.Universe.Lookup("any")
-	if universeAny == nil {
-		// Go <= 1.17. Nothing to check.
-		return nil, nil
-	}
 
 	nodeFilter := []ast.Node{
 		(*ast.TypeSpec)(nil),
@@ -45,9 +41,9 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		var tparams *ast.FieldList
 		switch node := node.(type) {
 		case *ast.TypeSpec:
-			tparams = typeparams.ForTypeSpec(node)
+			tparams = node.TypeParams
 		case *ast.FuncType:
-			tparams = typeparams.ForFuncType(node)
+			tparams = node.TypeParams
 		default:
 			panic(fmt.Sprintf("unexpected node type %T", node))
 		}

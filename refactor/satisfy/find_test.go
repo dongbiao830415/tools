@@ -15,7 +15,6 @@ import (
 	"sort"
 	"testing"
 
-	"golang.org/x/tools/internal/typeparams"
 	"golang.org/x/tools/internal/versions"
 	"golang.org/x/tools/refactor/satisfy"
 )
@@ -23,10 +22,6 @@ import (
 // This test exercises various operations on core types of type parameters.
 // (It also provides pretty decent coverage of the non-generic operations.)
 func TestGenericCoreOperations(t *testing.T) {
-	if !typeparams.Enabled {
-		t.Skip("!typeparams.Enabled")
-	}
-
 	const src = `package foo
 
 import "unsafe"
@@ -225,10 +220,10 @@ func constraints(t *testing.T, src string) []string {
 		Defs:       make(map[*ast.Ident]types.Object),
 		Uses:       make(map[*ast.Ident]types.Object),
 		Implicits:  make(map[ast.Node]types.Object),
+		Instances:  make(map[*ast.Ident]types.Instance),
 		Scopes:     make(map[ast.Node]*types.Scope),
 		Selections: make(map[*ast.SelectorExpr]*types.Selection),
 	}
-	typeparams.InitInstanceInfo(info)
 	versions.InitFileVersions(info)
 	conf := types.Config{
 		Importer: importer.Default(),

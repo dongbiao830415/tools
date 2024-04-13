@@ -15,7 +15,6 @@ import (
 	"os"
 	"sync"
 
-	"golang.org/x/tools/internal/typeparams"
 	"golang.org/x/tools/internal/versions"
 )
 
@@ -35,13 +34,12 @@ import (
 // See the Example tests for simple examples.
 func NewProgram(fset *token.FileSet, mode BuilderMode) *Program {
 	return &Program{
-		Fset:          fset,
-		imported:      make(map[string]*Package),
-		packages:      make(map[*types.Package]*Package),
-		mode:          mode,
-		canon:         newCanonizer(),
-		ctxt:          typeparams.NewContext(),
-		parameterized: tpWalker{seen: make(map[types.Type]bool)},
+		Fset:     fset,
+		imported: make(map[string]*Package),
+		packages: make(map[*types.Package]*Package),
+		mode:     mode,
+		canon:    newCanonizer(),
+		ctxt:     types.NewContext(),
 	}
 }
 
@@ -117,10 +115,10 @@ func createFunction(prog *Program, obj *types.Func, name string, syntax ast.Node
 	sig := obj.Type().(*types.Signature)
 
 	// Collect type parameters.
-	var tparams *typeparams.TypeParamList
-	if rtparams := typeparams.RecvTypeParams(sig); rtparams.Len() > 0 {
+	var tparams *types.TypeParamList
+	if rtparams := sig.RecvTypeParams(); rtparams.Len() > 0 {
 		tparams = rtparams // method of generic type
-	} else if sigparams := typeparams.ForSignature(sig); sigparams.Len() > 0 {
+	} else if sigparams := sig.TypeParams(); sigparams.Len() > 0 {
 		tparams = sigparams // generic function
 	}
 
@@ -246,7 +244,7 @@ func (prog *Program) CreatePackage(pkg *types.Package, files []*ast.File, info *
 	if len(files) > 0 {
 		// Go source package.
 		for _, file := range files {
-			goversion := versions.Lang(versions.FileVersions(p.info, file))
+			goversion := versions.Lang(versions.FileVersion(p.info, file))
 			for _, decl := range file.Decls {
 				membersFromDecl(p, decl, goversion)
 			}
@@ -260,6 +258,7 @@ func (prog *Program) CreatePackage(pkg *types.Package, files []*ast.File, info *
 			obj := scope.Lookup(name)
 			memberFromObject(p, obj, nil, "")
 			if obj, ok := obj.(*types.TypeName); ok {
+				// No Unalias: aliases should not duplicate methods.
 				if named, ok := obj.Type().(*types.Named); ok {
 					for i, n := 0, named.NumMethods(); i < n; i++ {
 						memberFromObject(p, named.Method(i), nil, "")
@@ -301,7 +300,7 @@ func (prog *Program) CreatePackage(pkg *types.Package, files []*ast.File, info *
 var printMu sync.Mutex
 
 // AllPackages returns a new slice containing all packages created by
-// prog.CreatePackage in in unspecified order.
+// prog.CreatePackage in unspecified order.
 func (prog *Program) AllPackages() []*Package {
 	pkgs := make([]*Package, 0, len(prog.packages))
 	for _, pkg := range prog.packages {

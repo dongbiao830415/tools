@@ -7,23 +7,24 @@ package workspace
 import (
 	"context"
 	"fmt"
-	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
-	"golang.org/x/tools/gopls/internal/hooks"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"github.com/google/go-cmp/cmp"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/test/integration/fake"
 	"golang.org/x/tools/gopls/internal/util/bug"
 	"golang.org/x/tools/gopls/internal/util/goversion"
 	"golang.org/x/tools/internal/gocommand"
+	"golang.org/x/tools/internal/testenv"
 
 	. "golang.org/x/tools/gopls/internal/test/integration"
 )
 
 func TestMain(m *testing.M) {
 	bug.PanicOnBugs = true
-	Main(m, hooks.Options)
+	Main(m)
 }
 
 const workspaceProxy = `
@@ -246,6 +247,25 @@ func TestAutomaticWorkspaceModule_Interdependent(t *testing.T) {
 			Diagnostics(env.AtRegexp("modb/b/b.go", "x")),
 			NoDiagnostics(env.AtRegexp("moda/a/a.go", `"b.com/b"`)),
 		)
+	})
+}
+
+func TestWorkspaceVendoring(t *testing.T) {
+	testenv.NeedsGo1Point(t, 22)
+	WithOptions(
+		ProxyFiles(workspaceModuleProxy),
+	).Run(t, multiModule, func(t *testing.T, env *Env) {
+		env.RunGoCommand("work", "init")
+		env.RunGoCommand("work", "use", "moda/a")
+		env.AfterChange()
+		env.OpenFile("moda/a/a.go")
+		env.RunGoCommand("work", "vendor")
+		env.AfterChange()
+		loc := env.GoToDefinition(env.RegexpSearch("moda/a/a.go", "b.(Hello)"))
+		const want = "vendor/b.com/b/b.go"
+		if got := env.Sandbox.Workdir.URIToPath(loc.URI); got != want {
+			t.Errorf("Definition: got location %q, want %q", got, want)
+		}
 	})
 }
 
@@ -638,7 +658,10 @@ use (
 
 		// This fails if guarded with a OnceMet(DoneWithSave(), ...), because it is
 		// delayed (and therefore not synchronous with the change).
-		env.Await(NoDiagnostics(ForFile("modb/go.mod")))
+		//
+		// Note: this check used to assert on NoDiagnostics, but with zero-config
+		// gopls we still have diagnostics.
+		env.Await(Diagnostics(ForFile("modb/go.mod"), WithMessage("example.com is not used")))
 
 		// Test Formatting.
 		env.SetBufferContent("go.work", `go 1.18
@@ -792,6 +815,51 @@ use (
 		want := "modb/b/b.go"
 		if !strings.HasSuffix(file, want) {
 			t.Errorf("expected %s, got %v", want, file)
+		}
+	})
+}
+
+func TestInnerGoWork(t *testing.T) {
+	// This test checks that gopls honors a go.work file defined
+	// inside a go module (golang/go#63917).
+	const workspace = `
+-- go.mod --
+module a.com
+
+require b.com v1.2.3
+-- a/go.work --
+go 1.18
+
+use (
+	..
+	../b
+)
+-- a/a.go --
+package a
+
+import "b.com/b"
+
+var _ = b.B
+-- b/go.mod --
+module b.com/b
+
+-- b/b.go --
+package b
+
+const B = 0
+`
+	WithOptions(
+		// This doesn't work if we open the outer module. I'm not sure it should,
+		// since the go.work file does not apply to the entire module, just a
+		// subdirectory.
+		WorkspaceFolders("a"),
+	).Run(t, workspace, func(t *testing.T, env *Env) {
+		env.OpenFile("a/a.go")
+		loc := env.GoToDefinition(env.RegexpSearch("a/a.go", "b.(B)"))
+		got := env.Sandbox.Workdir.URIToPath(loc.URI)
+		want := "b/b.go"
+		if got != want {
+			t.Errorf("Definition(b.B): got %q, want %q", got, want)
 		}
 	})
 }
@@ -972,105 +1040,6 @@ func main() {
 	})
 }
 
-// Sometimes users may have their module cache within the workspace.
-// We shouldn't consider any module in the module cache to be in the workspace.
-func TestGOMODCACHEInWorkspace(t *testing.T) {
-	const mod = `
--- a/go.mod --
-module a.com
-
-go 1.12
--- a/a.go --
-package a
-
-func _() {}
--- a/c/c.go --
-package c
--- gopath/src/b/b.go --
-package b
--- gopath/pkg/mod/example.com/go.mod --
-module example.com
-
-go 1.12
--- gopath/pkg/mod/example.com/main.go --
-package main
-`
-	WithOptions(
-		EnvVars{"GOPATH": filepath.FromSlash("$SANDBOX_WORKDIR/gopath")},
-		Modes(Default),
-	).Run(t, mod, func(t *testing.T, env *Env) {
-		env.Await(
-			// Confirm that the build configuration is seen as valid,
-			// even though there are technically multiple go.mod files in the
-			// worskpace.
-			LogMatching(protocol.Info, ".*valid build configuration = true.*", 1, false),
-		)
-	})
-}
-
-func TestAddAndRemoveGoWork(t *testing.T) {
-	// Use a workspace with a module in the root directory to exercise the case
-	// where a go.work is added to the existing root directory. This verifies
-	// that we're detecting changes to the module source, not just the root
-	// directory.
-	const nomod = `
--- go.mod --
-module a.com
-
-go 1.16
--- main.go --
-package main
-
-func main() {}
--- b/go.mod --
-module b.com
-
-go 1.16
--- b/main.go --
-package main
-
-func main() {}
-`
-	WithOptions(
-		Modes(Default),
-	).Run(t, nomod, func(t *testing.T, env *Env) {
-		env.OpenFile("main.go")
-		env.OpenFile("b/main.go")
-		// Since b/main.go is not in the workspace, it should have a warning on its
-		// package declaration.
-		env.AfterChange(
-			NoDiagnostics(ForFile("main.go")),
-			Diagnostics(env.AtRegexp("b/main.go", "package (main)")),
-		)
-		env.WriteWorkspaceFile("go.work", `go 1.16
-
-use (
-	.
-	b
-)
-`)
-		env.AfterChange(NoDiagnostics())
-		// Removing the go.work file should put us back where we started.
-		env.RemoveWorkspaceFile("go.work")
-
-		// TODO(golang/go#57558, golang/go#57508): file watching is asynchronous,
-		// and we must wait for the view to be reconstructed before touching
-		// b/main.go, so that the new view "knows" about b/main.go. This is simply
-		// a bug, but awaiting the change here avoids it.
-		env.Await(env.DoneWithChangeWatchedFiles())
-
-		// TODO(rfindley): fix this bug: reopening b/main.go is necessary here
-		// because we no longer "see" the file in any view.
-		env.CloseBuffer("b/main.go")
-		env.OpenFile("b/main.go")
-
-		env.AfterChange(
-			NoDiagnostics(ForFile("main.go")),
-			Diagnostics(env.AtRegexp("b/main.go", "package (main)")),
-		)
-	})
-}
-
 // Tests the fix for golang/go#52500.
 func TestChangeTestVariant_Issue52500(t *testing.T) {
 	const src = `
@@ -1155,16 +1124,139 @@ import (
 		env.AfterChange(
 			Diagnostics(env.AtRegexp("a/main.go", "V"), WithMessage("not used")),
 		)
+		// Here, diagnostics are added because of zero-config gopls.
+		// In the past, they were added simply due to diagnosing changed files.
+		// (see TestClearNonWorkspaceDiagnostics_NoView below for a
+		// reimplementation of that test).
+		if got, want := len(env.Views()), 2; got != want {
+			t.Errorf("after opening a/main.go, got %d views, want %d", got, want)
+		}
 		env.CloseBuffer("a/main.go")
-
-		// Make an arbitrary edit because gopls explicitly diagnoses a/main.go
-		// whenever it is "changed".
-		//
-		// TODO(rfindley): it should not be necessary to make another edit here.
-		// Gopls should be smart enough to avoid diagnosing a.
-		env.RegexpReplace("b/main.go", "package b", "package b // a package")
 		env.AfterChange(
 			NoDiagnostics(ForFile("a/main.go")),
+		)
+		if got, want := len(env.Views()), 1; got != want {
+			t.Errorf("after closing a/main.go, got %d views, want %d", got, want)
+		}
+	})
+}
+
+// This test is like TestClearNonWorkspaceDiagnostics, but bypasses the
+// zero-config algorithm by opening a nested workspace folder.
+//
+// We should still compute diagnostics correctly for open packages.
+func TestClearNonWorkspaceDiagnostics_NoView(t *testing.T) {
+	const ws = `
+-- a/go.mod --
+module example.com/a
+
+go 1.18
+
+require example.com/b v1.2.3
+
+replace example.com/b => ../b
+
+-- a/a.go --
+package a
+
+import "example.com/b"
+
+func _() {
+	V := b.B // unused
+}
+
+-- b/go.mod --
+module b
+
+go 1.18
+
+-- b/b.go --
+package b
+
+const B = 2
+
+func _() {
+	var V int // unused
+}
+
+-- b/b2.go --
+package b
+
+const B2 = B
+
+-- c/c.go --
+package main
+
+func main() {
+	var V int // unused
+}
+`
+	WithOptions(
+		WorkspaceFolders("a"),
+	).Run(t, ws, func(t *testing.T, env *Env) {
+		env.OpenFile("a/a.go")
+		env.AfterChange(
+			Diagnostics(env.AtRegexp("a/a.go", "V"), WithMessage("not used")),
+			NoDiagnostics(ForFile("b/b.go")),
+			NoDiagnostics(ForFile("c/c.go")),
+		)
+		env.OpenFile("b/b.go")
+		env.AfterChange(
+			Diagnostics(env.AtRegexp("a/a.go", "V"), WithMessage("not used")),
+			Diagnostics(env.AtRegexp("b/b.go", "V"), WithMessage("not used")),
+			NoDiagnostics(ForFile("c/c.go")),
+		)
+
+		// Opening b/b.go should not result in a new view, because b is not
+		// contained in a workspace folder.
+		//
+		// Yet we should get diagnostics for b, because it is open.
+		if got, want := len(env.Views()), 1; got != want {
+			t.Errorf("after opening b/b.go, got %d views, want %d", got, want)
+		}
+		env.CloseBuffer("b/b.go")
+		env.AfterChange(
+			Diagnostics(env.AtRegexp("a/a.go", "V"), WithMessage("not used")),
+			NoDiagnostics(ForFile("b/b.go")),
+			NoDiagnostics(ForFile("c/c.go")),
+		)
+
+		// We should get references in the b package.
+		bUse := env.RegexpSearch("a/a.go", `b\.(B)`)
+		refs := env.References(bUse)
+		wantRefs := []string{"a/a.go", "b/b.go", "b/b2.go"}
+		var gotRefs []string
+		for _, ref := range refs {
+			gotRefs = append(gotRefs, env.Sandbox.Workdir.URIToPath(ref.URI))
+		}
+		sort.Strings(gotRefs)
+		if diff := cmp.Diff(wantRefs, gotRefs); diff != "" {
+			t.Errorf("references(b.B) mismatch (-want +got)\n%s", diff)
+		}
+
+		// Opening c/c.go should also not result in a new view, yet we should get
+		// orphaned file diagnostics.
+		env.OpenFile("c/c.go")
+		env.AfterChange(
+			Diagnostics(env.AtRegexp("a/a.go", "V"), WithMessage("not used")),
+			NoDiagnostics(ForFile("b/b.go")),
+			Diagnostics(env.AtRegexp("c/c.go", "V"), WithMessage("not used")),
+		)
+		if got, want := len(env.Views()), 1; got != want {
+			t.Errorf("after opening b/b.go, got %d views, want %d", got, want)
+		}
+
+		env.CloseBuffer("c/c.go")
+		env.AfterChange(
+			Diagnostics(env.AtRegexp("a/a.go", "V"), WithMessage("not used")),
+			NoDiagnostics(ForFile("b/b.go")),
+			NoDiagnostics(ForFile("c/c.go")),
+		)
+		env.CloseBuffer("a/a.go")
+		env.AfterChange(
+			Diagnostics(env.AtRegexp("a/a.go", "V"), WithMessage("not used")),
+			NoDiagnostics(ForFile("b/b.go")),
+			NoDiagnostics(ForFile("c/c.go")),
 		)
 	})
 }

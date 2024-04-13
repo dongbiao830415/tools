@@ -17,14 +17,18 @@ import (
 	"context"
 	"os"
 
-	"golang.org/x/telemetry/counter"
+	"golang.org/x/telemetry"
 	"golang.org/x/tools/gopls/internal/cmd"
-	"golang.org/x/tools/gopls/internal/hooks"
+	versionpkg "golang.org/x/tools/gopls/internal/version"
 	"golang.org/x/tools/internal/tool"
 )
 
+var version = "" // if set by the linker, overrides the gopls version
+
 func main() {
-	counter.Open() // Enable telemetry counter writing.
+	versionpkg.VersionOverride = version
+
+	telemetry.Start(telemetry.Config{ReportCrashes: true})
 	ctx := context.Background()
-	tool.Main(ctx, cmd.New("gopls", "", nil, hooks.Options), os.Args[1:])
+	tool.Main(ctx, cmd.New(), os.Args[1:])
 }

@@ -21,11 +21,12 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/debug"
 	"golang.org/x/tools/gopls/internal/filecache"
-	"golang.org/x/tools/gopls/internal/lsp/cache"
-	"golang.org/x/tools/gopls/internal/lsp/lsprpc"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/lsprpc"
+	"golang.org/x/tools/gopls/internal/protocol"
+	"golang.org/x/tools/gopls/internal/protocol/command"
 	"golang.org/x/tools/gopls/internal/server"
 	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/gopls/internal/util/browser"
@@ -34,7 +35,6 @@ import (
 	"golang.org/x/tools/internal/diff"
 	"golang.org/x/tools/internal/jsonrpc2"
 	"golang.org/x/tools/internal/tool"
-	"golang.org/x/tools/internal/xcontext"
 )
 
 // Application is the main application as passed to tool.Main
@@ -52,15 +52,6 @@ type Application struct {
 
 	// the options configuring function to invoke when building a server
 	options func(*settings.Options)
-
-	// The name of the binary, used in help and telemetry.
-	name string
-
-	// The working directory to run commands in.
-	wd string
-
-	// The environment variables to use.
-	env []string
 
 	// Support for remote LSP server.
 	Remote string `flag:"remote" help:"forward all commands to a remote lsp specified by this flag. With no special prefix, this is assumed to be a TCP address. If prefixed by 'unix;', the subsequent address is assumed to be a unix domain socket. If 'auto', or prefixed by 'auto;', the remote address is automatically resolved based on the executing environment."`
@@ -104,15 +95,8 @@ func (app *Application) verbose() bool {
 }
 
 // New returns a new Application ready to run.
-func New(name, wd string, env []string, options func(*settings.Options)) *Application {
-	if wd == "" {
-		wd, _ = os.Getwd()
-	}
+func New() *Application {
 	app := &Application{
-		options: options,
-		name:    name,
-		wd:      wd,
-		env:     env,
 		OCAgent: "off", //TODO: Remove this line to default the exporter to on
 
 		Serve: Serve{
@@ -124,7 +108,7 @@ func New(name, wd string, env []string, options func(*settings.Options)) *Applic
 }
 
 // Name implements tool.Application returning the binary name.
-func (app *Application) Name() string { return app.name }
+func (app *Application) Name() string { return "gopls" }
 
 // Usage implements tool.Application returning empty extra argument usage.
 func (app *Application) Usage() string { return "" }
@@ -249,7 +233,7 @@ func (app *Application) Run(ctx context.Context, args ...string) error {
 	// executable, and immediately runs a gc.
 	filecache.Start()
 
-	ctx = debug.WithInstance(ctx, app.wd, app.OCAgent)
+	ctx = debug.WithInstance(ctx, app.OCAgent)
 	if len(args) == 0 {
 		s := flag.NewFlagSet(app.Name(), flag.ExitOnError)
 		return tool.Run(ctx, s, &app.Serve, args)
@@ -340,22 +324,6 @@ func (app *Application) connect(ctx context.Context, onProgress func(*protocol.P
 		}
 		return conn, nil
 
-	case strings.HasPrefix(app.Remote, "internal@"):
-		internalMu.Lock()
-		defer internalMu.Unlock()
-		opts := settings.DefaultOptions(app.options)
-		key := fmt.Sprintf("%s %v %v %v", app.wd, opts.PreferredContentFormat, opts.HierarchicalDocumentSymbolSupport, opts.SymbolMatcher)
-		if c := internalConnections[key]; c != nil {
-			return c, nil
-		}
-		remote := app.Remote[len("internal@"):]
-		ctx := xcontext.Detach(ctx) //TODO:a way of shutting down the internal server
-		connection, err := app.connectRemote(ctx, remote)
-		if err != nil {
-			return nil, err
-		}
-		internalConnections[key] = connection
-		return connection, nil
 	default:
 		return app.connectRemote(ctx, app.Remote)
 	}
@@ -379,8 +347,12 @@ func (app *Application) connectRemote(ctx context.Context, remote string) (*conn
 }
 
 func (c *connection) initialize(ctx context.Context, options func(*settings.Options)) error {
+	wd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("finding workdir: %v", err)
+	}
 	params := &protocol.ParamInitialize{}
-	params.RootURI = protocol.URIFromPath(c.client.app.wd)
+	params.RootURI = protocol.URIFromPath(wd)
 	params.Capabilities.Workspace.Configuration = true
 
 	// Make sure to respect configured options when sending initialize request.
@@ -426,18 +398,16 @@ type cmdClient struct {
 	app        *Application
 	onProgress func(*protocol.ProgressParams)
 
-	diagnosticsMu   sync.Mutex
-	diagnosticsDone chan struct{}
-
-	filesMu sync.Mutex // guards files map and each cmdFile.diagnostics
+	filesMu sync.Mutex // guards files map
 	files   map[protocol.DocumentURI]*cmdFile
 }
 
 type cmdFile struct {
-	uri         protocol.DocumentURI
-	mapper      *protocol.Mapper
-	err         error
-	diagnostics []protocol.Diagnostic
+	uri           protocol.DocumentURI
+	mapper        *protocol.Mapper
+	err           error
+	diagnosticsMu sync.Mutex
+	diagnostics   []protocol.Diagnostic
 }
 
 func newClient(app *Application, onProgress func(*protocol.ProgressParams)) *cmdClient {
@@ -515,16 +485,7 @@ func (c *cmdClient) Configuration(ctx context.Context, p *protocol.ParamConfigur
 		if item.Section != "gopls" {
 			continue
 		}
-		env := map[string]interface{}{}
-		for _, value := range c.app.env {
-			l := strings.SplitN(value, "=", 2)
-			if len(l) != 2 {
-				continue
-			}
-			env[l[0]] = l[1]
-		}
 		m := map[string]interface{}{
-			"env": env,
 			"analyses": map[string]any{
 				"fillreturns":    true,
 				"nonewvars":      true,
@@ -556,7 +517,7 @@ func (cli *cmdClient) applyWorkspaceEdit(edit *protocol.WorkspaceEdit) error {
 	for _, c := range edit.DocumentChanges {
 		if c.TextDocumentEdit != nil {
 			uri := c.TextDocumentEdit.TextDocument.URI
-			edits[uri] = append(edits[uri], c.TextDocumentEdit.Edits...)
+			edits[uri] = append(edits[uri], protocol.AsTextEdits(c.TextDocumentEdit.Edits)...)
 			orderedURIs = append(orderedURIs, uri)
 		}
 		if c.RenameFile != nil {
@@ -628,23 +589,22 @@ func applyTextEdits(mapper *protocol.Mapper, edits []protocol.TextEdit, flags *E
 }
 
 func (c *cmdClient) PublishDiagnostics(ctx context.Context, p *protocol.PublishDiagnosticsParams) error {
-	if p.URI == "gopls://diagnostics-done" {
-		close(c.diagnosticsDone)
-	}
 	// Don't worry about diagnostics without versions.
 	if p.Version == 0 {
 		return nil
 	}
 
 	c.filesMu.Lock()
-	defer c.filesMu.Unlock()
-
 	file := c.getFile(p.URI)
+	c.filesMu.Unlock()
+
+	file.diagnosticsMu.Lock()
+	defer file.diagnosticsMu.Unlock()
 	file.diagnostics = append(file.diagnostics, p.Diagnostics...)
 
 	// Perform a crude in-place deduplication.
-	// TODO(golang/go#60122): replace the ad-hoc gopls/diagnoseFiles
-	// non-standard request with support for textDocument/diagnostic,
+	// TODO(golang/go#60122): replace the gopls.diagnose_files
+	// command with support for textDocument/diagnostic,
 	// so that we don't need to do this de-duplication.
 	type key [6]interface{}
 	seen := make(map[key]bool)
@@ -767,29 +727,20 @@ func (c *connection) semanticTokens(ctx context.Context, p *protocol.SemanticTok
 }
 
 func (c *connection) diagnoseFiles(ctx context.Context, files []protocol.DocumentURI) error {
-	var untypedFiles []interface{}
-	for _, file := range files {
-		untypedFiles = append(untypedFiles, string(file))
-	}
-	c.client.diagnosticsMu.Lock()
-	defer c.client.diagnosticsMu.Unlock()
-
-	c.client.diagnosticsDone = make(chan struct{})
-	_, err := c.Server.NonstandardRequest(ctx, "gopls/diagnoseFiles", map[string]interface{}{"files": untypedFiles})
+	cmd, err := command.NewDiagnoseFilesCommand("Diagnose files", command.DiagnoseFilesArgs{
+		Files: files,
+	})
 	if err != nil {
-		close(c.client.diagnosticsDone)
 		return err
 	}
-
-	<-c.client.diagnosticsDone
-	return nil
+	_, err = c.ExecuteCommand(ctx, &protocol.ExecuteCommandParams{
+		Command:   cmd.Command,
+		Arguments: cmd.Arguments,
+	})
+	return err
 }
 
 func (c *connection) terminate(ctx context.Context) {
-	if strings.HasPrefix(c.client.app.Remote, "internal@") {
-		// internal connections need to be left alive for the next test
-		return
-	}
 	//TODO: do we need to handle errors on these calls?
 	c.Shutdown(ctx)
 	//TODO: right now calling exit terminates the process, we should rethink that

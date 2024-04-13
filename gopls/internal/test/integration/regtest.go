@@ -13,9 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/cmd"
-	"golang.org/x/tools/gopls/internal/lsp/cache"
-	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/internal/gocommand"
 	"golang.org/x/tools/internal/memoize"
 	"golang.org/x/tools/internal/testenv"
@@ -106,15 +105,19 @@ func DefaultModes() Mode {
 	return modes
 }
 
+var runFromMain = false // true if Main has been called
+
 // Main sets up and tears down the shared integration test state.
-func Main(m *testing.M, hook func(*settings.Options)) {
+func Main(m *testing.M) {
+	runFromMain = true
+
 	// golang/go#54461: enable additional debugging around hanging Go commands.
 	gocommand.DebugHangingGoCommands = true
 
 	// If this magic environment variable is set, run gopls instead of the test
 	// suite. See the documentation for runTestAsGoplsEnvvar for more details.
 	if os.Getenv(runTestAsGoplsEnvvar) == "true" {
-		tool.Main(context.Background(), cmd.New("gopls", "", nil, hook), os.Args[1:])
+		tool.Main(context.Background(), cmd.New(), os.Args[1:])
 		os.Exit(0)
 	}
 
@@ -124,17 +127,26 @@ func Main(m *testing.M, hook func(*settings.Options)) {
 	}
 	testenv.ExitIfSmallMachine()
 
+	flag.Parse()
+
 	// Disable GOPACKAGESDRIVER, as it can cause spurious test failures.
 	os.Setenv("GOPACKAGESDRIVER", "off")
 
-	flag.Parse()
+	if skipReason := checkBuilder(); skipReason != "" {
+		fmt.Printf("Skipping all tests: %s\n", skipReason)
+		os.Exit(0)
+	}
+
+	if err := testenv.HasTool("go"); err != nil {
+		fmt.Println("Missing go command")
+		os.Exit(1)
+	}
 
 	runner = &Runner{
 		DefaultModes:             DefaultModes(),
 		Timeout:                  *timeout,
 		PrintGoroutinesOnFailure: *printGoroutinesOnFailure,
 		SkipCleanup:              *skipCleanup,
-		OptionsHook:              hook,
 		store:                    memoize.NewStore(memoize.NeverEvict),
 	}
 

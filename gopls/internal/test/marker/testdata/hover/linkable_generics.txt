@@ -1,10 +1,5 @@
 This file contains tests for documentation links to generic code in hover.
 
-Requires go1.19+ for the new go/doc/comment package.
-
--- flags --
--min_go=go1.19
-
 -- go.mod --
 module mod.com
 
@@ -66,14 +61,16 @@ func GF[P any](p P)
 type GT[P any] struct {
 	F P //@hover("F", "F", F),hover("P", "P", FP)
 }
-
-func (GT[P]).M(p P)
 ```
 
 Hovering over type parameters should link to documentation.
 
 TODO(rfindley): should it? We should probably link to the type.
 
+
+```go
+func (GT[P]) M(p P)
+```
 
 [`generic.GT` on pkg.go.dev](https://pkg.go.dev/mod.com/generic#GT)
 -- @GTP --
@@ -85,8 +82,6 @@ type parameter P any
 type GT[P any] struct {
 	F P //@hover("F", "F", F),hover("P", "P", FP)
 }
-
-func (GT[P]).M(p P)
 ```
 
 Hovering over type parameters should link to documentation.
@@ -94,10 +89,14 @@ Hovering over type parameters should link to documentation.
 TODO(rfindley): should it? We should probably link to the type.
 
 
+```go
+func (GT[P]) M(p P)
+```
+
 [`generic.GT` on pkg.go.dev](https://pkg.go.dev/mod.com/generic#GT)
 -- @M --
 ```go
-func (GT[P]).M(p P)
+func (GT[P]) M(p P)
 ```
 
 [`(generic.GT).M` on pkg.go.dev](https://pkg.go.dev/mod.com/generic#GT.M)
@@ -135,13 +134,15 @@ field F int
 type GT[P any] struct {
 	F P //@hover("F", "F", F),hover("P", "P", FP)
 }
-
-func (generic.GT[P]).M(p P)
 ```
 
 Hovering over type parameters should link to documentation.
 
 TODO(rfindley): should it? We should probably link to the type.
 
+
+```go
+func (generic.GT[P]) M(p P)
+```
 
 [`generic.GT` on pkg.go.dev](https://pkg.go.dev/mod.com/generic#GT)

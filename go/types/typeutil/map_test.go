@@ -17,7 +17,6 @@ import (
 	"testing"
 
 	"golang.org/x/tools/go/types/typeutil"
-	"golang.org/x/tools/internal/typeparams"
 )
 
 var (
@@ -178,10 +177,6 @@ func TestMap(t *testing.T) {
 }
 
 func TestMapGenerics(t *testing.T) {
-	if !typeparams.Enabled {
-		t.Skip("type params are not enabled at this Go version")
-	}
-
 	const src = `
 package p
 
@@ -252,6 +247,15 @@ var Issue56048 = Issue56048_I.m
 type Issue56048_Ib interface{ m() chan []*interface { Issue56048_Ib } }
 var Issue56048b = Issue56048_Ib.m
 
+// Non-generic alias
+type NonAlias int
+type Alias1 = NonAlias
+type Alias2 = NonAlias
+
+// Generic alias (requires go1.23)
+// type SetOfInt = map[int]bool
+// type Set[T comparable] = map[K]bool
+// type SetOfInt2 = Set[int]
 `
 
 	fset := token.NewFileSet()
@@ -281,11 +285,11 @@ var Issue56048b = Issue56048_Ib.m
 		CI      = C.Underlying().(*types.Interface)
 		I       = scope.Lookup("I").Type()
 		II      = I.Underlying().(*types.Interface)
-		U       = CI.EmbeddedType(0).(*typeparams.Union)
+		U       = CI.EmbeddedType(0).(*types.Union)
 		Fa1     = scope.Lookup("Fa1").Type().(*types.Signature)
 		Fa2     = scope.Lookup("Fa2").Type().(*types.Signature)
-		Fa1P    = typeparams.ForSignature(Fa1).At(0)
-		Fa2Q    = typeparams.ForSignature(Fa2).At(0)
+		Fa1P    = Fa1.TypeParams().At(0)
+		Fa2Q    = Fa2.TypeParams().At(0)
 		Fb1     = scope.Lookup("Fb1").Type().(*types.Signature)
 		Fb1x    = Fb1.Params().At(0).Type()
 		Fb1y    = scope.Lookup("Fb1").(*types.Func).Scope().Lookup("y").Type()
@@ -312,6 +316,16 @@ var Issue56048b = Issue56048_Ib.m
 		Quux        = scope.Lookup("Quux").Type()
 		Issue56048  = scope.Lookup("Issue56048").Type()
 		Issue56048b = scope.Lookup("Issue56048b").Type()
+
+		// In go1.23 these will be *types.Alias; for now they are all int.
+		NonAlias = scope.Lookup("NonAlias").Type()
+		Alias1   = scope.Lookup("Alias1").Type()
+		Alias2   = scope.Lookup("Alias2").Type()
+
+		// Requires go1.23.
+		// SetOfInt    = scope.Lookup("SetOfInt").Type()
+		// Set         = scope.Lookup("Set").Type().(*types.Alias)
+		// SetOfInt2   = scope.Lookup("SetOfInt2").Type()
 	)
 
 	tmap := new(typeutil.Map)
@@ -384,6 +398,16 @@ var Issue56048b = Issue56048_Ib.m
 
 		{Issue56048, "Issue56048", true},   // (not actually about generics)
 		{Issue56048b, "Issue56048b", true}, // (not actually about generics)
+
+		// All three types are identical.
+		{NonAlias, "NonAlias", true},
+		{Alias1, "Alias1", false},
+		{Alias2, "Alias2", false},
+
+		// Generic aliases: requires go1.23.
+		// {SetOfInt, "SetOfInt", true},
+		// {Set, "Set", false},
+		// {SetOfInt2, "SetOfInt2", false},
 	}
 
 	for _, step := range steps {
@@ -396,7 +420,7 @@ var Issue56048b = Issue56048_Ib.m
 }
 
 func instantiate(t *testing.T, origin types.Type, targs ...types.Type) types.Type {
-	inst, err := typeparams.Instantiate(nil, origin, targs, true)
+	inst, err := types.Instantiate(nil, origin, targs, true)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,6 +1,6 @@
 # Settings
 
-<!--TODO: Generate this file from the documentation in golang.org/x/tools/gopls/internal/lsp/source/options.go.-->
+<!--TODO: Generate this file from the documentation in golang.org/x/tools/gopls/internal/golang/options.go.-->
 
 This document describes the global settings for `gopls` inside the editor.
 The settings block will be called `"gopls"` and contains a collection of
@@ -85,34 +85,26 @@ is the part of the file name after the final dot.)
 
 Default: `[]`.
 
-#### **memoryMode** *enum*
+#### **memoryMode** *string*
 
 **This setting is experimental and may be deleted.**
 
-memoryMode controls the tradeoff `gopls` makes between memory usage and
-correctness.
+obsolete, no effect
 
-Values other than `Normal` are untested and may break in surprising ways.
-
-Must be one of:
-
-* `"DegradeClosed"`: In DegradeClosed mode, `gopls` will collect less information about
-packages without open files. As a result, features like Find
-References and Rename will miss results in such packages.
-* `"Normal"`
-
-Default: `"Normal"`.
+Default: `""`.
 
 #### **expandWorkspaceToModule** *bool*
 
 **This setting is experimental and may be deleted.**
 
-expandWorkspaceToModule instructs `gopls` to adjust the scope of the
-workspace to find the best available module root. `gopls` first looks for
-a go.mod file in any parent directory of the workspace folder, expanding
-the scope to that directory if it exists. If no viable parent directory is
-found, gopls will check if there is exactly one child directory containing
-a go.mod file, narrowing the scope to that directory if it exists.
+expandWorkspaceToModule determines which packages are considered
+"workspace packages" when the workspace is using modules.
+
+Workspace packages affect the scope of workspace-wide operations. Notably,
+gopls diagnoses all packages considered to be part of the workspace after
+every keystroke, so by setting "ExpandWorkspaceToModule" to false, and
+opening a nested workspace directory, you can reduce the amount of work
+gopls has to do to keep your workspace up to date.
 
 Default: `true`.
 
@@ -294,7 +286,7 @@ Example Usage:
 ...
 "analyses": {
   "unreachable": false, // Disable the unreachable analyzer.
-  "unusedparams": true  // Enable the unusedparams analyzer.
+  "unusedvariable": true  // Enable the unusedvariable analyzer.
 }
 ...
 ```

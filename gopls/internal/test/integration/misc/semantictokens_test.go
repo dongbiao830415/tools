@@ -10,10 +10,9 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/tools/gopls/internal/protocol"
 	. "golang.org/x/tools/gopls/internal/test/integration"
 	"golang.org/x/tools/gopls/internal/test/integration/fake"
-	"golang.org/x/tools/internal/typeparams"
 )
 
 func TestBadURICrash_VSCodeIssue1498(t *testing.T) {
@@ -109,9 +108,6 @@ func Add[T int](target T, l []T) []T {
 // fix inconsistency in TypeParameters
 // https://github.com/golang/go/issues/57619
 func TestSemantic_57619(t *testing.T) {
-	if !typeparams.Enabled {
-		t.Skip("type parameters are needed for this test")
-	}
 	src := `
 -- go.mod --
 module example.com
@@ -186,6 +182,50 @@ func bar() {}
 		{Token: "bar", TokenType: "function", Mod: "definition"},
 	}
 
+	WithOptions(
+		Modes(Default),
+		Settings{"semanticTokens": true},
+	).Run(t, src, func(t *testing.T, env *Env) {
+		env.OpenFile("main.go")
+		seen := env.SemanticTokensFull("main.go")
+		if x := cmp.Diff(want, seen); x != "" {
+			t.Errorf("Semantic tokens do not match (-want +got):\n%s", x)
+		}
+	})
+}
+
+// Make sure no zero-length tokens occur
+func TestSemantic_65254(t *testing.T) {
+	src := `
+-- go.mod --
+module example.com
+	
+go 1.21
+-- main.go --
+package main
+
+/* a comment with an
+
+empty line
+*/
+
+const bad = `
+
+	src += "`foo" + `
+	` + "bar`"
+	want := []fake.SemanticToken{
+		{Token: "package", TokenType: "keyword"},
+		{Token: "main", TokenType: "namespace"},
+		{Token: "/* a comment with an", TokenType: "comment"},
+		// --- Note that the zero length line does not show up
+		{Token: "empty line", TokenType: "comment"},
+		{Token: "*/", TokenType: "comment"},
+		{Token: "const", TokenType: "keyword"},
+		{Token: "bad", TokenType: "variable", Mod: "definition readonly"},
+		{Token: "`foo", TokenType: "string"},
+		// --- Note the zero length line does not show up
+		{Token: "\tbar`", TokenType: "string"},
+	}
 	WithOptions(
 		Modes(Default),
 		Settings{"semanticTokens": true},

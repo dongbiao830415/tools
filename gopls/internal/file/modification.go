@@ -4,7 +4,7 @@
 
 package file
 
-import "golang.org/x/tools/gopls/internal/lsp/protocol"
+import "golang.org/x/tools/gopls/internal/protocol"
 
 // Modification represents a modification to a file.
 type Modification struct {
@@ -21,7 +21,7 @@ type Modification struct {
 	Text    []byte
 
 	// LanguageID is only sent from the language client on textDocument/didOpen.
-	LanguageID string
+	LanguageID protocol.LanguageKind
 }
 
 // An Action is a type of file state change.

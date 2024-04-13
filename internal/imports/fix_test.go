@@ -20,6 +20,7 @@ import (
 
 	"golang.org/x/tools/go/packages/packagestest"
 	"golang.org/x/tools/internal/gocommand"
+	"golang.org/x/tools/internal/stdlib"
 )
 
 var testDebug = flag.Bool("debug", false, "enable debug output")
@@ -1150,7 +1151,7 @@ var _ = rand.NewZipf
 `,
 		out: `package p
 
-import "math/rand"
+import "math/rand/v2"
 
 var _ = rand.NewZipf
 `,
@@ -1626,9 +1627,9 @@ import "bytes"
 var _ = bytes.Buffer
 `
 	// Force a scan of the stdlib.
-	savedStdlib := stdlib
-	defer func() { stdlib = savedStdlib }()
-	stdlib = map[string][]string{}
+	savedStdlib := stdlib.PackageSymbols
+	defer func() { stdlib.PackageSymbols = savedStdlib }()
+	stdlib.PackageSymbols = nil
 
 	testConfig{
 		module: packagestest.Module{
@@ -2854,8 +2855,8 @@ func TestGetPackageCompletions(t *testing.T) {
 			defer mu.Unlock()
 			for _, csym := range c.Exports {
 				for _, w := range want {
-					if c.Fix.StmtInfo.ImportPath == w.path && csym == w.symbol {
-						got = append(got, res{c.Fix.Relevance, c.Fix.IdentName, c.Fix.StmtInfo.ImportPath, csym})
+					if c.Fix.StmtInfo.ImportPath == w.path && csym.Name == w.symbol {
+						got = append(got, res{c.Fix.Relevance, c.Fix.IdentName, c.Fix.StmtInfo.ImportPath, csym.Name})
 					}
 				}
 			}

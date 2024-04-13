@@ -23,49 +23,23 @@ import (
 	"unicode"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/ast/inspector"
 	"golang.org/x/tools/gopls/internal/util/safetoken"
+	"golang.org/x/tools/internal/aliases"
 	"golang.org/x/tools/internal/analysisinternal"
 	"golang.org/x/tools/internal/fuzzy"
 	"golang.org/x/tools/internal/typeparams"
 )
 
-const Doc = `note incomplete struct initializations
-
-This analyzer provides diagnostics for any struct literals that do not have
-any fields initialized. Because the suggested fix for this analysis is
-expensive to compute, callers should compute it separately, using the
-SuggestedFix function below.
-`
-
-var Analyzer = &analysis.Analyzer{
-	Name:             "fillstruct",
-	Doc:              Doc,
-	Requires:         []*analysis.Analyzer{inspect.Analyzer},
-	Run:              run,
-	RunDespiteErrors: true,
-}
-
-// TODO(rfindley): remove this thin wrapper around the fillstruct refactoring,
-// and eliminate the fillstruct analyzer.
+// Diagnose computes diagnostics for fillable struct literals overlapping with
+// the provided start and end position.
 //
-// Previous iterations used the analysis framework for computing refactorings,
-// which proved inefficient.
-func run(pass *analysis.Pass) (interface{}, error) {
-	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
-	for _, d := range DiagnoseFillableStructs(inspect, token.NoPos, token.NoPos, pass.Pkg, pass.TypesInfo) {
-		pass.Report(d)
-	}
-	return nil, nil
-}
-
-// DiagnoseFillableStructs computes diagnostics for fillable struct composite
-// literals overlapping with the provided start and end position.
+// The diagnostic contains a lazy fix; the actual patch is computed
+// (via the ApplyFix command) by a call to [SuggestedFix].
 //
-// If either start or end is invalid, it is considered an unbounded condition.
-func DiagnoseFillableStructs(inspect *inspector.Inspector, start, end token.Pos, pkg *types.Package, info *types.Info) []analysis.Diagnostic {
+// If either start or end is invalid, the entire package is inspected.
+func Diagnose(inspect *inspector.Inspector, start, end token.Pos, pkg *types.Package, info *types.Info) []analysis.Diagnostic {
 	var diags []analysis.Diagnostic
 	nodeFilter := []ast.Node{(*ast.CompositeLit)(nil)}
 	inspect.Preorder(nodeFilter, func(n ast.Node) {
@@ -81,8 +55,8 @@ func DiagnoseFillableStructs(inspect *inspector.Inspector, start, end token.Pos,
 		}
 
 		// Find reference to the type declaration of the struct being initialized.
-		typ = deref(typ)
-		tStruct, ok := typ.Underlying().(*types.Struct)
+		typ = typeparams.Deref(typ)
+		tStruct, ok := typeparams.CoreType(typ).(*types.Struct)
 		if !ok {
 			return
 		}
@@ -130,23 +104,30 @@ func DiagnoseFillableStructs(inspect *inspector.Inspector, start, end token.Pos,
 			if i < totalFields {
 				fillableFields = append(fillableFields, "...")
 			}
-			name = fmt.Sprintf("anonymous struct { %s }", strings.Join(fillableFields, ", "))
+			name = fmt.Sprintf("anonymous struct{ %s }", strings.Join(fillableFields, ", "))
 		}
 		diags = append(diags, analysis.Diagnostic{
-			Message: fmt.Sprintf("Fill %s", name),
-			Pos:     expr.Pos(),
-			End:     expr.End(),
+			Message:  fmt.Sprintf("%s literal has missing fields", name),
+			Pos:      expr.Pos(),
+			End:      expr.End(),
+			Category: FixCategory,
+			SuggestedFixes: []analysis.SuggestedFix{{
+				Message: fmt.Sprintf("Fill %s", name),
+				// No TextEdits => computed later by gopls.
+			}},
 		})
 	})
 
 	return diags
 }
 
+const FixCategory = "fillstruct" // recognized by gopls ApplyFix
+
 // SuggestedFix computes the suggested fix for the kinds of
 // diagnostics produced by the Analyzer above.
-func SuggestedFix(fset *token.FileSet, start, end token.Pos, content []byte, file *ast.File, pkg *types.Package, info *types.Info) (*analysis.SuggestedFix, error) {
+func SuggestedFix(fset *token.FileSet, start, end token.Pos, content []byte, file *ast.File, pkg *types.Package, info *types.Info) (*token.FileSet, *analysis.SuggestedFix, error) {
 	if info == nil {
-		return nil, fmt.Errorf("nil types.Info")
+		return nil, nil, fmt.Errorf("nil types.Info")
 	}
 
 	pos := start // don't use the end
@@ -155,7 +136,7 @@ func SuggestedFix(fset *token.FileSet, start, end token.Pos, content []byte, fil
 	// calling PathEnclosingInterval. Switch this approach.
 	path, _ := astutil.PathEnclosingInterval(file, pos, pos)
 	if len(path) == 0 {
-		return nil, fmt.Errorf("no enclosing ast.Node")
+		return nil, nil, fmt.Errorf("no enclosing ast.Node")
 	}
 	var expr *ast.CompositeLit
 	for _, n := range path {
@@ -167,14 +148,14 @@ func SuggestedFix(fset *token.FileSet, start, end token.Pos, content []byte, fil
 
 	typ := info.TypeOf(expr)
 	if typ == nil {
-		return nil, fmt.Errorf("no composite literal")
+		return nil, nil, fmt.Errorf("no composite literal")
 	}
 
 	// Find reference to the type declaration of the struct being initialized.
-	typ = deref(typ)
+	typ = typeparams.Deref(typ)
 	tStruct, ok := typ.Underlying().(*types.Struct)
 	if !ok {
-		return nil, fmt.Errorf("%s is not a (pointer to) struct type",
+		return nil, nil, fmt.Errorf("%s is not a (pointer to) struct type",
 			types.TypeString(typ, types.RelativeTo(pkg)))
 	}
 	// Inv: typ is the possibly-named struct type.
@@ -240,7 +221,7 @@ func SuggestedFix(fset *token.FileSet, start, end token.Pos, content []byte, fil
 		} else {
 			names, ok := matches[fieldTyp]
 			if !ok {
-				return nil, fmt.Errorf("invalid struct field type: %v", fieldTyp)
+				return nil, nil, fmt.Errorf("invalid struct field type: %v", fieldTyp)
 			}
 
 			// Find the name most similar to the field name.
@@ -251,7 +232,7 @@ func SuggestedFix(fset *token.FileSet, start, end token.Pos, content []byte, fil
 			} else if v := populateValue(file, pkg, fieldTyp); v != nil {
 				kv.Value = v
 			} else {
-				return nil, nil
+				return nil, nil, nil // no fix to suggest
 			}
 		}
 		elts = append(elts, kv)
@@ -260,7 +241,7 @@ func SuggestedFix(fset *token.FileSet, start, end token.Pos, content []byte, fil
 
 	// If all of the struct's fields are unexported, we have nothing to do.
 	if len(elts) == 0 {
-		return nil, fmt.Errorf("no elements to fill")
+		return nil, nil, fmt.Errorf("no elements to fill")
 	}
 
 	// Add the final line for the right brace. Offset is the number of
@@ -292,7 +273,7 @@ func SuggestedFix(fset *token.FileSet, start, end token.Pos, content []byte, fil
 	// First pass through the formatter: turn the expr into a string.
 	var formatBuf bytes.Buffer
 	if err := format.Node(&formatBuf, fakeFset, cl); err != nil {
-		return nil, fmt.Errorf("failed to run first format on:\n%s\ngot err: %v", cl.Type, err)
+		return nil, nil, fmt.Errorf("failed to run first format on:\n%s\ngot err: %v", cl.Type, err)
 	}
 	sug := indent(formatBuf.Bytes(), whitespace)
 
@@ -304,7 +285,7 @@ func SuggestedFix(fset *token.FileSet, start, end token.Pos, content []byte, fil
 		}
 	}
 
-	return &analysis.SuggestedFix{
+	return fset, &analysis.SuggestedFix{
 		TextEdits: []analysis.TextEdit{
 			{
 				Pos:     expr.Pos(),
@@ -344,6 +325,8 @@ func indent(str, ind []byte) []byte {
 //
 // The reasoning here is that users will call fillstruct with the intention of
 // initializing the struct, in which case setting these fields to nil has no effect.
+//
+// populateValue returns nil if the value cannot be filled.
 func populateValue(f *ast.File, pkg *types.Package, typ types.Type) ast.Expr {
 	switch u := typ.Underlying().(type) {
 	case *types.Basic:
@@ -356,6 +339,8 @@ func populateValue(f *ast.File, pkg *types.Package, typ types.Type) ast.Expr {
 			return &ast.BasicLit{Kind: token.STRING, Value: `""`}
 		case u.Kind() == types.UnsafePointer:
 			return ast.NewIdent("nil")
+		case u.Kind() == types.Invalid:
+			return nil
 		default:
 			panic(fmt.Sprintf("unknown basic type %v", u))
 		}
@@ -464,7 +449,7 @@ func populateValue(f *ast.File, pkg *types.Package, typ types.Type) ast.Expr {
 		}
 
 	case *types.Pointer:
-		switch u.Elem().(type) {
+		switch aliases.Unalias(u.Elem()).(type) {
 		case *types.Basic:
 			return &ast.CallExpr{
 				Fun: &ast.Ident{
@@ -477,14 +462,18 @@ func populateValue(f *ast.File, pkg *types.Package, typ types.Type) ast.Expr {
 				},
 			}
 		default:
+			x := populateValue(f, pkg, u.Elem())
+			if x == nil {
+				return nil
+			}
 			return &ast.UnaryExpr{
 				Op: token.AND,
-				X:  populateValue(f, pkg, u.Elem()),
+				X:  x,
 			}
 		}
 
 	case *types.Interface:
-		if param, ok := typ.(*typeparams.TypeParam); ok {
+		if param, ok := aliases.Unalias(typ).(*types.TypeParam); ok {
 			// *new(T) is the zero value of a type parameter T.
 			// TODO(adonovan): one could give a more specific zero
 			// value if the type has a core type that is, say,
@@ -502,14 +491,4 @@ func populateValue(f *ast.File, pkg *types.Package, typ types.Type) ast.Expr {
 		return ast.NewIdent("nil")
 	}
 	return nil
-}
-
-func deref(t types.Type) types.Type {
-	for {
-		ptr, ok := t.Underlying().(*types.Pointer)
-		if !ok {
-			return t
-		}
-		t = ptr.Elem()
-	}
 }

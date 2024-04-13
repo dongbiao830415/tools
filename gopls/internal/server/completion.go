@@ -10,9 +10,9 @@ import (
 	"strings"
 
 	"golang.org/x/tools/gopls/internal/file"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/source"
-	"golang.org/x/tools/gopls/internal/lsp/source/completion"
+	"golang.org/x/tools/gopls/internal/golang"
+	"golang.org/x/tools/gopls/internal/golang/completion"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/gopls/internal/telemetry"
 	"golang.org/x/tools/gopls/internal/template"
@@ -30,11 +30,12 @@ func (s *server) Completion(ctx context.Context, params *protocol.CompletionPara
 	ctx, done := event.Start(ctx, "lsp.Server.completion", tag.URI.Of(params.TextDocument.URI))
 	defer done()
 
-	snapshot, fh, ok, release, err := s.beginFileRequest(ctx, params.TextDocument.URI, file.UnknownKind)
-	defer release()
-	if !ok {
+	fh, snapshot, release, err := s.fileOf(ctx, params.TextDocument.URI)
+	if err != nil {
 		return nil, err
 	}
+	defer release()
+
 	var candidates []completion.CompletionItem
 	var surrounding *completion.Selection
 	switch snapshot.FileKind(fh) {
@@ -60,6 +61,7 @@ func (s *server) Completion(ctx context.Context, params *protocol.CompletionPara
 		event.Error(ctx, "no completions found", err, tag.Position.Of(params.Position))
 	}
 	if candidates == nil {
+		complEmpty.Inc()
 		return &protocol.CompletionList{
 			IsIncomplete: true,
 			Items:        []protocol.CompletionItem{},
@@ -77,11 +79,29 @@ func (s *server) Completion(ctx context.Context, params *protocol.CompletionPara
 	incompleteResults := options.DeepCompletion || options.Matcher == settings.Fuzzy
 
 	items := toProtocolCompletionItems(candidates, rng, options)
+	if snapshot.FileKind(fh) == file.Go {
+		s.saveLastCompletion(fh.URI(), fh.Version(), items, params.Position)
+	}
 
+	if len(items) > 10 {
+		// TODO(pjw): long completions are ok for field lists
+		complLong.Inc()
+	} else {
+		complShort.Inc()
+	}
 	return &protocol.CompletionList{
 		IsIncomplete: incompleteResults,
 		Items:        items,
 	}, nil
+}
+
+func (s *server) saveLastCompletion(uri protocol.DocumentURI, version int32, items []protocol.CompletionItem, pos protocol.Position) {
+	s.efficacyMu.Lock()
+	defer s.efficacyMu.Unlock()
+	s.efficacyVersion = version
+	s.efficacyURI = uri
+	s.efficacyPos = pos
+	s.efficacyItems = items
 }
 
 func toProtocolCompletionItems(candidates []completion.CompletionItem, rng protocol.Range, options *settings.Options) []protocol.CompletionItem {
@@ -115,7 +135,7 @@ func toProtocolCompletionItems(candidates []completion.CompletionItem, rng proto
 		doc := &protocol.Or_CompletionItem_documentation{
 			Value: protocol.MarkupContent{
 				Kind:  protocol.Markdown,
-				Value: source.CommentToMarkdown(candidate.Documentation, options),
+				Value: golang.CommentToMarkdown(candidate.Documentation, options),
 			},
 		}
 		if options.PreferredContentFormat != protocol.Markdown {

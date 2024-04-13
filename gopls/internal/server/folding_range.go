@@ -8,8 +8,8 @@ import (
 	"context"
 
 	"golang.org/x/tools/gopls/internal/file"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
-	"golang.org/x/tools/gopls/internal/lsp/source"
+	"golang.org/x/tools/gopls/internal/golang"
+	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/event/tag"
 )
@@ -18,20 +18,22 @@ func (s *server) FoldingRange(ctx context.Context, params *protocol.FoldingRange
 	ctx, done := event.Start(ctx, "lsp.Server.foldingRange", tag.URI.Of(params.TextDocument.URI))
 	defer done()
 
-	snapshot, fh, ok, release, err := s.beginFileRequest(ctx, params.TextDocument.URI, file.Go)
-	defer release()
-	if !ok {
+	fh, snapshot, release, err := s.fileOf(ctx, params.TextDocument.URI)
+	if err != nil {
 		return nil, err
 	}
-
-	ranges, err := source.FoldingRange(ctx, snapshot, fh, snapshot.Options().LineFoldingOnly)
+	defer release()
+	if snapshot.FileKind(fh) != file.Go {
+		return nil, nil // empty result
+	}
+	ranges, err := golang.FoldingRange(ctx, snapshot, fh, snapshot.Options().LineFoldingOnly)
 	if err != nil {
 		return nil, err
 	}
 	return toProtocolFoldingRanges(ranges)
 }
 
-func toProtocolFoldingRanges(ranges []*source.FoldingRangeInfo) ([]protocol.FoldingRange, error) {
+func toProtocolFoldingRanges(ranges []*golang.FoldingRangeInfo) ([]protocol.FoldingRange, error) {
 	result := make([]protocol.FoldingRange, 0, len(ranges))
 	for _, info := range ranges {
 		rng := info.MappedRange.Range()

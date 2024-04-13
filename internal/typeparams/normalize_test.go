@@ -13,15 +13,10 @@ import (
 	"strings"
 	"testing"
 
-	"golang.org/x/tools/internal/typeparams"
 	. "golang.org/x/tools/internal/typeparams"
 )
 
 func TestStructuralTerms(t *testing.T) {
-	if !Enabled {
-		t.Skip("typeparams are not enabled")
-	}
-
 	// In the following tests, src must define a type T with (at least) one type
 	// parameter. We will compute the structural terms of the first type
 	// parameter.
@@ -76,7 +71,7 @@ type T[P interface{ A|B; C }] int
 			if obj == nil {
 				t.Fatal("type T not found")
 			}
-			T := typeparams.ForNamed(obj.Type().(*types.Named)).At(0)
+			T := obj.Type().(*types.Named).TypeParams().At(0)
 			terms, err := StructuralTerms(T)
 			if test.wantError != "" {
 				if err == nil {
@@ -95,7 +90,7 @@ type T[P interface{ A|B; C }] int
 				got = "all"
 			} else {
 				qf := types.RelativeTo(pkg)
-				got = types.TypeString(NewUnion(terms), qf)
+				got = types.TypeString(types.NewUnion(terms), qf)
 			}
 			want := regexp.MustCompile(test.want)
 			if !want.MatchString(got) {

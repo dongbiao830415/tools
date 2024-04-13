@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"golang.org/x/tools/gopls/internal/hooks"
-	"golang.org/x/tools/gopls/internal/lsp/protocol"
+	"golang.org/x/telemetry/counter"
+	"golang.org/x/telemetry/counter/countertest"
+	"golang.org/x/tools/gopls/internal/protocol"
+	"golang.org/x/tools/gopls/internal/server"
 	. "golang.org/x/tools/gopls/internal/test/integration"
 	"golang.org/x/tools/gopls/internal/test/integration/fake"
 	"golang.org/x/tools/gopls/internal/util/bug"
@@ -22,7 +24,7 @@ import (
 
 func TestMain(m *testing.M) {
 	bug.PanicOnBugs = true
-	Main(m, hooks.Options)
+	Main(m)
 }
 
 const proxy = `
@@ -829,6 +831,7 @@ use ./a/ba
 use ./a/b/
 use ./dir/foo
 use ./dir/foobar/
+use ./missing/
 -- a/go.mod --
 -- go.mod --
 -- a/bar/go.mod --
@@ -853,6 +856,7 @@ use ./dir/foobar/
 			{`use ./a/ba()`, []string{"r"}},
 			{`use ./dir/foo()`, []string{"bar"}},
 			{`use ./dir/foobar/()`, []string{}},
+			{`use ./missing/()`, []string{}},
 		}
 		for _, tt := range tests {
 			completions := env.Completion(env.RegexpSearch("go.work", tt.re))
@@ -993,6 +997,67 @@ func Join() {}
 				if strings.Contains(item.Detail, "golang.org/toolchain") {
 					t.Errorf("Completion(...) returned toolchain item %#v", item)
 				}
+			}
+		}
+	})
+}
+
+// show that the efficacy counters get exercised. Fortuntely a small program
+// exercises them all
+func TestCounters(t *testing.T) {
+	const files = `
+-- go.mod --
+module foo
+go 1.21
+-- x.go --
+package foo
+
+func main() {
+}
+
+`
+	WithOptions(
+		Modes(Default),
+	).Run(t, files, func(t *testing.T, env *Env) {
+		cts := func() map[*counter.Counter]uint64 {
+			ans := make(map[*counter.Counter]uint64)
+			for _, c := range server.CompletionCounters {
+				ans[c], _ = countertest.ReadCounter(c)
+			}
+			return ans
+		}
+		before := cts()
+		env.OpenFile("x.go")
+		env.Await(env.DoneWithOpen())
+		saved := env.BufferText("x.go")
+		lines := strings.Split(saved, "\n")
+		// make sure the unused counter is exercised
+		loc := env.RegexpSearch("x.go", "main")
+		loc.Range.End = loc.Range.Start
+		env.Completion(loc)                       // ignore the proposed completions
+		env.RegexpReplace("x.go", "main", "Main") // completions are unused
+		env.SetBufferContent("x.go", saved)       // restore x.go
+		// used:no
+
+		// all the action is after 4 characters on line 2 (counting from 0)
+		for i := 2; i < len(lines); i++ {
+			l := lines[i]
+			loc.Range.Start.Line = uint32(i)
+			for j := 4; j < len(l); j++ {
+				loc.Range.Start.Character = uint32(j)
+				loc.Range.End = loc.Range.Start
+				res := env.Completion(loc)
+				if len(res.Items) > 0 {
+					r := res.Items[0]
+					env.AcceptCompletion(loc, r)
+					env.SetBufferContent("x.go", saved)
+				}
+			}
+		}
+		after := cts()
+		for c := range after {
+			if after[c] <= before[c] {
+				t.Errorf("%s did not increase", c.Name())
 			}
 		}
 	})
